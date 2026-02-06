@@ -141,8 +141,15 @@ pub trait Channel: Send + Sync {
 
     /// Send a status update (thinking, tool execution, etc.).
     ///
+    /// The metadata contains channel-specific routing info (e.g., Telegram chat_id)
+    /// needed to deliver the status to the correct destination.
+    ///
     /// Default implementation does nothing (for channels that don't support status).
-    async fn send_status(&self, _status: StatusUpdate) -> Result<(), ChannelError> {
+    async fn send_status(
+        &self,
+        _status: StatusUpdate,
+        _metadata: &serde_json::Value,
+    ) -> Result<(), ChannelError> {
         Ok(())
     }
 

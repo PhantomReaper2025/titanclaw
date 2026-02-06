@@ -420,6 +420,10 @@ pub struct WasmChannel {
     /// Keys are placeholder names like "TELEGRAM_BOT_TOKEN".
     /// Wrapped in Arc for sharing with the polling task.
     credentials: Arc<RwLock<HashMap<String, String>>>,
+
+    /// Background task that repeats typing indicators every 4 seconds.
+    /// Telegram's "typing..." indicator expires after ~5s, so we refresh it.
+    typing_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl WasmChannel {
@@ -447,6 +451,7 @@ impl WasmChannel {
             poll_shutdown_tx: RwLock::new(None),
             endpoints: RwLock::new(Vec::new()),
             credentials: Arc::new(RwLock::new(HashMap::new())),
+            typing_task: RwLock::new(None),
         }
     }
 
@@ -1012,6 +1017,214 @@ impl WasmChannel {
         }
     }
 
+    /// Execute the on_status callback.
+    ///
+    /// Called to notify the WASM channel of agent status changes (e.g., typing).
+    pub async fn call_on_status(
+        &self,
+        status: &StatusUpdate,
+        metadata: &serde_json::Value,
+    ) -> Result<(), WasmChannelError> {
+        // If no WASM bytes, do nothing (for testing)
+        if self.prepared.component_bytes.is_empty() {
+            return Ok(());
+        }
+
+        let runtime = Arc::clone(&self.runtime);
+        let prepared = Arc::clone(&self.prepared);
+        let capabilities = self.capabilities.clone();
+        let timeout = self.runtime.config().callback_timeout;
+        let channel_name = self.name.clone();
+        let credentials = self.get_credentials().await;
+
+        let wit_update = status_to_wit(status, metadata);
+
+        let result = tokio::time::timeout(timeout, async move {
+            tokio::task::spawn_blocking(move || {
+                let mut store =
+                    Self::create_store(&runtime, &prepared, &capabilities, credentials)?;
+                let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
+
+                let channel_iface = instance.near_agent_channel();
+                channel_iface
+                    .call_on_status(&mut store, &wit_update)
+                    .map_err(|e| Self::map_wasm_error(e, &prepared.name, prepared.limits.fuel))?;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| WasmChannelError::ExecutionPanicked {
+                name: channel_name.clone(),
+                reason: e.to_string(),
+            })?
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {
+                tracing::debug!(
+                    channel = %self.name,
+                    "WASM channel on_status completed"
+                );
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(WasmChannelError::Timeout {
+                name: self.name.clone(),
+                callback: "on_status".to_string(),
+            }),
+        }
+    }
+
+    /// Execute a single on_status callback with a fresh WASM instance.
+    ///
+    /// Static method for use by the background typing repeat task (which
+    /// doesn't have access to `&self`).
+    async fn execute_status(
+        channel_name: &str,
+        runtime: &Arc<WasmChannelRuntime>,
+        prepared: &Arc<PreparedChannelModule>,
+        capabilities: &ChannelCapabilities,
+        credentials: &RwLock<HashMap<String, String>>,
+        timeout: Duration,
+        wit_update: wit_channel::StatusUpdate,
+    ) -> Result<(), WasmChannelError> {
+        if prepared.component_bytes.is_empty() {
+            return Ok(());
+        }
+
+        let runtime = Arc::clone(runtime);
+        let prepared = Arc::clone(prepared);
+        let capabilities = capabilities.clone();
+        let credentials_snapshot = credentials.read().await.clone();
+        let channel_name_owned = channel_name.to_string();
+
+        let result = tokio::time::timeout(timeout, async move {
+            tokio::task::spawn_blocking(move || {
+                let mut store =
+                    Self::create_store(&runtime, &prepared, &capabilities, credentials_snapshot)?;
+                let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
+
+                let channel_iface = instance.near_agent_channel();
+                channel_iface
+                    .call_on_status(&mut store, &wit_update)
+                    .map_err(|e| Self::map_wasm_error(e, &prepared.name, prepared.limits.fuel))?;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| WasmChannelError::ExecutionPanicked {
+                name: channel_name_owned.clone(),
+                reason: e.to_string(),
+            })?
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(WasmChannelError::Timeout {
+                name: channel_name.to_string(),
+                callback: "on_status".to_string(),
+            }),
+        }
+    }
+
+    /// Cancel the background typing indicator task if running.
+    async fn cancel_typing_task(&self) {
+        if let Some(handle) = self.typing_task.write().await.take() {
+            handle.abort();
+        }
+    }
+
+    /// Handle a status update, managing the typing repeat timer.
+    ///
+    /// On Thinking: fires on_status once, then spawns a background task
+    /// that repeats the call every 4 seconds (Telegram's typing indicator
+    /// expires after ~5s).
+    ///
+    /// On Done/Interrupted/Status: cancels the repeat task, fires on_status once.
+    /// On StreamChunk: no-op (too noisy).
+    async fn handle_status_update(
+        &self,
+        status: StatusUpdate,
+        metadata: &serde_json::Value,
+    ) -> Result<(), ChannelError> {
+        match &status {
+            StatusUpdate::Thinking(_) => {
+                // Cancel any existing typing task
+                self.cancel_typing_task().await;
+
+                // Fire once immediately
+                if let Err(e) = self.call_on_status(&status, metadata).await {
+                    tracing::debug!(
+                        channel = %self.name,
+                        error = %e,
+                        "on_status(Thinking) failed (best-effort)"
+                    );
+                }
+
+                // Spawn background repeater
+                let channel_name = self.name.clone();
+                let runtime = Arc::clone(&self.runtime);
+                let prepared = Arc::clone(&self.prepared);
+                let capabilities = self.capabilities.clone();
+                let credentials = self.credentials.clone();
+                let callback_timeout = self.runtime.config().callback_timeout;
+                let wit_update = status_to_wit(&status, metadata);
+
+                let handle = tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(4));
+                    // Skip the first tick (we already fired above)
+                    interval.tick().await;
+
+                    loop {
+                        interval.tick().await;
+
+                        let wit_update_clone = clone_wit_status_update(&wit_update);
+
+                        if let Err(e) = Self::execute_status(
+                            &channel_name,
+                            &runtime,
+                            &prepared,
+                            &capabilities,
+                            &credentials,
+                            callback_timeout,
+                            wit_update_clone,
+                        )
+                        .await
+                        {
+                            tracing::debug!(
+                                channel = %channel_name,
+                                error = %e,
+                                "Typing repeat on_status failed (best-effort)"
+                            );
+                        }
+                    }
+                });
+
+                *self.typing_task.write().await = Some(handle);
+            }
+            StatusUpdate::StreamChunk(_) => {
+                // No-op, too noisy
+            }
+            _ => {
+                // Done, Interrupted, Status, ToolStarted, ToolCompleted: cancel and fire once
+                self.cancel_typing_task().await;
+
+                if let Err(e) = self.call_on_status(&status, metadata).await {
+                    tracing::debug!(
+                        channel = %self.name,
+                        error = %e,
+                        "on_status failed (best-effort)"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Process emitted messages from a callback.
     async fn process_emitted_messages(
         &self,
@@ -1403,6 +1616,9 @@ impl Channel for WasmChannel {
         msg: &IncomingMessage,
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
+        // Stop the typing indicator, we're about to send the actual response
+        self.cancel_typing_task().await;
+
         // Check if there's a pending synchronous response waiter
         if let Some(tx) = self.pending_responses.write().await.remove(&msg.id) {
             let _ = tx.send(response.content.clone());
@@ -1428,11 +1644,13 @@ impl Channel for WasmChannel {
         Ok(())
     }
 
-    async fn send_status(&self, status: StatusUpdate) -> Result<(), ChannelError> {
-        // WASM channels don't support status updates by default
-        // Could be extended with an optional on_status callback
-        let _ = status;
-        Ok(())
+    async fn send_status(
+        &self,
+        status: StatusUpdate,
+        metadata: &serde_json::Value,
+    ) -> Result<(), ChannelError> {
+        // Delegate to the typing indicator implementation
+        self.handle_status_update(status, metadata).await
     }
 
     async fn health_check(&self) -> Result<(), ChannelError> {
@@ -1447,6 +1665,9 @@ impl Channel for WasmChannel {
     }
 
     async fn shutdown(&self) -> Result<(), ChannelError> {
+        // Cancel typing indicator
+        self.cancel_typing_task().await;
+
         // Send shutdown signal
         if let Some(tx) = self.shutdown_tx.write().await.take() {
             let _ = tx.send(());
@@ -1457,8 +1678,6 @@ impl Channel for WasmChannel {
 
         // Clear the message sender
         *self.message_tx.write().await = None;
-
-        // TODO: Call WASM on_shutdown if we add that callback
 
         tracing::info!(
             channel = %self.name,
@@ -1529,6 +1748,14 @@ impl Channel for SharedWasmChannel {
         self.inner.respond(msg, response).await
     }
 
+    async fn send_status(
+        &self,
+        status: StatusUpdate,
+        metadata: &serde_json::Value,
+    ) -> Result<(), ChannelError> {
+        self.inner.send_status(status, metadata).await
+    }
+
     async fn health_check(&self) -> Result<(), ChannelError> {
         self.inner.health_check().await
     }
@@ -1576,6 +1803,62 @@ fn convert_http_response(wit: wit_channel::OutgoingHttpResponse) -> HttpResponse
         status: wit.status,
         headers,
         body: wit.body,
+    }
+}
+
+/// Convert a StatusUpdate + metadata into the WIT StatusUpdate type.
+fn status_to_wit(status: &StatusUpdate, metadata: &serde_json::Value) -> wit_channel::StatusUpdate {
+    let metadata_json = serde_json::to_string(metadata).unwrap_or_default();
+
+    match status {
+        StatusUpdate::Thinking(msg) => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::Thinking,
+            message: msg.clone(),
+            metadata_json,
+        },
+        StatusUpdate::ToolStarted { name } => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::ToolStarted,
+            message: name.clone(),
+            metadata_json,
+        },
+        StatusUpdate::ToolCompleted { name, success } => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::ToolCompleted,
+            message: format!("{}: {}", name, if *success { "ok" } else { "failed" }),
+            metadata_json,
+        },
+        StatusUpdate::StreamChunk(chunk) => wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::Thinking,
+            message: chunk.clone(),
+            metadata_json,
+        },
+        StatusUpdate::Status(msg) => {
+            // Map well-known status strings to WIT types
+            let status_type = match msg.as_str() {
+                "Done" => wit_channel::StatusType::Done,
+                "Interrupted" => wit_channel::StatusType::Interrupted,
+                _ => wit_channel::StatusType::Thinking,
+            };
+            wit_channel::StatusUpdate {
+                status: status_type,
+                message: msg.clone(),
+                metadata_json,
+            }
+        }
+    }
+}
+
+/// Clone a WIT StatusUpdate (the generated type doesn't derive Clone).
+fn clone_wit_status_update(update: &wit_channel::StatusUpdate) -> wit_channel::StatusUpdate {
+    wit_channel::StatusUpdate {
+        status: match update.status {
+            wit_channel::StatusType::Thinking => wit_channel::StatusType::Thinking,
+            wit_channel::StatusType::Done => wit_channel::StatusType::Done,
+            wit_channel::StatusType::Interrupted => wit_channel::StatusType::Interrupted,
+            wit_channel::StatusType::ToolStarted => wit_channel::StatusType::ToolStarted,
+            wit_channel::StatusType::ToolCompleted => wit_channel::StatusType::ToolCompleted,
+        },
+        message: update.message.clone(),
+        metadata_json: update.metadata_json.clone(),
     }
 }
 
@@ -1843,5 +2126,214 @@ mod tests {
         assert!(result.is_ok());
 
         channel.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_typing_task_starts_on_thinking() {
+        let channel = create_test_channel();
+        let _stream = channel.start().await.expect("Channel should start");
+
+        let metadata = serde_json::json!({"chat_id": 123});
+
+        // Sending Thinking should succeed (no-op for no WASM)
+        let result = channel
+            .send_status(
+                crate::channels::StatusUpdate::Thinking("Processing...".into()),
+                &metadata,
+            )
+            .await;
+        assert!(result.is_ok());
+
+        // A typing task should have been spawned
+        assert!(channel.typing_task.read().await.is_some());
+
+        // Shutdown should cancel the typing task
+        channel.shutdown().await.expect("Shutdown should succeed");
+        assert!(channel.typing_task.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_typing_task_cancelled_on_done() {
+        let channel = create_test_channel();
+        let _stream = channel.start().await.expect("Channel should start");
+
+        let metadata = serde_json::json!({"chat_id": 123});
+
+        // Start typing
+        let _ = channel
+            .send_status(
+                crate::channels::StatusUpdate::Thinking("Processing...".into()),
+                &metadata,
+            )
+            .await;
+        assert!(channel.typing_task.read().await.is_some());
+
+        // Send Done status
+        let _ = channel
+            .send_status(
+                crate::channels::StatusUpdate::Status("Done".into()),
+                &metadata,
+            )
+            .await;
+
+        // Typing task should be cancelled
+        assert!(channel.typing_task.read().await.is_none());
+
+        channel.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_typing_task_replaced_on_new_thinking() {
+        let channel = create_test_channel();
+        let _stream = channel.start().await.expect("Channel should start");
+
+        let metadata = serde_json::json!({"chat_id": 123});
+
+        // Start typing
+        let _ = channel
+            .send_status(
+                crate::channels::StatusUpdate::Thinking("First...".into()),
+                &metadata,
+            )
+            .await;
+
+        // Get handle of first task
+        let first_handle = {
+            let guard = channel.typing_task.read().await;
+            guard.as_ref().map(|h| h.id())
+        };
+        assert!(first_handle.is_some());
+
+        // Start typing again (should replace the previous task)
+        let _ = channel
+            .send_status(
+                crate::channels::StatusUpdate::Thinking("Second...".into()),
+                &metadata,
+            )
+            .await;
+
+        // Should still have a typing task, but it's a new one
+        let second_handle = {
+            let guard = channel.typing_task.read().await;
+            guard.as_ref().map(|h| h.id())
+        };
+        assert!(second_handle.is_some());
+        // The task IDs should differ (old one was aborted, new one spawned)
+        assert_ne!(first_handle, second_handle);
+
+        channel.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_respond_cancels_typing_task() {
+        use crate::channels::IncomingMessage;
+
+        let channel = create_test_channel();
+        let _stream = channel.start().await.expect("Channel should start");
+
+        let metadata = serde_json::json!({"chat_id": 123});
+
+        // Start typing
+        let _ = channel
+            .send_status(
+                crate::channels::StatusUpdate::Thinking("Processing...".into()),
+                &metadata,
+            )
+            .await;
+        assert!(channel.typing_task.read().await.is_some());
+
+        // Respond should cancel the typing task
+        let msg = IncomingMessage::new("test", "user1", "hello").with_metadata(metadata);
+        let _ = channel
+            .respond(&msg, crate::channels::OutgoingResponse::text("response"))
+            .await;
+
+        // Typing task should be gone
+        assert!(channel.typing_task.read().await.is_none());
+
+        channel.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_stream_chunk_is_noop() {
+        let channel = create_test_channel();
+        let _stream = channel.start().await.expect("Channel should start");
+
+        let metadata = serde_json::json!({"chat_id": 123});
+
+        // StreamChunk should not start a typing task
+        let result = channel
+            .send_status(
+                crate::channels::StatusUpdate::StreamChunk("chunk".into()),
+                &metadata,
+            )
+            .await;
+        assert!(result.is_ok());
+        assert!(channel.typing_task.read().await.is_none());
+
+        channel.shutdown().await.expect("Shutdown should succeed");
+    }
+
+    #[test]
+    fn test_status_to_wit_thinking() {
+        use super::status_to_wit;
+
+        let metadata = serde_json::json!({"chat_id": 42});
+        let wit = status_to_wit(
+            &crate::channels::StatusUpdate::Thinking("Processing...".into()),
+            &metadata,
+        );
+
+        assert!(matches!(
+            wit.status,
+            super::wit_channel::StatusType::Thinking
+        ));
+        assert_eq!(wit.message, "Processing...");
+        assert!(wit.metadata_json.contains("42"));
+    }
+
+    #[test]
+    fn test_status_to_wit_done() {
+        use super::status_to_wit;
+
+        let metadata = serde_json::json!(null);
+        let wit = status_to_wit(
+            &crate::channels::StatusUpdate::Status("Done".into()),
+            &metadata,
+        );
+
+        assert!(matches!(wit.status, super::wit_channel::StatusType::Done));
+    }
+
+    #[test]
+    fn test_status_to_wit_interrupted() {
+        use super::status_to_wit;
+
+        let metadata = serde_json::json!(null);
+        let wit = status_to_wit(
+            &crate::channels::StatusUpdate::Status("Interrupted".into()),
+            &metadata,
+        );
+
+        assert!(matches!(
+            wit.status,
+            super::wit_channel::StatusType::Interrupted
+        ));
+    }
+
+    #[test]
+    fn test_clone_wit_status_update() {
+        use super::{clone_wit_status_update, wit_channel};
+
+        let original = wit_channel::StatusUpdate {
+            status: wit_channel::StatusType::Thinking,
+            message: "hello".to_string(),
+            metadata_json: "{\"a\":1}".to_string(),
+        };
+
+        let cloned = clone_wit_status_update(&original);
+        assert!(matches!(cloned.status, wit_channel::StatusType::Thinking));
+        assert_eq!(cloned.message, "hello");
+        assert_eq!(cloned.metadata_json, "{\"a\":1}");
     }
 }

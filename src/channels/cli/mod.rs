@@ -116,7 +116,11 @@ impl Channel for TuiChannel {
         Ok(())
     }
 
-    async fn send_status(&self, status: StatusUpdate) -> Result<(), ChannelError> {
+    async fn send_status(
+        &self,
+        status: StatusUpdate,
+        _metadata: &serde_json::Value,
+    ) -> Result<(), ChannelError> {
         let event = match status {
             StatusUpdate::Thinking(msg) => AppEvent::ThinkingMessage(format!("🤔 {}", msg)),
             StatusUpdate::ToolStarted { name } => AppEvent::ToolStarted { name },

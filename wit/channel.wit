@@ -16,9 +16,9 @@
 // │                              ▼                                                   │
 // │          ┌──────────────────┬──────────────────┐                                │
 // │          ▼                  ▼                  ▼                                 │
-// │   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐                           │
-// │   │ on-http-req │   │  on-poll    │   │ on-respond  │  WASM Exports             │
-// │   └─────────────┘   └─────────────┘   └─────────────┘                           │
+// │   ┌───────────┐ ┌────────┐ ┌──────────┐ ┌──────────┐                             │
+// │   │on-http-req│ │on-poll │ │on-respond│ │on-status │   WASM Exports             │
+// │   └───────────┘ └────────┘ └──────────┘ └──────────┘                             │
 // │          │                  │                  │                                 │
 // │          └──────────────────┴──────────────────┘                                │
 // │                             │                                                    │
@@ -215,6 +215,32 @@ interface channel {
         metadata-json: string,
     }
 
+    // ==================== Status Types ====================
+
+    /// Types of status updates the agent can send to channels.
+    enum status-type {
+        /// Agent is thinking/processing a response.
+        thinking,
+        /// Agent finished processing (response sent or about to be sent).
+        done,
+        /// Agent processing was interrupted.
+        interrupted,
+        /// A tool execution started.
+        tool-started,
+        /// A tool execution completed.
+        tool-completed,
+    }
+
+    /// A status update from the agent.
+    record status-update {
+        /// The type of status change.
+        status: status-type,
+        /// Human-readable description of the status.
+        message: string,
+        /// Channel-specific metadata as JSON string (e.g., contains chat_id for routing).
+        metadata-json: string,
+    }
+
     // ==================== Lifecycle Callbacks ====================
 
     /// Initialize the channel.
@@ -260,6 +286,15 @@ interface channel {
     /// - Ok: Response delivered successfully
     /// - Err(string): Delivery failure message
     on-respond: func(response: agent-response) -> result<_, string>;
+
+    /// Notify the channel of agent status changes.
+    ///
+    /// Called when the agent starts thinking, finishes, or changes state.
+    /// Channels can use this to show typing indicators or status messages.
+    ///
+    /// Arguments:
+    /// - update: The status update
+    on-status: func(update: status-update);
 
     /// Clean up channel resources.
     ///

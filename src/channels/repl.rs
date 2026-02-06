@@ -183,7 +183,11 @@ impl Channel for ReplChannel {
         Ok(())
     }
 
-    async fn send_status(&self, status: StatusUpdate) -> Result<(), ChannelError> {
+    async fn send_status(
+        &self,
+        status: StatusUpdate,
+        _metadata: &serde_json::Value,
+    ) -> Result<(), ChannelError> {
         let debug = self.is_debug();
 
         match status {

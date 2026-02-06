@@ -568,6 +568,7 @@ impl Agent {
                             "Context at {:.0}% capacity, compacting...",
                             pct
                         )),
+                        &message.metadata,
                     )
                     .await;
 
@@ -615,6 +616,7 @@ impl Agent {
             .send_status(
                 &message.channel,
                 StatusUpdate::Thinking("Processing...".into()),
+                &message.metadata,
             )
             .await;
 
@@ -633,7 +635,11 @@ impl Agent {
         if thread.state == ThreadState::Interrupted {
             let _ = self
                 .channels
-                .send_status(&message.channel, StatusUpdate::Status("Interrupted".into()))
+                .send_status(
+                    &message.channel,
+                    StatusUpdate::Status("Interrupted".into()),
+                    &message.metadata,
+                )
                 .await;
             return Ok(SubmissionResult::Interrupted);
         }
@@ -644,7 +650,11 @@ impl Agent {
                 thread.complete_turn(&response);
                 let _ = self
                     .channels
-                    .send_status(&message.channel, StatusUpdate::Status("Done".into()))
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::Status("Done".into()),
+                        &message.metadata,
+                    )
                     .await;
                 Ok(SubmissionResult::response(response))
             }
@@ -660,6 +670,7 @@ impl Agent {
                     .send_status(
                         &message.channel,
                         StatusUpdate::Status("Awaiting approval".into()),
+                        &message.metadata,
                     )
                     .await;
                 Ok(SubmissionResult::NeedApproval {
@@ -781,6 +792,7 @@ impl Agent {
                                 "Executing {} tool(s)...",
                                 tool_calls.len()
                             )),
+                            &message.metadata,
                         )
                         .await;
 
@@ -938,6 +950,7 @@ impl Agent {
                 .send_status(
                     &message.channel,
                     StatusUpdate::Thinking("Processing...".into()),
+                    &message.metadata,
                 )
                 .await;
         }
@@ -1250,7 +1263,11 @@ impl Agent {
                     thread.complete_turn(&response);
                     let _ = self
                         .channels
-                        .send_status(&message.channel, StatusUpdate::Status("Done".into()))
+                        .send_status(
+                            &message.channel,
+                            StatusUpdate::Status("Done".into()),
+                            &message.metadata,
+                        )
                         .await;
                     Ok(SubmissionResult::response(response))
                 }
@@ -1267,6 +1284,7 @@ impl Agent {
                         .send_status(
                             &message.channel,
                             StatusUpdate::Status("Awaiting approval".into()),
+                            &message.metadata,
                         )
                         .await;
                     Ok(SubmissionResult::NeedApproval {
@@ -1292,7 +1310,11 @@ impl Agent {
 
             let _ = self
                 .channels
-                .send_status(&message.channel, StatusUpdate::Status("Rejected".into()))
+                .send_status(
+                    &message.channel,
+                    StatusUpdate::Status("Rejected".into()),
+                    &message.metadata,
+                )
                 .await;
 
             Ok(SubmissionResult::response(format!(

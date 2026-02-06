@@ -83,14 +83,18 @@ impl ChannelManager {
     }
 
     /// Send a status update to a specific channel.
+    ///
+    /// The metadata contains channel-specific routing info (e.g., Telegram chat_id)
+    /// needed to deliver the status to the correct destination.
     pub async fn send_status(
         &self,
         channel_name: &str,
         status: StatusUpdate,
+        metadata: &serde_json::Value,
     ) -> Result<(), ChannelError> {
         let channels = self.channels.read().await;
         if let Some(channel) = channels.get(channel_name) {
-            channel.send_status(status).await
+            channel.send_status(status, metadata).await
         } else {
             // Silently ignore if channel not found (status is best-effort)
             Ok(())

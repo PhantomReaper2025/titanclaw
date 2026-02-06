@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 // Re-export generated types
 use exports::near::agent::channel::{
     AgentResponse, ChannelConfig, Guest, HttpEndpointConfig, IncomingHttpRequest,
-    OutgoingHttpResponse, PollConfig,
+    OutgoingHttpResponse, PollConfig, StatusType, StatusUpdate,
 };
 use near::agent::channel_host::{self, EmittedMessage};
 
@@ -498,6 +498,54 @@ impl Guest for TelegramChannel {
                 Ok(())
             }
             Err(e) => Err(format!("HTTP request failed: {}", e)),
+        }
+    }
+
+    fn on_status(update: StatusUpdate) {
+        // Only send typing indicator for Thinking status
+        if !matches!(update.status, StatusType::Thinking) {
+            return;
+        }
+
+        // Parse chat_id from metadata
+        let metadata: TelegramMessageMetadata = match serde_json::from_str(&update.metadata_json) {
+            Ok(m) => m,
+            Err(_) => {
+                channel_host::log(
+                    channel_host::LogLevel::Debug,
+                    "on_status: no valid Telegram metadata, skipping typing indicator",
+                );
+                return;
+            }
+        };
+
+        // POST /sendChatAction with action "typing"
+        let payload = serde_json::json!({
+            "chat_id": metadata.chat_id,
+            "action": "typing"
+        });
+
+        let payload_bytes = match serde_json::to_vec(&payload) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        let headers = serde_json::json!({
+            "Content-Type": "application/json"
+        });
+
+        let result = channel_host::http_request(
+            "POST",
+            "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendChatAction",
+            &headers.to_string(),
+            Some(&payload_bytes),
+        );
+
+        if let Err(e) = result {
+            channel_host::log(
+                channel_host::LogLevel::Debug,
+                &format!("sendChatAction failed: {}", e),
+            );
         }
     }
 
