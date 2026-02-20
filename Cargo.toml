@@ -138,6 +138,7 @@ tempfile = "3"
 tree-sitter = "0.26.5"
 tree-sitter-rust = "0.24.0"
 streaming-iterator = "0.1.9"
+libp2p = { version = "0.56.0", features = ["tokio", "gossipsub", "mdns", "noise", "yamux", "tcp", "identify", "kad", "macros"] }
 
 # macOS keychain
 [target.'cfg(target_os = "macos")'.dependencies]

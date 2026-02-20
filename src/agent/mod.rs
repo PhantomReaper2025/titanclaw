@@ -18,6 +18,7 @@ pub mod cost_guard;
 mod dispatcher;
 mod heartbeat;
 pub mod job_monitor;
+pub mod kernel_monitor;
 mod router;
 pub mod reflex;
 pub mod routine;
