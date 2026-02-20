@@ -268,6 +268,50 @@ pub trait LlmProvider: Send + Sync {
         request: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError>;
 
+    /// Complete a chat conversation with streaming text chunks.
+    ///
+    /// Each text fragment is forwarded to `on_chunk` as it arrives from the
+    /// provider, enabling zero-latency display in the TUI/Web GUI.
+    ///
+    /// The default implementation falls back to `complete()` and fires
+    /// `on_chunk` once with the full response text.
+    async fn complete_streaming(
+        &self,
+        request: CompletionRequest,
+        on_chunk: &(dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+              + Send
+              + Sync),
+    ) -> Result<CompletionResponse, LlmError> {
+        let response = self.complete(request).await?;
+        if !response.content.is_empty() {
+            on_chunk(response.content.clone()).await;
+        }
+        Ok(response)
+    }
+
+    /// Complete with tool use support and streaming text chunks.
+    ///
+    /// Text fragments are forwarded to `on_chunk` as they arrive. Tool calls
+    /// are accumulated and returned in the final `ToolCompletionResponse`.
+    ///
+    /// The default implementation falls back to `complete_with_tools()` and
+    /// fires `on_chunk` once with the full response content.
+    async fn complete_with_tools_streaming(
+        &self,
+        request: ToolCompletionRequest,
+        on_chunk: &(dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+              + Send
+              + Sync),
+    ) -> Result<ToolCompletionResponse, LlmError> {
+        let response = self.complete_with_tools(request).await?;
+        if let Some(ref content) = response.content {
+            if !content.is_empty() {
+                on_chunk(content.clone()).await;
+            }
+        }
+        Ok(response)
+    }
+
     /// List available models from the provider.
     /// Default implementation returns empty list.
     async fn list_models(&self) -> Result<Vec<String>, LlmError> {

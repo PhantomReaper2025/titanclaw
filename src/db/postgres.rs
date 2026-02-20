@@ -259,6 +259,14 @@ impl JobStore for PgBackend {
             .update_estimation_actuals(id, actual_cost, actual_time_secs, actual_value)
             .await
     }
+
+    async fn find_recurring_job_patterns(
+        &self,
+        threshold: i64,
+        limit: i64,
+    ) -> Result<Vec<String>, DatabaseError> {
+        self.store.find_recurring_job_patterns(threshold, limit).await
+    }
 }
 
 // ==================== SandboxStore ====================

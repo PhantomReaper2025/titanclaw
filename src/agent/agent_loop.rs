@@ -454,6 +454,20 @@ impl Agent {
         // Extract engine ref for use in message loop
         let routine_engine_for_loop = routine_handle.as_ref().map(|(_, e)| Arc::clone(e));
 
+        // Spawn Reflex compiler background ticker
+        let reflex_handle = if let Some(store) = self.store() {
+            tracing::info!("Reflex compiler background ticker enabled (evaluating every 5m)");
+            Some(crate::agent::reflex::spawn_reflex_compiler(
+                Arc::clone(store),
+                self.llm().clone(),
+                self.safety().clone(),
+                self.tools().clone(),
+                std::time::Duration::from_secs(300),
+            ))
+        } else {
+            None
+        };
+
         // Main message loop
         tracing::info!("Agent {} ready and listening", self.config.name);
 
@@ -539,6 +553,9 @@ impl Agent {
         }
         if let Some((cron_handle, _)) = routine_handle {
             cron_handle.abort();
+        }
+        if let Some(handle) = reflex_handle {
+            handle.abort();
         }
         self.scheduler.stop_all().await;
         self.channels.shutdown_all().await?;

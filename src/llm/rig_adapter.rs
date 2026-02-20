@@ -4,15 +4,17 @@
 //! `Arc<dyn LlmProvider>` without changing any of the agent, reasoning, or tool code.
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use rig::OneOrMany;
 use rig::completion::{
-    AssistantContent, CompletionModel, CompletionRequest as RigRequest,
+    AssistantContent, CompletionModel, CompletionRequest as RigRequest, GetTokenUsage,
     ToolDefinition as RigToolDefinition, Usage as RigUsage,
 };
 use rig::message::{
     Message as RigMessage, ToolChoice as RigToolChoice, ToolFunction, ToolResult as RigToolResult,
     ToolResultContent, UserContent,
 };
+use rig::streaming::StreamedAssistantContent;
 use rust_decimal::Decimal;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -468,6 +470,162 @@ where
             tool_calls,
             input_tokens: saturate_u32(response.usage.input_tokens),
             output_tokens: saturate_u32(response.usage.output_tokens),
+            finish_reason: finish,
+            response_id: None,
+        })
+    }
+
+    async fn complete_streaming(
+        &self,
+        request: CompletionRequest,
+        on_chunk: &(dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+              + Send
+              + Sync),
+    ) -> Result<CompletionResponse, LlmError>
+    where
+        M::StreamingResponse: Send + Sync + 'static,
+    {
+        let (preamble, history) = convert_messages(&request.messages);
+
+        let rig_req = build_rig_request(
+            preamble,
+            history,
+            Vec::new(),
+            None,
+            request.temperature,
+            request.max_tokens,
+        )?;
+
+        let mut stream = self
+            .model
+            .stream(rig_req)
+            .await
+            .map_err(|e| LlmError::RequestFailed {
+                provider: self.model_name.clone(),
+                reason: e.to_string(),
+            })?;
+
+        let mut full_text = String::new();
+        let mut output_tokens: u32 = 0;
+        let mut input_tokens: u32 = 0;
+
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(StreamedAssistantContent::Text(text)) => {
+                    full_text.push_str(&text.text);
+                    on_chunk(text.text).await;
+                }
+                Ok(StreamedAssistantContent::Final(ref resp)) => {
+                    if let Some(usage) = resp.token_usage() {
+                        input_tokens = saturate_u32(usage.input_tokens);
+                        output_tokens = saturate_u32(usage.output_tokens);
+                    }
+                }
+                Ok(_) => {} // Reasoning, ToolCall, etc. — not relevant for simple complete
+                Err(e) => {
+                    return Err(LlmError::RequestFailed {
+                        provider: self.model_name.clone(),
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(CompletionResponse {
+            content: full_text,
+            input_tokens,
+            output_tokens,
+            finish_reason: FinishReason::Stop,
+            response_id: None,
+        })
+    }
+
+    async fn complete_with_tools_streaming(
+        &self,
+        request: ToolCompletionRequest,
+        on_chunk: &(dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+              + Send
+              + Sync),
+    ) -> Result<ToolCompletionResponse, LlmError>
+    where
+        M::StreamingResponse: Send + Sync + 'static,
+    {
+        let (preamble, history) = convert_messages(&request.messages);
+        let tools = convert_tools(&request.tools);
+        let tool_choice = convert_tool_choice(request.tool_choice.as_deref());
+
+        let rig_req = build_rig_request(
+            preamble,
+            history,
+            tools,
+            tool_choice,
+            request.temperature,
+            request.max_tokens,
+        )?;
+
+        let mut stream = self
+            .model
+            .stream(rig_req)
+            .await
+            .map_err(|e| LlmError::RequestFailed {
+                provider: self.model_name.clone(),
+                reason: e.to_string(),
+            })?;
+
+        let mut full_text = String::new();
+        let mut tool_calls: Vec<IronToolCall> = Vec::new();
+        let mut output_tokens: u32 = 0;
+        let mut input_tokens: u32 = 0;
+
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(StreamedAssistantContent::Text(text)) => {
+                    full_text.push_str(&text.text);
+                    on_chunk(text.text).await;
+                }
+                Ok(StreamedAssistantContent::ToolCall {
+                    tool_call,
+                    internal_call_id: _,
+                }) => {
+                    tool_calls.push(IronToolCall {
+                        id: tool_call.id,
+                        name: tool_call.function.name,
+                        arguments: tool_call.function.arguments,
+                    });
+                }
+                Ok(StreamedAssistantContent::Final(ref resp)) => {
+                    if let Some(usage) = resp.token_usage() {
+                        input_tokens = saturate_u32(usage.input_tokens);
+                        output_tokens = saturate_u32(usage.output_tokens);
+                    }
+                }
+                Ok(_) => {} // Reasoning deltas, tool call deltas — skip
+                Err(e) => {
+                    return Err(LlmError::RequestFailed {
+                        provider: self.model_name.clone(),
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        let finish = if !tool_calls.is_empty() {
+            FinishReason::ToolUse
+        } else {
+            FinishReason::Stop
+        };
+
+        let content = if full_text.is_empty() {
+            None
+        } else {
+            Some(full_text)
+        };
+
+        Ok(ToolCompletionResponse {
+            content,
+            tool_calls,
+            input_tokens,
+            output_tokens,
             finish_reason: finish,
             response_id: None,
         })

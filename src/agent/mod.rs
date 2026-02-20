@@ -19,6 +19,7 @@ mod dispatcher;
 mod heartbeat;
 pub mod job_monitor;
 mod router;
+pub mod reflex;
 pub mod routine;
 pub mod routine_engine;
 mod scheduler;

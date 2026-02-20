@@ -426,6 +426,92 @@ Respond in JSON format:
         }
     }
 
+    /// Like `respond_with_tools`, but streams text chunks to `on_chunk` in real time.
+    ///
+    /// Providers that support streaming (e.g. rig-core backends) will forward
+    /// each text fragment as it arrives from the LLM, enabling zero-latency
+    /// display. Tool call results are still returned in the final output.
+    pub async fn respond_with_tools_streaming(
+        &self,
+        context: &ReasoningContext,
+        on_chunk: &(dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+              + Send
+              + Sync),
+    ) -> Result<RespondOutput, LlmError> {
+        let system_prompt = self.build_conversation_prompt(context);
+
+        let mut messages = vec![ChatMessage::system(system_prompt)];
+        messages.extend(context.messages.clone());
+
+        let effective_tools = context.available_tools.clone();
+
+        if !effective_tools.is_empty() {
+            let mut request = ToolCompletionRequest::new(messages, effective_tools)
+                .with_max_tokens(4096)
+                .with_temperature(0.7)
+                .with_tool_choice("auto");
+            request.metadata = context.metadata.clone();
+
+            let response = self
+                .llm
+                .complete_with_tools_streaming(request, on_chunk)
+                .await?;
+            let usage = TokenUsage {
+                input_tokens: response.input_tokens,
+                output_tokens: response.output_tokens,
+            };
+
+            if !response.tool_calls.is_empty() {
+                return Ok(RespondOutput {
+                    result: RespondResult::ToolCalls {
+                        tool_calls: response.tool_calls,
+                        content: response.content,
+                    },
+                    usage,
+                });
+            }
+
+            let content = response
+                .content
+                .unwrap_or_else(|| "I'm not sure how to respond to that.".to_string());
+
+            let recovered = recover_tool_calls_from_content(&content, &context.available_tools);
+            if !recovered.is_empty() {
+                let cleaned = clean_response(&content);
+                return Ok(RespondOutput {
+                    result: RespondResult::ToolCalls {
+                        tool_calls: recovered,
+                        content: if cleaned.is_empty() {
+                            None
+                        } else {
+                            Some(cleaned)
+                        },
+                    },
+                    usage,
+                });
+            }
+
+            Ok(RespondOutput {
+                result: RespondResult::Text(clean_response(&content)),
+                usage,
+            })
+        } else {
+            let mut request = CompletionRequest::new(messages)
+                .with_max_tokens(4096)
+                .with_temperature(0.7);
+            request.metadata = context.metadata.clone();
+
+            let response = self.llm.complete_streaming(request, on_chunk).await?;
+            Ok(RespondOutput {
+                result: RespondResult::Text(clean_response(&response.content)),
+                usage: TokenUsage {
+                    input_tokens: response.input_tokens,
+                    output_tokens: response.output_tokens,
+                },
+            })
+        }
+    }
+
     fn build_planning_prompt(&self, context: &ReasoningContext) -> String {
         let tools_desc = if context.available_tools.is_empty() {
             "No tools available.".to_string()

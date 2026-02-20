@@ -177,7 +177,32 @@ impl Agent {
                     m
                 });
 
-            let output = reasoning.respond_with_tools(&context).await?;
+            // Use the streaming path: each text chunk is forwarded to
+            // the channel as a StreamChunk status update so the user
+            // sees tokens materialize in real time.
+            let channels = self.channels.clone();
+            let channel_name = message.channel.clone();
+            let metadata = message.metadata.clone();
+
+            let on_chunk =
+                |chunk: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+                    let channels = channels.clone();
+                    let channel_name = channel_name.clone();
+                    let metadata = metadata.clone();
+                    Box::pin(async move {
+                        let _ = channels
+                            .send_status(
+                                &channel_name,
+                                StatusUpdate::StreamChunk(chunk),
+                                &metadata,
+                            )
+                            .await;
+                    })
+                };
+
+            let output = reasoning
+                .respond_with_tools_streaming(&context, &on_chunk)
+                .await?;
 
             // Record cost and track token usage
             let model_name = self.llm().active_model_name();

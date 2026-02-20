@@ -191,6 +191,11 @@ pub trait JobStore: Send + Sync {
         actual_time_secs: i32,
         actual_value: Option<Decimal>,
     ) -> Result<(), DatabaseError>;
+    async fn find_recurring_job_patterns(
+        &self,
+        threshold: i64,
+        limit: i64,
+    ) -> Result<Vec<String>, DatabaseError>;
 }
 
 #[async_trait]

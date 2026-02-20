@@ -8,19 +8,20 @@ use crate::settings::Settings;
 
 /// Which LLM backend to use.
 ///
-/// Defaults to `NearAi` to keep IronClaw close to the NEAR ecosystem.
+/// Defaults to `Ollama` to ensure local processing over external APIs.
 /// Users can override with `LLM_BACKEND` env var to use their own API keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LlmBackend {
-    /// NEAR AI proxy (default) -- session or API key auth
+    /// Local Ollama instance (default)
     #[default]
+    Ollama,
+    /// NEAR AI proxy -- session or API key auth
     NearAi,
     /// Direct OpenAI API
     OpenAi,
     /// Direct Anthropic API
     Anthropic,
-    /// Local Ollama instance
-    Ollama,
+
     /// Any OpenAI-compatible endpoint (e.g. vLLM, LiteLLM, Together)
     OpenAiCompatible,
     /// Tinfoil private inference
@@ -101,7 +102,7 @@ pub struct TinfoilConfig {
 /// by setting `LLM_BACKEND` (e.g. `openai`, `anthropic`, `ollama`).
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
-    /// Which backend to use (default: NearAi)
+    /// Which backend to use (default: Ollama)
     pub backend: LlmBackend,
     /// NEAR AI config (always populated for NEAR AI embeddings, etc.)
     pub nearai: NearAiConfig,
@@ -206,15 +207,15 @@ impl LlmConfig {
                 Ok(backend) => backend,
                 Err(e) => {
                     tracing::warn!(
-                        "Invalid llm_backend '{}' in settings: {}. Using default NearAi.",
+                        "Invalid llm_backend '{}' in settings: {}. Using default Ollama.",
                         b,
                         e
                     );
-                    LlmBackend::NearAi
+                    LlmBackend::Ollama
                 }
             }
         } else {
-            LlmBackend::NearAi
+            LlmBackend::Ollama
         };
 
         // Resolve NEAR AI config only when backend is NearAi (or when explicitly configured)

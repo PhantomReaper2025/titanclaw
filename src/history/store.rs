@@ -453,6 +453,37 @@ impl Store {
 
         Ok(())
     }
+
+    /// Find recurring job patterns (descriptions) that happen frequently.
+    pub async fn find_recurring_job_patterns(
+        &self,
+        threshold: i64,
+        limit: i64,
+    ) -> Result<Vec<String>, DatabaseError> {
+        let conn = self.conn().await?;
+
+        let rows = conn
+            .query(
+                r#"
+                SELECT description, COUNT(id) as cnt
+                FROM agent_jobs
+                WHERE status = 'completed' AND description IS NOT NULL AND description != ''
+                GROUP BY description
+                HAVING COUNT(id) >= $1
+                ORDER BY cnt DESC
+                LIMIT $2
+                "#,
+                &[&threshold, &limit],
+            )
+            .await?;
+
+        let mut patterns = Vec::new();
+        for row in rows {
+            patterns.push(row.get("description"));
+        }
+
+        Ok(patterns)
+    }
 }
 
 // ==================== Sandbox Jobs ====================

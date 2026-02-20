@@ -327,4 +327,40 @@ impl JobStore for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
+
+    async fn find_recurring_job_patterns(
+        &self,
+        threshold: i64,
+        limit: i64,
+    ) -> Result<Vec<String>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT description, COUNT(id) as cnt
+                FROM agent_jobs
+                WHERE status = 'completed' AND description IS NOT NULL AND description != ''
+                GROUP BY description
+                HAVING COUNT(id) >= ?1
+                ORDER BY cnt DESC
+                LIMIT ?2
+                "#,
+                params![threshold, limit],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut patterns = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            if let Ok(desc) = row.get::<String>(0) {
+                patterns.push(desc);
+            }
+        }
+
+        Ok(patterns)
+    }
 }
