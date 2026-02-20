@@ -17,10 +17,10 @@ use crate::skills::registry::SkillRegistry;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
 use crate::tools::builtin::{
     ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, HttpTool, JobEventsTool, JobPromptTool,
-    JobStatusTool, JsonTool, ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool,
-    MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool, ShellTool, SkillInstallTool,
-    SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool, ToolActivateTool, ToolAuthTool,
-    ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool, WriteFileTool,
+    JobStatusTool, JsonTool, ListDirTool, ListJobsTool, MemoryGraphTool, MemoryReadTool,
+    MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool, ShellTool,
+    SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool, ToolActivateTool,
+    ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool, WriteFileTool,
 };
 use crate::tools::tool::{Tool, ToolDomain};
 use crate::tools::wasm::{
@@ -45,6 +45,7 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "memory_search",
     "memory_write",
     "memory_read",
+    "memory_graph",
     "memory_tree",
     "create_job",
     "list_jobs",
@@ -243,9 +244,10 @@ impl ToolRegistry {
         self.register_sync(Arc::new(MemorySearchTool::new(Arc::clone(&workspace))));
         self.register_sync(Arc::new(MemoryWriteTool::new(Arc::clone(&workspace))));
         self.register_sync(Arc::new(MemoryReadTool::new(Arc::clone(&workspace))));
+        self.register_sync(Arc::new(MemoryGraphTool::new(Arc::clone(&workspace))));
         self.register_sync(Arc::new(MemoryTreeTool::new(workspace)));
 
-        tracing::info!("Registered 4 memory tools");
+        tracing::info!("Registered 5 memory tools");
     }
 
     /// Register job management tools.

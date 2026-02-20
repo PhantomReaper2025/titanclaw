@@ -352,6 +352,95 @@ impl Tool for MemoryReadTool {
     }
 }
 
+/// Tool for querying AST graph relationships from indexed workspace code.
+pub struct MemoryGraphTool {
+    workspace: Arc<Workspace>,
+}
+
+impl MemoryGraphTool {
+    /// Create a new memory graph query tool.
+    pub fn new(workspace: Arc<Workspace>) -> Self {
+        Self { workspace }
+    }
+}
+
+#[async_trait]
+impl Tool for MemoryGraphTool {
+    fn name(&self) -> &str {
+        "memory_graph"
+    }
+
+    fn description(&self) -> &str {
+        "Query AST graph relationships for a symbol in indexed Rust code. \
+         Returns symbol matches with outgoing call edges and source file paths."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "Exact symbol/function name to query in AST graph."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of symbol matches to return (default: 5, max: 20).",
+                    "default": 5,
+                    "minimum": 1,
+                    "maximum": 20
+                },
+                "depth": {
+                    "type": "integer",
+                    "description": "Traversal depth for related symbols (1 = direct symbol only, max: 3).",
+                    "default": 1,
+                    "minimum": 1,
+                    "maximum": 3
+                }
+            },
+            "required": ["symbol"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        _ctx: &JobContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let start = std::time::Instant::now();
+
+        let symbol = require_str(&params, "symbol")?;
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5)
+            .min(20) as usize;
+        let depth = params
+            .get("depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .clamp(1, 3) as usize;
+
+        let matches = self
+            .workspace
+            .ast_graph_query(symbol, limit, depth)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("AST graph query failed: {}", e)))?;
+
+        let output = serde_json::json!({
+            "symbol": symbol,
+            "matches": matches,
+            "match_count": matches.len(),
+        });
+
+        Ok(ToolOutput::success(output, start.elapsed()))
+    }
+
+    fn requires_sanitization(&self) -> bool {
+        false // Internal indexed workspace data
+    }
+}
+
 /// Tool for viewing workspace structure as a tree.
 ///
 /// Returns a hierarchical view of files and directories with configurable depth.
@@ -546,5 +635,24 @@ mod tests {
         assert!(schema["properties"]["path"].is_object());
         assert!(schema["properties"]["depth"].is_object());
         assert_eq!(schema["properties"]["depth"]["default"], 1);
+    }
+
+    #[test]
+    fn test_memory_graph_schema() {
+        let workspace = make_test_workspace();
+        let tool = MemoryGraphTool::new(workspace);
+
+        assert_eq!(tool.name(), "memory_graph");
+
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"]["symbol"].is_object());
+        assert!(schema["properties"]["limit"].is_object());
+        assert!(schema["properties"]["depth"].is_object());
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&"symbol".into())
+        );
     }
 }

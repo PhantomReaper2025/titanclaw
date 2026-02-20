@@ -19,7 +19,18 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 | Zero-latency text streaming | ✅ | Streaming chunk path is active in agent dispatcher to REPL/Web/WASM channels. |
 | Tool/block-level streaming | 🚧 | Tool start/completion/result events are live; shell tool now streams incremental stdout/stderr chunks in real time, while token-to-tool piped execution remains partial. |
 | Reflex compiler | 🚧 | Background reflex compiler loop is running; deterministic natural-language fast-path now bypasses LLM for high-confidence job intents (`list/status/cancel/help/create`), but generalized reflex routing is still incomplete. |
-| GraphRAG + AST indexing | 🚧 | Tree-sitter AST graph indexing is integrated for Rust docs; full knowledge-graph behavior remains in progress. |
+| GraphRAG + AST indexing | 🚧 | Tree-sitter AST graph indexing is integrated and queryable through `memory_graph` (now with bounded multi-hop traversal); ranking and richer graph reasoning are still in progress. |
+
+## Execution TODO (Live)
+
+- [x] Zero-latency text streaming to channels
+- [x] Shell tool incremental output streaming
+- [x] Deterministic NL reflex fast-path for job intents
+- [x] AST graph indexing + symbol-level query tool (`memory_graph`)
+- [ ] Token-to-tool piped execution (execute before full tool-call completion)
+- [ ] Generalized reflex routing from recurring patterns to compiled tools
+- [ ] Multi-hop GraphRAG retrieval quality (cross-file traversal is live; ranking/context fusion still pending)
+- [ ] Swarm workload distribution from scheduler into mesh peers
 
 ## Proposed Changes
 

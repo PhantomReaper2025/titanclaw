@@ -25,7 +25,9 @@ pub use job::{
     PromptQueue,
 };
 pub use json::JsonTool;
-pub use memory::{MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool};
+pub use memory::{
+    MemoryGraphTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool,
+};
 pub use routine::{
     RoutineCreateTool, RoutineDeleteTool, RoutineHistoryTool, RoutineListTool, RoutineUpdateTool,
 };

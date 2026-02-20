@@ -62,6 +62,7 @@ use std::sync::Arc;
 use chrono::{NaiveDate, Utc};
 #[cfg(feature = "postgres")]
 use deadpool_postgres::Pool;
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::WorkspaceError;
@@ -611,6 +612,121 @@ impl Workspace {
                 &config,
             )
             .await
+    }
+
+    /// Query indexed AST graph relationships for a symbol name.
+    ///
+    /// Returns matches across indexed Rust documents with outgoing call edges
+    /// resolved to symbol names where available.
+    pub async fn ast_graph_query(
+        &self,
+        symbol: &str,
+        limit: usize,
+        depth: usize,
+    ) -> Result<Vec<serde_json::Value>, WorkspaceError> {
+        let db = match &self.storage {
+            WorkspaceStorage::Db(db) => db,
+            #[cfg(feature = "postgres")]
+            WorkspaceStorage::Repo(_) => {
+                return Err(WorkspaceError::SearchFailed {
+                    reason: "AST graph query requires Database-backed workspace".to_string(),
+                });
+            }
+        };
+
+        let mut nodes = db.find_ast_nodes_by_name(symbol).await?;
+        nodes.truncate(limit.max(1));
+
+        let mut results = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let doc = self.storage.get_document_by_id(node.document_id).await?;
+            let doc_nodes = db.get_ast_nodes(node.document_id).await?;
+            let name_by_id = doc_nodes
+                .into_iter()
+                .map(|n| (n.id, n.name))
+                .collect::<std::collections::HashMap<_, _>>();
+            let edges = db.get_ast_edges_from(node.id).await?;
+            let outgoing_calls = edges
+                .iter()
+                .filter_map(|e| name_by_id.get(&e.target_node_id).cloned())
+                .collect::<Vec<_>>();
+
+            let mut related_symbols = Vec::new();
+            if depth > 1 {
+                let mut visited = std::collections::HashSet::new();
+                visited.insert(node.name.clone());
+                let mut frontier = outgoing_calls.clone();
+
+                // Bounded breadth expansion using symbol-name linkage across indexed docs.
+                for hop in 2..=depth.min(3) {
+                    if frontier.is_empty() {
+                        break;
+                    }
+
+                    let mut next_frontier = Vec::new();
+                    for sym in frontier.into_iter().take(64) {
+                        if !visited.insert(sym.clone()) {
+                            continue;
+                        }
+
+                        let linked_nodes = db.find_ast_nodes_by_name(&sym).await?;
+                        let mut linked_paths = std::collections::BTreeSet::new();
+
+                        for linked in linked_nodes.iter().take(24) {
+                            if let Ok(doc) =
+                                self.storage.get_document_by_id(linked.document_id).await
+                            {
+                                linked_paths.insert(doc.path);
+                            }
+
+                            let linked_doc_nodes = db.get_ast_nodes(linked.document_id).await?;
+                            let linked_name_by_id = linked_doc_nodes
+                                .into_iter()
+                                .map(|n| (n.id, n.name))
+                                .collect::<std::collections::HashMap<_, _>>();
+                            let linked_edges = db.get_ast_edges_from(linked.id).await?;
+                            for target_name in linked_edges
+                                .iter()
+                                .filter_map(|e| linked_name_by_id.get(&e.target_node_id))
+                            {
+                                if !visited.contains(target_name) {
+                                    next_frontier.push(target_name.clone());
+                                }
+                            }
+                        }
+
+                        related_symbols.push(json!({
+                            "symbol": sym,
+                            "hop": hop,
+                            "match_count": linked_nodes.len(),
+                            "paths": linked_paths.into_iter().collect::<Vec<_>>(),
+                        }));
+                    }
+
+                    // Keep expansion bounded and deterministic.
+                    next_frontier.sort();
+                    next_frontier.dedup();
+                    next_frontier.truncate(64);
+                    frontier = next_frontier;
+                }
+            }
+
+            results.push(json!({
+                "symbol": node.name,
+                "node_type": node.node_type,
+                "document_id": node.document_id.to_string(),
+                "path": doc.path,
+                "start_byte": node.start_byte,
+                "end_byte": node.end_byte,
+                "content_preview": node.content_preview,
+                "outgoing_calls": outgoing_calls,
+                "outgoing_edge_count": edges.len(),
+                "related_symbols": related_symbols,
+                "traversal_depth": depth.min(3),
+            }));
+        }
+
+        Ok(results)
     }
 
     // ==================== Indexing ====================

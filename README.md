@@ -36,7 +36,7 @@ Based on `implementation_plan.md`, this is where the upgrade stands today.
 | Phase 0: secure extensibility | ✅ | WASM tool system, dynamic tool building, secure skills framework |
 | Phase 0: streaming everywhere | 🚧 | Gateway SSE/WebSocket exists; shell tool output now streams live per chunk, full token-to-tool piped execution still in progress |
 | Phase 0: reflex fast-path bypass | 🚧 | Deterministic natural-language fast-path now bypasses LLM for high-confidence job intents (list/status/cancel/help/create) |
-| Phase 1: deep context indexing | 🚧 | Tree-sitter and memory foundations are present; full GraphRAG path is not complete |
+| Phase 1: deep context indexing | 🚧 | Tree-sitter AST indexing is live and queryable with `memory_graph` (including bounded multi-hop traversal); full GraphRAG ranking/context fusion is not complete |
 | Phase 2: distributed swarm mesh | 🔮 | libp2p dependencies are integrated; mesh-level runtime behavior is roadmap work |
 
 ## Capabilities
@@ -52,6 +52,18 @@ Based on `implementation_plan.md`, this is where the upgrade stands today.
 - Docker-isolated workers for higher-risk or heavier executions
 - OpenAI-compatible API endpoints for external integration
 - LLM-bypassed fast-path for common job ops in natural language
+- AST graph symbol query via `memory_graph` for indexed Rust code relationships (with bounded multi-hop traversal)
+
+### Current TODO
+
+- [x] Zero-latency text streaming to channels
+- [x] Shell tool incremental output streaming
+- [x] Deterministic NL fast-path bypass for common job intents
+- [x] AST graph indexing + query access (`memory_graph`)
+- [ ] Token-to-tool piped execution
+- [ ] Generalized reflex routing from recurring patterns
+- [ ] Multi-hop GraphRAG ranking/context fusion
+- [ ] Swarm task distribution beyond local runtime wiring
 
 ### Built For Operators
 
