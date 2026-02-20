@@ -1,288 +1,162 @@
 <p align="center">
-  <img src="ironclaw.png" alt="IronClaw" width="200"/>
+  <img src="ironclaw.png" alt="TitanClaw" width="220"/>
 </p>
 
-<h1 align="center">IronClaw</h1>
+<h1 align="center">TitanClaw</h1>
 
 <p align="center">
-  <strong>Your secure personal AI assistant, always on your side</strong>
+  <strong>IronClaw, upgraded for secure high-throughput orchestration.</strong>
 </p>
 
 <p align="center">
-  <a href="#philosophy">Philosophy</a> •
-  <a href="#features">Features</a> •
-  <a href="#installation">Installation</a> •
-  <a href="#configuration">Configuration</a> •
-  <a href="#security">Security</a> •
-  <a href="#architecture">Architecture</a>
+  <a href="#why-titanclaw">Why TitanClaw</a> •
+  <a href="#titan-upgrade-status">Titan Upgrade Status</a> •
+  <a href="#capabilities">Capabilities</a> •
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#architecture">Architecture</a> •
+  <a href="#security-model">Security Model</a>
 </p>
 
 ---
 
-## Philosophy
+## Why TitanClaw
 
-IronClaw is built on a simple principle: **your AI assistant should work for you, not against you**.
+TitanClaw is a security-first AI runtime built for people who need real automation, not just chat.
 
-In a world where AI systems are increasingly opaque about data handling and aligned with corporate interests, IronClaw takes a different approach:
+It keeps your data under your control, runs tools in hardened sandboxes, supports multi-provider inference, and scales execution through concurrent jobs and isolated workers.
 
-- **Your data stays yours** - All information is stored locally, encrypted, and never leaves your control
-- **Transparency by design** - Open source, auditable, no hidden telemetry or data harvesting
-- **Self-expanding capabilities** - Build new tools on the fly without waiting for vendor updates
-- **Defense in depth** - Multiple security layers protect against prompt injection and data exfiltration
+## Titan Upgrade Status
 
-IronClaw is the AI assistant you can actually trust with your personal and professional life.
+Based on `implementation_plan.md`, this is where the upgrade stands today.
 
-## Features
+| Track | Status | What is live now |
+|---|---|---|
+| Phase 0: provider independence + local inference | ✅ | NEAR AI, OpenAI-compatible, Ollama, Tinfoil, provider failover |
+| Phase 0: orchestration foundations | ✅ | Scheduler, parallel jobs, Docker worker/orchestrator flow |
+| Phase 0: secure extensibility | ✅ | WASM tool system, dynamic tool building, secure skills framework |
+| Phase 0: streaming everywhere | 🚧 | Gateway SSE/WebSocket exists; full block/tool streaming parity still in progress |
+| Phase 1: deep context indexing | 🚧 | Tree-sitter and memory foundations are present; full GraphRAG path is not complete |
+| Phase 2: distributed swarm mesh | 🔮 | libp2p dependencies are integrated; mesh-level runtime behavior is roadmap work |
 
-### Security First
+## Capabilities
 
-- **WASM Sandbox** - Untrusted tools run in isolated WebAssembly containers with capability-based permissions
-- **Credential Protection** - Secrets are never exposed to tools; injected at the host boundary with leak detection
-- **Prompt Injection Defense** - Pattern detection, content sanitization, and policy enforcement
-- **Endpoint Allowlisting** - HTTP requests only to explicitly approved hosts and paths
+### What You Get Today
 
-### Always Available
+- Multi-provider LLM runtime with failover and retry logic
+- Local-first memory with hybrid retrieval and persistent workspace context
+- Secure WASM tool sandbox with capability gates and outbound allowlists
+- Dynamic tool creation pipeline for runtime expansion
+- Web gateway with WebSocket + SSE for real-time interaction
+- Routines/automation engine for scheduled and event-driven tasks
+- Docker-isolated workers for higher-risk or heavier executions
+- OpenAI-compatible API endpoints for external integration
 
-- **Multi-channel** - REPL, HTTP webhooks, WASM channels (Telegram, Slack), and web gateway
-- **Docker Sandbox** - Isolated container execution with per-job tokens and orchestrator/worker pattern
-- **Web Gateway** - Browser UI with real-time SSE/WebSocket streaming
-- **Routines** - Cron schedules, event triggers, webhook handlers for background automation
-- **Heartbeat System** - Proactive background execution for monitoring and maintenance tasks
-- **Parallel Jobs** - Handle multiple requests concurrently with isolated contexts
-- **Self-repair** - Automatic detection and recovery of stuck operations
+### Built For Operators
 
-### Self-Expanding
+- Strong defaults for prompt-injection resistance and secret handling
+- Auditability and explicit approval flows for sensitive actions
+- CLI + service model for persistent local operation
+- Rust-native performance with a single deployable binary
 
-- **Dynamic Tool Building** - Describe what you need, and IronClaw builds it as a WASM tool
-- **MCP Protocol** - Connect to Model Context Protocol servers for additional capabilities
-- **Plugin Architecture** - Drop in new WASM tools and channels without restarting
-
-### Persistent Memory
-
-- **Hybrid Search** - Full-text + vector search using Reciprocal Rank Fusion
-- **Workspace Filesystem** - Flexible path-based storage for notes, logs, and context
-- **Identity Files** - Maintain consistent personality and preferences across sessions
-
-## Installation
+## Quick Start
 
 ### Prerequisites
 
-- Rust 1.85+
-- PostgreSQL 15+ with [pgvector](https://github.com/pgvector/pgvector) extension
-- NEAR AI account (authentication handled via setup wizard)
+- Rust `1.92+`
+- PostgreSQL `15+` with `pgvector` (recommended)
+- Optional: Ollama for local inference
 
-## Download or Build
+### Install
 
-Visit [Releases page](https://github.com/nearai/ironclaw/releases/) to see the latest updates.
+Use upstream release assets:
 
-<details>
-  <summary>Install via Windows Installer (Windows)</summary>
+- Windows MSI: `https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-x86_64-pc-windows-msvc.msi`
+- PowerShell installer: `irm https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-installer.ps1 | iex`
+- Shell installer: `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-installer.sh | sh`
 
-Download the [Windows Installer](https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-x86_64-pc-windows-msvc.msi) and run it.
-
-</details>
-
-<details>
-  <summary>Install via powershell script (Windows)</summary>
-
-```sh
-irm https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-installer.ps1 | iex
-```
-
-</details>
-
-<details>
-  <summary>Install via shell script (macOS, Linux, Windows/WSL)</summary>
-
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-installer.sh | sh
-```
-</details>
-
-<details>
-  <summary>Compile the source code (Cargo on Windows, Linux, macOS)</summary>
-
-Install it with `cargo`, just make sure you have [Rust](https://rustup.rs) installed on your computer.
+Or build from source:
 
 ```bash
-# Clone the repository
-git clone https://github.com/nearai/ironclaw.git
-cd ironclaw
-
-# Build
+git clone https://github.com/PhantomReaper2025/titanclaw.git
+cd titanclaw
 cargo build --release
-
-# Run tests
-cargo test
 ```
 
-For **full release** (after modifying channel sources), run `./scripts/build-all.sh` to rebuild channels first.
-
-</details>
-
-### Database Setup
+### First Run
 
 ```bash
-# Create database
-createdb ironclaw
+# Interactive setup wizard
+./target/release/ironclaw onboard
 
-# Enable pgvector
-psql ironclaw -c "CREATE EXTENSION IF NOT EXISTS vector;"
+# Start agent runtime (default command)
+./target/release/ironclaw run
 ```
 
-## Configuration
-
-Run the setup wizard to configure IronClaw:
+### Useful Commands
 
 ```bash
-ironclaw onboard
+# Health and diagnostics
+./target/release/ironclaw status
+./target/release/ironclaw doctor
+
+# Tool and memory management
+./target/release/ironclaw tool --help
+./target/release/ironclaw memory --help
+
+# Service management
+./target/release/ironclaw service --help
 ```
-
-The wizard handles database connection, NEAR AI authentication (via browser OAuth),
-and secrets encryption (using your system keychain). Settings are persisted in the
-connected database; bootstrap variables (e.g. `DATABASE_URL`, `LLM_BACKEND`) are
-written to `~/.ironclaw/.env` so they are available before the database connects.
-
-## Security
-
-IronClaw implements defense in depth to protect your data and prevent misuse.
-
-### WASM Sandbox
-
-All untrusted tools run in isolated WebAssembly containers:
-
-- **Capability-based permissions** - Explicit opt-in for HTTP, secrets, tool invocation
-- **Endpoint allowlisting** - HTTP requests only to approved hosts/paths
-- **Credential injection** - Secrets injected at host boundary, never exposed to WASM code
-- **Leak detection** - Scans requests and responses for secret exfiltration attempts
-- **Rate limiting** - Per-tool request limits to prevent abuse
-- **Resource limits** - Memory, CPU, and execution time constraints
-
-```
-WASM ──► Allowlist ──► Leak Scan ──► Credential ──► Execute ──► Leak Scan ──► WASM
-         Validator     (request)     Injector       Request     (response)
-```
-
-### Prompt Injection Defense
-
-External content passes through multiple security layers:
-
-- Pattern-based detection of injection attempts
-- Content sanitization and escaping
-- Policy rules with severity levels (Block/Warn/Review/Sanitize)
-- Tool output wrapping for safe LLM context injection
-
-### Data Protection
-
-- All data stored locally in your PostgreSQL database
-- Secrets encrypted with AES-256-GCM
-- No telemetry, analytics, or data sharing
-- Full audit log of all tool executions
 
 ## Architecture
 
-```
-┌────────────────────────────────────────────────────────────────┐
-│                          Channels                              │
-│  ┌──────┐  ┌──────┐   ┌─────────────┐  ┌─────────────┐         │
-│  │ REPL │  │ HTTP │   │WASM Channels│  │ Web Gateway │         │
-│  └──┬───┘  └──┬───┘   └──────┬──────┘  │ (SSE + WS)  │         │
-│     │         │              │         └──────┬──────┘         │
-│     └─────────┴──────────────┴────────────────┘                │
-│                              │                                 │
-│                    ┌─────────▼─────────┐                       │
-│                    │    Agent Loop     │  Intent routing       │
-│                    └────┬──────────┬───┘                       │
-│                         │          │                           │
-│              ┌──────────▼────┐  ┌──▼───────────────┐           │
-│              │  Scheduler    │  │ Routines Engine  │           │
-│              │(parallel jobs)│  │(cron, event, wh) │           │
-│              └──────┬────────┘  └────────┬─────────┘           │
-│                     │                    │                     │
-│       ┌─────────────┼────────────────────┘                     │
-│       │             │                                          │
-│   ┌───▼─────┐  ┌────▼────────────────┐                         │
-│   │ Local   │  │    Orchestrator     │                         │
-│   │Workers  │  │  ┌───────────────┐  │                         │
-│   │(in-proc)│  │  │ Docker Sandbox│  │                         │
-│   └───┬─────┘  │  │   Containers  │  │                         │
-│       │        │  │ ┌───────────┐ │  │                         │
-│       │        │  │ │Worker / CC│ │  │                         │
-│       │        │  │ └───────────┘ │  │                         │
-│       │        │  └───────────────┘  │                         │
-│       │        └─────────┬───────────┘                         │
-│       └──────────────────┤                                     │
-│                          │                                     │
-│              ┌───────────▼──────────┐                          │
-│              │    Tool Registry     │                          │
-│              │  Built-in, MCP, WASM │                          │
-│              └──────────────────────┘                          │
-└────────────────────────────────────────────────────────────────┘
+```text
+Channels (CLI / Web / Webhooks / WASM Integrations)
+          |
+          v
+Agent Loop + Router
+          |
+          +--> Scheduler (parallel task execution)
+          |
+          +--> Routines Engine (cron/event/webhook)
+          |
+          +--> Tool Registry (built-in + WASM + MCP)
+          |
+          +--> Orchestrator --> Docker Workers (isolated execution)
+          |
+          +--> Workspace + Hybrid Memory Store
 ```
 
-### Core Components
+For detailed parity tracking and OpenClaw comparison, see `FEATURE_PARITY.md`.
 
-| Component | Purpose |
-|-----------|---------|
-| **Agent Loop** | Main message handling and job coordination |
-| **Router** | Classifies user intent (command, query, task) |
-| **Scheduler** | Manages parallel job execution with priorities |
-| **Worker** | Executes jobs with LLM reasoning and tool calls |
-| **Orchestrator** | Container lifecycle, LLM proxying, per-job auth |
-| **Web Gateway** | Browser UI with chat, memory, jobs, logs, extensions, routines |
-| **Routines Engine** | Scheduled (cron) and reactive (event, webhook) background tasks |
-| **Workspace** | Persistent memory with hybrid search |
-| **Safety Layer** | Prompt injection defense and content sanitization |
+## Security Model
 
-## Usage
+Defense-in-depth is a core design constraint, not an add-on.
 
-```bash
-# First-time setup (configures database, auth, etc.)
-ironclaw onboard
-
-# Start interactive REPL
-cargo run
-
-# With debug logging
-RUST_LOG=ironclaw=debug cargo run
-```
+- WASM capability sandbox for untrusted tools
+- Request/response scanning and policy checks for exfiltration patterns
+- Secrets injected at host boundary instead of exposing raw credentials to tools
+- Endpoint allowlisting for outbound network activity
+- Isolation layers: in-process controls plus optional Docker worker boundaries
 
 ## Development
 
 ```bash
-# Format code
 cargo fmt
-
-# Lint
 cargo clippy --all --benches --tests --examples --all-features
-
-# Run tests
-createdb ironclaw_test
 cargo test
-
-# Run specific test
-cargo test test_name
 ```
 
-- **Telegram channel**: See [docs/TELEGRAM_SETUP.md](docs/TELEGRAM_SETUP.md) for setup and DM pairing.
-- **Changing channel sources**: Run `./channels-src/telegram/build.sh` before `cargo build` so the updated WASM is bundled.
+If you modify channel source packages, run `./scripts/build-all.sh` before a release build.
 
-## OpenClaw Heritage
+## Project Lineage
 
-IronClaw is a Rust reimplementation inspired by [OpenClaw](https://github.com/openclaw/openclaw). See [FEATURE_PARITY.md](FEATURE_PARITY.md) for the complete tracking matrix.
-
-Key differences:
-
-- **Rust vs TypeScript** - Native performance, memory safety, single binary
-- **WASM sandbox vs Docker** - Lightweight, capability-based security
-- **PostgreSQL vs SQLite** - Production-ready persistence
-- **Security-first design** - Multiple defense layers, credential protection
+TitanClaw is built on IronClaw's Rust architecture and tracks OpenClaw parity progress in `FEATURE_PARITY.md`.
 
 ## License
 
-Licensed under either of:
+Licensed under either:
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT License ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, Version 2.0 (`LICENSE-APACHE`)
+- MIT License (`LICENSE-MIT`)
 
 at your option.
