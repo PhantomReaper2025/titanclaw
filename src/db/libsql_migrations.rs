@@ -506,6 +506,21 @@ CREATE TABLE IF NOT EXISTS settings (
 
 CREATE INDEX IF NOT EXISTS idx_settings_user ON settings(user_id);
 
+-- ==================== Reflex Patterns ====================
+
+CREATE TABLE IF NOT EXISTS reflex_patterns (
+    normalized_pattern TEXT PRIMARY KEY,
+    compiled_tool_name TEXT NOT NULL,
+    source_count INTEGER NOT NULL DEFAULT 0,
+    last_seen_at TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_reflex_patterns_enabled ON reflex_patterns(enabled);
+CREATE INDEX IF NOT EXISTS idx_reflex_patterns_last_seen ON reflex_patterns(last_seen_at DESC);
+
 -- ==================== Missing indexes (parity with PostgreSQL) ====================
 
 -- agent_jobs

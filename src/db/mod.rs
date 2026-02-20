@@ -196,6 +196,16 @@ pub trait JobStore: Send + Sync {
         threshold: i64,
         limit: i64,
     ) -> Result<Vec<String>, DatabaseError>;
+    async fn upsert_reflex_pattern(
+        &self,
+        normalized_pattern: &str,
+        compiled_tool_name: &str,
+    ) -> Result<(), DatabaseError>;
+    async fn find_reflex_tool_for_pattern(
+        &self,
+        normalized_pattern: &str,
+    ) -> Result<Option<String>, DatabaseError>;
+    async fn bump_reflex_pattern_hit(&self, normalized_pattern: &str) -> Result<(), DatabaseError>;
 }
 
 #[async_trait]

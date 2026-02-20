@@ -363,4 +363,65 @@ impl JobStore for LibSqlBackend {
 
         Ok(patterns)
     }
+
+    async fn upsert_reflex_pattern(
+        &self,
+        normalized_pattern: &str,
+        compiled_tool_name: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let now = fmt_ts(&Utc::now());
+        conn.execute(
+            r#"
+            INSERT INTO reflex_patterns
+                (normalized_pattern, compiled_tool_name, source_count, last_seen_at, created_at, updated_at)
+            VALUES (?1, ?2, 1, ?3, ?3, ?3)
+            ON CONFLICT(normalized_pattern) DO UPDATE SET
+                compiled_tool_name = excluded.compiled_tool_name,
+                source_count = reflex_patterns.source_count + 1,
+                last_seen_at = excluded.last_seen_at,
+                updated_at = excluded.updated_at
+            "#,
+            params![normalized_pattern, compiled_tool_name, now],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn find_reflex_tool_for_pattern(
+        &self,
+        normalized_pattern: &str,
+    ) -> Result<Option<String>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT compiled_tool_name FROM reflex_patterns WHERE normalized_pattern = ?1 AND enabled = 1",
+                params![normalized_pattern],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+            && let Ok(name) = row.get::<String>(0)
+        {
+            return Ok(Some(name));
+        }
+        Ok(None)
+    }
+
+    async fn bump_reflex_pattern_hit(&self, normalized_pattern: &str) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let now = fmt_ts(&Utc::now());
+        conn.execute(
+            "UPDATE reflex_patterns SET source_count = source_count + 1, last_seen_at = ?2, updated_at = ?2 WHERE normalized_pattern = ?1",
+            params![normalized_pattern, now],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(())
+    }
 }

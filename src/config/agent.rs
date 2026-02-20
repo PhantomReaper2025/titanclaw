@@ -23,6 +23,8 @@ pub struct AgentConfig {
     pub max_cost_per_day_cents: Option<u64>,
     /// Maximum LLM/tool actions per hour. None = unlimited.
     pub max_actions_per_hour: Option<u64>,
+    /// Enable token-to-tool piped execution path.
+    pub enable_piped_tool_execution: bool,
 }
 
 impl AgentConfig {
@@ -115,6 +117,14 @@ impl AgentConfig {
                     key: "MAX_ACTIONS_PER_HOUR".to_string(),
                     message: format!("must be a positive integer: {e}"),
                 })?,
+            enable_piped_tool_execution: optional_env("ENABLE_PIPED_TOOL_EXECUTION")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "ENABLE_PIPED_TOOL_EXECUTION".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(settings.agent.enable_piped_tool_execution),
         })
     }
 }

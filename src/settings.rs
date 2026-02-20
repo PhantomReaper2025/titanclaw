@@ -306,6 +306,10 @@ pub struct AgentSettings {
     /// longer than this are pruned from memory.
     #[serde(default = "default_session_idle_timeout")]
     pub session_idle_timeout_secs: u64,
+
+    /// Enable experimental token-to-tool piped execution path.
+    #[serde(default)]
+    pub enable_piped_tool_execution: bool,
 }
 
 fn default_agent_name() -> String {
@@ -351,6 +355,7 @@ impl Default for AgentSettings {
             repair_check_interval_secs: default_repair_interval(),
             max_repair_attempts: default_max_repair_attempts(),
             session_idle_timeout_secs: default_session_idle_timeout(),
+            enable_piped_tool_execution: false,
         }
     }
 }

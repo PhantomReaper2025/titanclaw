@@ -17,9 +17,9 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 |---|---|---|
 | Swarm mesh runtime wiring | 🚧 | `swarm` module exists and is now wired into main runtime lifecycle behind config (`SWARM_ENABLED`, listen/heartbeat/max slots). |
 | Zero-latency text streaming | ✅ | Streaming chunk path is active in agent dispatcher to REPL/Web/WASM channels. |
-| Tool/block-level streaming | 🚧 | Tool start/completion/result events are live; shell tool streams incremental stdout/stderr, and streamed tool-call deltas now surface live shell command drafts (`[draft]`) before final tool-call resolution. Full execute-while-generating behavior remains partial. |
-| Reflex compiler | 🚧 | Background reflex compiler loop is running; deterministic natural-language fast-path now bypasses LLM for high-confidence job intents (`list/status/cancel/help/create`), but generalized reflex routing is still incomplete. |
-| GraphRAG + AST indexing | 🚧 | Tree-sitter AST graph indexing is integrated and queryable through `memory_graph` with bounded multi-hop traversal, graph scoring, and semantic context fusion; higher-order reasoning quality tuning is still in progress. |
+| Tool/block-level streaming | 🚧 | Tool start/completion/result events are live; shell tool streams incremental stdout/stderr, streamed tool-call deltas surface live shell command drafts (`[draft]`), and feature-flagged early piped shell execution is enabled for safe auto-approved commands (`ENABLE_PIPED_TOOL_EXECUTION=true`). |
+| Reflex compiler | ✅ | Background reflex compiler now persists normalized recurring patterns to a reflex registry and routes matching prompts directly to compiled tools before LLM fallback. |
+| GraphRAG + AST indexing | ✅ | `memory_graph` now supports bounded multi-hop traversal, graph scoring, stable ranking, and semantic context fusion in responses. |
 
 ## Execution TODO (Live)
 
@@ -27,9 +27,9 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 - [x] Shell tool incremental output streaming
 - [x] Deterministic NL reflex fast-path for job intents
 - [x] AST graph indexing + symbol-level query tool (`memory_graph`)
-- [ ] Token-to-tool piped execution completion (live tool-call draft piping is live; full execute-before-final-resolution path still pending)
-- [ ] Generalized reflex routing from recurring patterns to compiled tools
-- [ ] Multi-hop GraphRAG retrieval quality hardening (cross-file traversal + initial ranking/context fusion are live; advanced reasoning quality tuning remains)
+- [x] Generalized reflex routing from recurring patterns to compiled tools
+- [x] Multi-hop GraphRAG retrieval quality hardening
+- [ ] Token-to-tool piped execution completion (feature-flagged early execution is live; broad default-on rollout and approval UX hardening remain)
 - [ ] Swarm workload distribution from scheduler into mesh peers
 
 ## Proposed Changes

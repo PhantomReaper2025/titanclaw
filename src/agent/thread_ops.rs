@@ -18,6 +18,14 @@ use crate::context::JobContext;
 use crate::error::Error;
 use crate::llm::ChatMessage;
 
+fn normalize_reflex_pattern(input: &str) -> String {
+    input
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl Agent {
     /// Hydrate a historical thread from DB into memory if not already present.
     ///
@@ -199,6 +207,68 @@ impl Agent {
         if let Some(intent) = self.router.route_fast_path_nl(&temp_message) {
             tracing::debug!("Routed via natural-language fast path");
             return self.handle_job_or_command(intent, message).await;
+        }
+
+        if let Some(store) = self.store() {
+            let normalized = normalize_reflex_pattern(content);
+            match store.find_reflex_tool_for_pattern(&normalized).await {
+                Ok(Some(tool_name)) => {
+                    if self.tools().has(&tool_name).await {
+                        tracing::info!(
+                            tool = %tool_name,
+                            pattern = %normalized,
+                            "Routed via reflex pattern registry"
+                        );
+
+                        let _ = self
+                            .channels
+                            .send_status(
+                                &message.channel,
+                                StatusUpdate::Thinking(format!(
+                                    "Reflex fast-path: executing {}",
+                                    tool_name
+                                )),
+                                &message.metadata,
+                            )
+                            .await;
+
+                        let job_ctx = JobContext::with_user(
+                            &message.user_id,
+                            "chat",
+                            "Reflex fast-path execution",
+                        );
+                        let params = serde_json::json!({ "input": content });
+                        let live_stream = tool_name == "shell";
+                        match self
+                            .execute_chat_tool(
+                                &tool_name,
+                                &params,
+                                &job_ctx,
+                                &message.channel,
+                                &message.metadata,
+                                live_stream,
+                            )
+                            .await
+                        {
+                            Ok(output) => {
+                                let _ = store.bump_reflex_pattern_hit(&normalized).await;
+                                return Ok(SubmissionResult::response(output));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    tool = %tool_name,
+                                    "Reflex fast-path failed, falling back to agentic loop: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("Reflex pattern lookup failed: {}", e);
+                }
+            }
         }
 
         // Natural language goes through the agentic loop

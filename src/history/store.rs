@@ -484,6 +484,59 @@ impl Store {
 
         Ok(patterns)
     }
+
+    /// Upsert normalized reflex pattern mapping to a compiled tool.
+    pub async fn upsert_reflex_pattern(
+        &self,
+        normalized_pattern: &str,
+        compiled_tool_name: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.conn().await?;
+        conn.execute(
+            r#"
+            INSERT INTO reflex_patterns (normalized_pattern, compiled_tool_name, source_count, last_seen_at)
+            VALUES ($1, $2, 1, NOW())
+            ON CONFLICT (normalized_pattern)
+            DO UPDATE SET
+                compiled_tool_name = EXCLUDED.compiled_tool_name,
+                source_count = reflex_patterns.source_count + 1,
+                last_seen_at = NOW(),
+                updated_at = NOW()
+            "#,
+            &[&normalized_pattern, &compiled_tool_name],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Find an enabled compiled reflex tool by normalized pattern.
+    pub async fn find_reflex_tool_for_pattern(
+        &self,
+        normalized_pattern: &str,
+    ) -> Result<Option<String>, DatabaseError> {
+        let conn = self.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT compiled_tool_name FROM reflex_patterns WHERE normalized_pattern = $1 AND enabled = true",
+                &[&normalized_pattern],
+            )
+            .await?;
+        Ok(row.map(|r| r.get::<_, String>("compiled_tool_name")))
+    }
+
+    /// Increment hit counters for a reflex pattern.
+    pub async fn bump_reflex_pattern_hit(
+        &self,
+        normalized_pattern: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.conn().await?;
+        conn.execute(
+            "UPDATE reflex_patterns SET source_count = source_count + 1, last_seen_at = NOW(), updated_at = NOW() WHERE normalized_pattern = $1",
+            &[&normalized_pattern],
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 // ==================== Sandbox Jobs ====================

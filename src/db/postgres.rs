@@ -269,6 +269,29 @@ impl JobStore for PgBackend {
             .find_recurring_job_patterns(threshold, limit)
             .await
     }
+
+    async fn upsert_reflex_pattern(
+        &self,
+        normalized_pattern: &str,
+        compiled_tool_name: &str,
+    ) -> Result<(), DatabaseError> {
+        self.store
+            .upsert_reflex_pattern(normalized_pattern, compiled_tool_name)
+            .await
+    }
+
+    async fn find_reflex_tool_for_pattern(
+        &self,
+        normalized_pattern: &str,
+    ) -> Result<Option<String>, DatabaseError> {
+        self.store
+            .find_reflex_tool_for_pattern(normalized_pattern)
+            .await
+    }
+
+    async fn bump_reflex_pattern_hit(&self, normalized_pattern: &str) -> Result<(), DatabaseError> {
+        self.store.bump_reflex_pattern_hit(normalized_pattern).await
+    }
 }
 
 // ==================== SandboxStore ====================

@@ -10,6 +10,14 @@ use crate::tools::builder::{
 };
 use uuid::Uuid;
 
+fn normalize_pattern(input: &str) -> String {
+    input
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Spawn the Reflex compiler background ticker.
 /// It periodically scans the job history for recurring prompts
 /// and compiles them into WASM micro-skills.
@@ -75,6 +83,17 @@ pub fn spawn_reflex_compiler(
                                         "Successfully compiled Reflex MS (micro-skill) for pattern: {}",
                                         description
                                     );
+                                    let normalized = normalize_pattern(&description);
+                                    if let Err(e) =
+                                        store.upsert_reflex_pattern(&normalized, &req.name).await
+                                    {
+                                        tracing::warn!(
+                                            "Failed to persist reflex pattern '{}' -> '{}': {}",
+                                            normalized,
+                                            req.name,
+                                            e
+                                        );
+                                    }
                                 } else {
                                     tracing::warn!(
                                         "Failed to compile Reflex MS for pattern: {}",

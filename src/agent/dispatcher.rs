@@ -24,17 +24,21 @@ const TOOL_DRAFT_PREVIEW_CHARS: usize = 240;
 
 #[derive(Debug, Clone)]
 struct StreamedToolCallState {
+    provider_call_id: Option<String>,
     name: Option<String>,
     args_buffer: String,
     last_preview: Option<String>,
+    early_started: bool,
 }
 
 impl StreamedToolCallState {
     fn new() -> Self {
         Self {
+            provider_call_id: None,
             name: None,
             args_buffer: String::new(),
             last_preview: None,
+            early_started: false,
         }
     }
 }
@@ -79,6 +83,16 @@ fn shell_preview_from_args(args_value: &serde_json::Value) -> Option<String> {
         return None;
     }
     Some(truncate_preview_chars(command, TOOL_DRAFT_PREVIEW_CHARS))
+}
+
+fn serialize_tool_result_json(
+    tool_name: &str,
+    result: &serde_json::Value,
+) -> Result<String, crate::error::ToolError> {
+    serde_json::to_string_pretty(result).map_err(|e| crate::error::ToolError::ExecutionFailed {
+        name: tool_name.to_string(),
+        reason: format!("Failed to serialize result: {}", e),
+    })
 }
 
 fn chunk_tool_result_preview(output: &str) -> Vec<String> {
@@ -293,9 +307,17 @@ impl Agent {
             let channels = self.channels.clone();
             let channel_name = message.channel.clone();
             let metadata = message.metadata.clone();
+            let piped_exec_enabled = self.config.enable_piped_tool_execution;
+            let tools_registry = self.tools().clone();
+            let safety_layer = self.safety().clone();
+            let session_for_pipe = session.clone();
+            let job_ctx_for_pipe = job_ctx.clone();
             let streamed_tool_calls: Arc<Mutex<HashMap<String, StreamedToolCallState>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let streamed_tool_calls_for_cb = Arc::clone(&streamed_tool_calls);
+            let early_shell_results: Arc<Mutex<HashMap<String, Result<String, String>>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+            let early_shell_results_for_cb = Arc::clone(&early_shell_results);
 
             let on_chunk = |chunk: String| -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = ()> + Send + 'static>,
@@ -304,15 +326,21 @@ impl Agent {
                 let channel_name = channel_name.clone();
                 let metadata = metadata.clone();
                 let streamed_tool_calls = Arc::clone(&streamed_tool_calls_for_cb);
+                let tools_registry = tools_registry.clone();
+                let safety_layer = safety_layer.clone();
+                let session_for_pipe = session_for_pipe.clone();
+                let job_ctx_for_pipe = job_ctx_for_pipe.clone();
+                let early_shell_results = Arc::clone(&early_shell_results_for_cb);
                 Box::pin(async move {
                     if let Some(event) = parse_tool_stream_event(&chunk) {
                         match event {
                             ToolStreamEvent::ToolCall {
-                                id: _id,
+                                id,
                                 internal_call_id,
                                 name,
                                 arguments,
                             } => {
+                                let mut start_early = None;
                                 let preview = if name == "shell" {
                                     shell_preview_from_args(&arguments)
                                 } else {
@@ -324,10 +352,23 @@ impl Agent {
                                     let entry = guard
                                         .entry(internal_call_id)
                                         .or_insert_with(StreamedToolCallState::new);
+                                    entry.provider_call_id = Some(id.clone());
                                     entry.name = Some(name.clone());
                                     entry.args_buffer = arguments.to_string();
                                     if let Some(ref p) = preview {
                                         entry.last_preview = Some(p.clone());
+                                    }
+                                    if piped_exec_enabled
+                                        && name == "shell"
+                                        && !entry.early_started
+                                        && arguments
+                                            .get("command")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| !s.trim().is_empty())
+                                            .unwrap_or(false)
+                                    {
+                                        entry.early_started = true;
+                                        start_early = Some((id.clone(), arguments.clone()));
                                     }
                                 }
 
@@ -343,21 +384,104 @@ impl Agent {
                                         )
                                         .await;
                                 }
+
+                                if let Some((provider_call_id, args)) = start_early {
+                                    let channels = channels.clone();
+                                    let channel_name = channel_name.clone();
+                                    let metadata = metadata.clone();
+                                    let tools_registry = tools_registry.clone();
+                                    let safety_layer = safety_layer.clone();
+                                    let session_for_pipe = session_for_pipe.clone();
+                                    let job_ctx_for_pipe = job_ctx_for_pipe.clone();
+                                    let early_shell_results = Arc::clone(&early_shell_results);
+                                    tokio::spawn(async move {
+                                        let Some(tool) = tools_registry.get("shell").await else {
+                                            return;
+                                        };
+
+                                        if tool.requires_approval() {
+                                            let is_auto_approved = {
+                                                let sess = session_for_pipe.lock().await;
+                                                sess.is_tool_auto_approved("shell")
+                                            };
+                                            if !is_auto_approved
+                                                || tool.requires_approval_for(&args)
+                                            {
+                                                return;
+                                            }
+                                        }
+
+                                        let validation =
+                                            safety_layer.validator().validate_tool_params(&args);
+                                        if !validation.is_valid {
+                                            return;
+                                        }
+
+                                        let on_pipe_chunk: &ToolStreamCallback =
+                                            &move |c: String| {
+                                                let channels = channels.clone();
+                                                let channel_name = channel_name.clone();
+                                                let metadata = metadata.clone();
+                                                Box::pin(async move {
+                                                    let _ = channels
+                                                        .send_status(
+                                                            &channel_name,
+                                                            StatusUpdate::ToolResult {
+                                                                name: "shell".to_string(),
+                                                                preview: format!("[piped] {}", c),
+                                                            },
+                                                            &metadata,
+                                                        )
+                                                        .await;
+                                                })
+                                            };
+
+                                        let timeout = tool.execution_timeout();
+                                        let early_result = tokio::time::timeout(timeout, async {
+                                            tool.execute_streaming(
+                                                args.clone(),
+                                                &job_ctx_for_pipe,
+                                                Some(on_pipe_chunk),
+                                            )
+                                            .await
+                                        })
+                                        .await;
+
+                                        let normalized = match early_result {
+                                            Ok(Ok(output)) => {
+                                                serialize_tool_result_json("shell", &output.result)
+                                                    .map_err(|e| e.to_string())
+                                            }
+                                            Ok(Err(e)) => Err(e.to_string()),
+                                            Err(_) => Err(format!(
+                                                "Tool 'shell' timed out after {}s",
+                                                timeout.as_secs()
+                                            )),
+                                        };
+
+                                        early_shell_results
+                                            .lock()
+                                            .await
+                                            .insert(provider_call_id, normalized);
+                                    });
+                                }
                             }
                             ToolStreamEvent::ToolCallDelta {
-                                id: _id,
+                                id,
                                 internal_call_id,
                                 delta_type,
                                 content,
                             } => {
                                 let mut maybe_preview = None;
                                 let mut tool_name_for_preview = None;
+                                let mut start_early = None;
 
                                 {
                                     let mut guard = streamed_tool_calls.lock().await;
                                     let entry = guard
                                         .entry(internal_call_id)
                                         .or_insert_with(StreamedToolCallState::new);
+                                    entry.provider_call_id = Some(id.clone());
 
                                     if delta_type == "name" {
                                         entry.name = Some(content);
@@ -383,6 +507,25 @@ impl Agent {
                                             tool_name_for_preview = Some("shell".to_string());
                                         }
                                     }
+
+                                    if piped_exec_enabled
+                                        && entry.name.as_deref() == Some("shell")
+                                        && !entry.early_started
+                                        && let Ok(args_value) =
+                                            serde_json::from_str::<serde_json::Value>(
+                                                &entry.args_buffer,
+                                            )
+                                        && args_value
+                                            .get("command")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| !s.trim().is_empty())
+                                            .unwrap_or(false)
+                                        && let Some(provider_call_id) =
+                                            entry.provider_call_id.clone()
+                                    {
+                                        entry.early_started = true;
+                                        start_early = Some((provider_call_id, args_value));
+                                    }
                                 }
 
                                 if let (Some(preview), Some(tool_name)) =
@@ -398,6 +541,87 @@ impl Agent {
                                             &metadata,
                                         )
                                         .await;
+                                }
+
+                                if let Some((provider_call_id, args)) = start_early {
+                                    let channels = channels.clone();
+                                    let channel_name = channel_name.clone();
+                                    let metadata = metadata.clone();
+                                    let tools_registry = tools_registry.clone();
+                                    let safety_layer = safety_layer.clone();
+                                    let session_for_pipe = session_for_pipe.clone();
+                                    let job_ctx_for_pipe = job_ctx_for_pipe.clone();
+                                    let early_shell_results = Arc::clone(&early_shell_results);
+                                    tokio::spawn(async move {
+                                        let Some(tool) = tools_registry.get("shell").await else {
+                                            return;
+                                        };
+
+                                        if tool.requires_approval() {
+                                            let is_auto_approved = {
+                                                let sess = session_for_pipe.lock().await;
+                                                sess.is_tool_auto_approved("shell")
+                                            };
+                                            if !is_auto_approved
+                                                || tool.requires_approval_for(&args)
+                                            {
+                                                return;
+                                            }
+                                        }
+
+                                        let validation =
+                                            safety_layer.validator().validate_tool_params(&args);
+                                        if !validation.is_valid {
+                                            return;
+                                        }
+
+                                        let on_pipe_chunk: &ToolStreamCallback =
+                                            &move |c: String| {
+                                                let channels = channels.clone();
+                                                let channel_name = channel_name.clone();
+                                                let metadata = metadata.clone();
+                                                Box::pin(async move {
+                                                    let _ = channels
+                                                        .send_status(
+                                                            &channel_name,
+                                                            StatusUpdate::ToolResult {
+                                                                name: "shell".to_string(),
+                                                                preview: format!("[piped] {}", c),
+                                                            },
+                                                            &metadata,
+                                                        )
+                                                        .await;
+                                                })
+                                            };
+
+                                        let timeout = tool.execution_timeout();
+                                        let early_result = tokio::time::timeout(timeout, async {
+                                            tool.execute_streaming(
+                                                args.clone(),
+                                                &job_ctx_for_pipe,
+                                                Some(on_pipe_chunk),
+                                            )
+                                            .await
+                                        })
+                                        .await;
+
+                                        let normalized = match early_result {
+                                            Ok(Ok(output)) => {
+                                                serialize_tool_result_json("shell", &output.result)
+                                                    .map_err(|e| e.to_string())
+                                            }
+                                            Ok(Err(e)) => Err(e.to_string()),
+                                            Err(_) => Err(format!(
+                                                "Tool 'shell' timed out after {}s",
+                                                timeout.as_secs()
+                                            )),
+                                        };
+
+                                        early_shell_results
+                                            .lock()
+                                            .await
+                                            .insert(provider_call_id, normalized);
+                                    });
                                 }
                             }
                         }
@@ -579,8 +803,20 @@ impl Agent {
                             .await;
 
                         let live_stream = tc.name == "shell";
-                        let tool_result = self
-                            .execute_chat_tool(
+                        let tool_result = if live_stream
+                            && self.config.enable_piped_tool_execution
+                            && let Some(cached) = early_shell_results.lock().await.remove(&tc.id)
+                        {
+                            match cached {
+                                Ok(output) => Ok(output),
+                                Err(reason) => Err(crate::error::ToolError::ExecutionFailed {
+                                    name: tc.name.clone(),
+                                    reason,
+                                }
+                                .into()),
+                            }
+                        } else {
+                            self.execute_chat_tool(
                                 &tc.name,
                                 &tc.arguments,
                                 &job_ctx,
@@ -588,7 +824,8 @@ impl Agent {
                                 &message.metadata,
                                 live_stream,
                             )
-                            .await;
+                            .await
+                        };
 
                         let _ = self
                             .channels
