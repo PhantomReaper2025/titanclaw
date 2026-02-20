@@ -34,7 +34,8 @@ Based on `implementation_plan.md`, this is where the upgrade stands today.
 | Phase 0: provider independence + local inference | ✅ | NEAR AI, OpenAI-compatible, Ollama, Tinfoil, provider failover |
 | Phase 0: orchestration foundations | ✅ | Scheduler, parallel jobs, Docker worker/orchestrator flow |
 | Phase 0: secure extensibility | ✅ | WASM tool system, dynamic tool building, secure skills framework |
-| Phase 0: streaming everywhere | 🚧 | Gateway SSE/WebSocket exists; full block/tool streaming parity still in progress |
+| Phase 0: streaming everywhere | 🚧 | Gateway SSE/WebSocket exists; shell tool output now streams live per chunk, full token-to-tool piped execution still in progress |
+| Phase 0: reflex fast-path bypass | 🚧 | Deterministic natural-language fast-path now bypasses LLM for high-confidence job intents (list/status/cancel/help/create) |
 | Phase 1: deep context indexing | 🚧 | Tree-sitter and memory foundations are present; full GraphRAG path is not complete |
 | Phase 2: distributed swarm mesh | 🔮 | libp2p dependencies are integrated; mesh-level runtime behavior is roadmap work |
 
@@ -50,6 +51,7 @@ Based on `implementation_plan.md`, this is where the upgrade stands today.
 - Routines/automation engine for scheduled and event-driven tasks
 - Docker-isolated workers for higher-risk or heavier executions
 - OpenAI-compatible API endpoints for external integration
+- LLM-bypassed fast-path for common job ops in natural language
 
 ### Built For Operators
 

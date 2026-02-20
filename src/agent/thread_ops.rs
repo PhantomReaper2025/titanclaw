@@ -196,6 +196,11 @@ impl Agent {
             return self.handle_job_or_command(intent, message).await;
         }
 
+        if let Some(intent) = self.router.route_fast_path_nl(&temp_message) {
+            tracing::debug!("Routed via natural-language fast path");
+            return self.handle_job_or_command(intent, message).await;
+        }
+
         // Natural language goes through the agentic loop
         // Job tools (create_job, list_jobs, etc.) are in the tool registry
 
@@ -679,7 +684,14 @@ impl Agent {
                 .await;
 
             let tool_result = self
-                .execute_chat_tool(&pending.tool_name, &pending.parameters, &job_ctx)
+                .execute_chat_tool(
+                    &pending.tool_name,
+                    &pending.parameters,
+                    &job_ctx,
+                    &message.channel,
+                    &message.metadata,
+                    pending.tool_name == "shell",
+                )
                 .await;
 
             let _ = self
@@ -694,7 +706,8 @@ impl Agent {
                 )
                 .await;
 
-            if let Ok(ref output) = tool_result
+            if pending.tool_name != "shell"
+                && let Ok(ref output) = tool_result
                 && !output.is_empty()
             {
                 let _ = self

@@ -5,6 +5,7 @@
 //! which uses LLM + tools instead of brittle pattern matching.
 
 use crate::channels::IncomingMessage;
+use regex::Regex;
 
 /// Intent extracted from a message.
 #[derive(Debug, Clone)]
@@ -70,6 +71,79 @@ impl Router {
         } else {
             None
         }
+    }
+
+    /// Route a small set of high-confidence natural-language intents.
+    ///
+    /// This is a deterministic fast-path for common job operations so we can
+    /// bypass an LLM call for repeated operational requests.
+    pub fn route_fast_path_nl(&self, message: &IncomingMessage) -> Option<MessageIntent> {
+        if self.is_command(message) {
+            return None;
+        }
+
+        let raw = message.content.trim();
+        if raw.is_empty() {
+            return None;
+        }
+
+        let normalized = raw.to_lowercase();
+        let normalized = normalized.trim();
+
+        // list jobs / show jobs variants
+        let list_phrases = [
+            "list jobs",
+            "list my jobs",
+            "show jobs",
+            "show my jobs",
+            "what jobs are running",
+            "what are my jobs",
+        ];
+        if list_phrases.contains(&normalized) {
+            return Some(MessageIntent::ListJobs { filter: None });
+        }
+
+        // create job <description>
+        let create_prefix = "create job ";
+        if normalized.starts_with(create_prefix) {
+            let original_rest = raw.get(create_prefix.len()..).unwrap_or("").trim();
+            if !original_rest.is_empty() {
+                return Some(MessageIntent::CreateJob {
+                    title: original_rest.to_string(),
+                    description: original_rest.to_string(),
+                    category: None,
+                });
+            }
+        }
+
+        // status of job <id> / check job <id>
+        let status_re =
+            Regex::new(r"^(?:status(?: of)?|check(?: status)?(?: of)?) job ([^\s]+)$").ok()?;
+        if let Some(caps) = status_re.captures(normalized)
+            && let Some(job_id) = caps.get(1).map(|m| m.as_str().to_string())
+        {
+            return Some(MessageIntent::CheckJobStatus {
+                job_id: Some(job_id),
+            });
+        }
+
+        // cancel/stop job <id>
+        let cancel_re = Regex::new(r"^(?:cancel|stop) job ([^\s]+)$").ok()?;
+        if let Some(caps) = cancel_re.captures(normalized)
+            && let Some(job_id) = caps.get(1).map(|m| m.as_str().to_string())
+        {
+            return Some(MessageIntent::CancelJob { job_id });
+        }
+
+        // help/unstick job <id>
+        let help_re = Regex::new(r"^(?:help|unstick) job ([^\s]+)$").ok()?;
+        if let Some(caps) = help_re.captures(normalized)
+            && let Some(job_id) = caps.get(1).map(|m| m.as_str().to_string())
+        {
+            return Some(MessageIntent::HelpJob { job_id });
+        }
+
+        None
     }
 
     fn parse_command(&self, content: &str) -> MessageIntent {
@@ -196,5 +270,55 @@ mod tests {
             }
             _ => panic!("Expected ListJobs intent"),
         }
+    }
+
+    #[test]
+    fn test_fast_path_list_jobs() {
+        let router = Router::new();
+        let msg = IncomingMessage::new("test", "user", "show my jobs");
+        let intent = router.route_fast_path_nl(&msg);
+        assert!(matches!(intent, Some(MessageIntent::ListJobs { .. })));
+    }
+
+    #[test]
+    fn test_fast_path_status_job() {
+        let router = Router::new();
+        let msg = IncomingMessage::new("test", "user", "status of job abc-123");
+        let intent = router.route_fast_path_nl(&msg);
+        assert!(matches!(
+            intent,
+            Some(MessageIntent::CheckJobStatus {
+                job_id: Some(ref id)
+            }) if id == "abc-123"
+        ));
+    }
+
+    #[test]
+    fn test_fast_path_cancel_job() {
+        let router = Router::new();
+        let msg = IncomingMessage::new("test", "user", "cancel job job-789");
+        let intent = router.route_fast_path_nl(&msg);
+        assert!(matches!(
+            intent,
+            Some(MessageIntent::CancelJob { ref job_id }) if job_id == "job-789"
+        ));
+    }
+
+    #[test]
+    fn test_fast_path_create_job() {
+        let router = Router::new();
+        let msg = IncomingMessage::new("test", "user", "create job build auth middleware");
+        let intent = router.route_fast_path_nl(&msg);
+        assert!(matches!(
+            intent,
+            Some(MessageIntent::CreateJob { ref title, .. }) if title == "build auth middleware"
+        ));
+    }
+
+    #[test]
+    fn test_fast_path_ignores_slash_commands() {
+        let router = Router::new();
+        let msg = IncomingMessage::new("test", "user", "/list");
+        assert!(router.route_fast_path_nl(&msg).is_none());
     }
 }

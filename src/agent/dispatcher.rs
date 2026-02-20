@@ -14,6 +14,54 @@ use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
 use crate::llm::{ChatMessage, Reasoning, ReasoningContext, RespondResult};
+use crate::tools::ToolStreamCallback;
+
+const TOOL_RESULT_CHUNK_CHARS: usize = 700;
+const TOOL_RESULT_MAX_CHUNKS: usize = 12;
+
+fn chunk_tool_result_preview(output: &str) -> Vec<String> {
+    if output.is_empty() {
+        return vec![];
+    }
+
+    let total_chars = output.chars().count();
+    let max_chars = TOOL_RESULT_CHUNK_CHARS * TOOL_RESULT_MAX_CHUNKS;
+    let truncated = total_chars > max_chars;
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+
+    for ch in output.chars().take(max_chars) {
+        current.push(ch);
+        if current.chars().count() >= TOOL_RESULT_CHUNK_CHARS {
+            chunks.push(current);
+            current = String::new();
+            if chunks.len() >= TOOL_RESULT_MAX_CHUNKS {
+                break;
+            }
+        }
+    }
+
+    if !current.is_empty() && chunks.len() < TOOL_RESULT_MAX_CHUNKS {
+        chunks.push(current);
+    }
+
+    if chunks.len() <= 1 && !truncated {
+        return chunks;
+    }
+
+    let total = chunks.len();
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(idx, chunk)| {
+            if truncated && idx + 1 == total {
+                format!("[{}/{}] {}…", idx + 1, total, chunk)
+            } else {
+                format!("[{}/{}] {}", idx + 1, total, chunk)
+            }
+        })
+        .collect()
+}
 
 /// Result of the agentic loop execution.
 pub(super) enum AgenticLoopResult {
@@ -365,8 +413,16 @@ impl Agent {
                             )
                             .await;
 
+                        let live_stream = tc.name == "shell";
                         let tool_result = self
-                            .execute_chat_tool(&tc.name, &tc.arguments, &job_ctx)
+                            .execute_chat_tool(
+                                &tc.name,
+                                &tc.arguments,
+                                &job_ctx,
+                                &message.channel,
+                                &message.metadata,
+                                live_stream,
+                            )
                             .await;
 
                         let _ = self
@@ -381,20 +437,20 @@ impl Agent {
                             )
                             .await;
 
-                        if let Ok(ref output) = tool_result
-                            && !output.is_empty()
-                        {
-                            let _ = self
-                                .channels
-                                .send_status(
-                                    &message.channel,
-                                    StatusUpdate::ToolResult {
-                                        name: tc.name.clone(),
-                                        preview: output.clone(),
-                                    },
-                                    &message.metadata,
-                                )
-                                .await;
+                        if !live_stream && let Ok(ref output) = tool_result {
+                            for preview in chunk_tool_result_preview(output) {
+                                let _ = self
+                                    .channels
+                                    .send_status(
+                                        &message.channel,
+                                        StatusUpdate::ToolResult {
+                                            name: tc.name.clone(),
+                                            preview,
+                                        },
+                                        &message.metadata,
+                                    )
+                                    .await;
+                            }
                         }
 
                         // Record result in thread
@@ -475,6 +531,9 @@ impl Agent {
         tool_name: &str,
         params: &serde_json::Value,
         job_ctx: &JobContext,
+        channel_name: &str,
+        metadata: &serde_json::Value,
+        live_stream: bool,
     ) -> Result<String, Error> {
         let tool =
             self.tools()
@@ -509,10 +568,40 @@ impl Agent {
         // Execute with per-tool timeout
         let timeout = tool.execution_timeout();
         let start = std::time::Instant::now();
-        let result = tokio::time::timeout(timeout, async {
-            tool.execute(params.clone(), job_ctx).await
-        })
-        .await;
+        let result = if live_stream {
+            let channels = Arc::clone(&self.channels);
+            let channel = channel_name.to_string();
+            let metadata_value = metadata.clone();
+            let tool_name = tool_name.to_string();
+            let on_chunk: &ToolStreamCallback = &move |chunk: String| {
+                let channels = Arc::clone(&channels);
+                let channel = channel.clone();
+                let metadata_value = metadata_value.clone();
+                let tool_name = tool_name.clone();
+                Box::pin(async move {
+                    let _ = channels
+                        .send_status(
+                            &channel,
+                            StatusUpdate::ToolResult {
+                                name: tool_name,
+                                preview: chunk,
+                            },
+                            &metadata_value,
+                        )
+                        .await;
+                })
+            };
+            tokio::time::timeout(timeout, async {
+                tool.execute_streaming(params.clone(), job_ctx, Some(on_chunk))
+                    .await
+            })
+            .await
+        } else {
+            tokio::time::timeout(timeout, async {
+                tool.execute(params.clone(), job_ctx).await
+            })
+            .await
+        };
         let elapsed = start.elapsed();
 
         match &result {
@@ -620,7 +709,27 @@ pub(super) fn detect_auth_awaiting(
 mod tests {
     use crate::error::Error;
 
-    use super::detect_auth_awaiting;
+    use super::{TOOL_RESULT_CHUNK_CHARS, chunk_tool_result_preview, detect_auth_awaiting};
+
+    #[test]
+    fn test_chunk_tool_result_preview_empty() {
+        assert!(chunk_tool_result_preview("").is_empty());
+    }
+
+    #[test]
+    fn test_chunk_tool_result_preview_small_single_chunk() {
+        let result = chunk_tool_result_preview("hello");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], "hello");
+    }
+
+    #[test]
+    fn test_chunk_tool_result_preview_large_is_numbered() {
+        let input = "x".repeat(TOOL_RESULT_CHUNK_CHARS + 10);
+        let result = chunk_tool_result_preview(&input);
+        assert!(result.len() >= 2);
+        assert!(result[0].starts_with("[1/"));
+    }
 
     #[test]
     fn test_detect_auth_awaiting_positive() {

@@ -17,8 +17,8 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 |---|---|---|
 | Swarm mesh runtime wiring | 🚧 | `swarm` module exists and is now wired into main runtime lifecycle behind config (`SWARM_ENABLED`, listen/heartbeat/max slots). |
 | Zero-latency text streaming | ✅ | Streaming chunk path is active in agent dispatcher to REPL/Web/WASM channels. |
-| Tool/block-level streaming | 🚧 | Tool start/completion/result events are live; token + tool piped execution still partial. |
-| Reflex compiler | 🚧 | Background reflex compiler loop is running; intent fast-path bypass not complete. |
+| Tool/block-level streaming | 🚧 | Tool start/completion/result events are live; shell tool now streams incremental stdout/stderr chunks in real time, while token-to-tool piped execution remains partial. |
+| Reflex compiler | 🚧 | Background reflex compiler loop is running; deterministic natural-language fast-path now bypasses LLM for high-confidence job intents (`list/status/cancel/help/create`), but generalized reflex routing is still incomplete. |
 | GraphRAG + AST indexing | 🚧 | Tree-sitter AST graph indexing is integrated for Rust docs; full knowledge-graph behavior remains in progress. |
 
 ## Proposed Changes

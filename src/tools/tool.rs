@@ -9,6 +9,11 @@ use thiserror::Error;
 
 use crate::context::JobContext;
 
+/// Callback for streaming incremental tool output chunks.
+pub type ToolStreamCallback = dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+    + Send
+    + Sync;
+
 /// Where a tool should execute: orchestrator process or inside a container.
 ///
 /// Orchestrator tools run in the main agent process (memory access, job mgmt, etc).
@@ -141,6 +146,18 @@ pub trait Tool: Send + Sync {
         params: serde_json::Value,
         ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError>;
+
+    /// Execute the tool with optional incremental output streaming.
+    ///
+    /// Default behavior falls back to `execute` and ignores streaming.
+    async fn execute_streaming(
+        &self,
+        params: serde_json::Value,
+        ctx: &JobContext,
+        _on_chunk: Option<&ToolStreamCallback>,
+    ) -> Result<ToolOutput, ToolError> {
+        self.execute(params, ctx).await
+    }
 
     /// Estimate the cost of running this tool with the given parameters.
     fn estimated_cost(&self, _params: &serde_json::Value) -> Option<Decimal> {

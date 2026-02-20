@@ -55,7 +55,9 @@ use tokio::process::Command;
 
 use crate::context::JobContext;
 use crate::sandbox::{SandboxManager, SandboxPolicy};
-use crate::tools::tool::{Tool, ToolDomain, ToolError, ToolOutput, require_str};
+use crate::tools::tool::{
+    Tool, ToolDomain, ToolError, ToolOutput, ToolStreamCallback, require_str,
+};
 
 /// Maximum output size before truncation (64KB).
 const MAX_OUTPUT_SIZE: usize = 64 * 1024;
@@ -674,6 +676,51 @@ impl Tool for ShellTool {
         Ok(ToolOutput::success(result, duration))
     }
 
+    async fn execute_streaming(
+        &self,
+        params: serde_json::Value,
+        ctx: &JobContext,
+        on_chunk: Option<&ToolStreamCallback>,
+    ) -> Result<ToolOutput, ToolError> {
+        let command = require_str(&params, "command")?;
+        let workdir = params.get("workdir").and_then(|v| v.as_str());
+        let timeout = params.get("timeout").and_then(|v| v.as_u64());
+        let start = std::time::Instant::now();
+
+        // Keep sandbox path unchanged for now; stream host execution first.
+        let use_direct_streaming = on_chunk.is_some() && self.sandbox.is_none();
+        let (output, exit_code) = if use_direct_streaming {
+            let cwd = workdir
+                .map(PathBuf::from)
+                .or_else(|| self.working_dir.clone())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            let timeout_duration = timeout.map(Duration::from_secs).unwrap_or(self.timeout);
+            execute_direct_with_streaming(
+                command,
+                &cwd,
+                timeout_duration,
+                &ctx.extra_env,
+                on_chunk.expect("checked is_some"),
+            )
+            .await
+            .map(|(out, code)| (out, code as i64))?
+        } else {
+            self.execute_command(command, workdir, timeout, &ctx.extra_env)
+                .await?
+        };
+
+        let duration = start.elapsed();
+        let sandboxed = self.sandbox.is_some();
+        let result = serde_json::json!({
+            "output": output,
+            "exit_code": exit_code,
+            "success": exit_code == 0,
+            "sandboxed": sandboxed
+        });
+
+        Ok(ToolOutput::success(result, duration))
+    }
+
     fn requires_approval(&self) -> bool {
         true // Shell commands should require approval
     }
@@ -730,6 +777,114 @@ fn truncate_for_error(s: &str) -> String {
         s.to_string()
     } else {
         format!("{}...", s.chars().take(100).collect::<String>())
+    }
+}
+
+async fn execute_direct_with_streaming(
+    cmd: &str,
+    workdir: &PathBuf,
+    timeout: Duration,
+    extra_env: &HashMap<String, String>,
+    on_chunk: &ToolStreamCallback,
+) -> Result<(String, i32), ToolError> {
+    let mut command = if cfg!(target_os = "windows") {
+        let mut c = Command::new("cmd");
+        c.args(["/C", cmd]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", cmd]);
+        c
+    };
+
+    command.env_clear();
+    for var in SAFE_ENV_VARS {
+        if let Ok(val) = std::env::var(var) {
+            command.env(var, val);
+        }
+    }
+    command.envs(extra_env);
+    command
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| ToolError::ExecutionFailed(format!("Failed to spawn command: {}", e)))?;
+
+    let result = tokio::time::timeout(timeout, async {
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut out_done = false;
+        let mut err_done = false;
+
+        let mut out_pipe = child.stdout.take();
+        let mut err_pipe = child.stderr.take();
+        let mut out_buf = vec![0u8; 1024];
+        let mut err_buf = vec![0u8; 1024];
+
+        while !out_done || !err_done {
+            tokio::select! {
+                out = async {
+                    match out_pipe.as_mut() {
+                        Some(pipe) => pipe.read(&mut out_buf).await,
+                        None => Ok(0),
+                    }
+                }, if !out_done => {
+                    let n = out.map_err(|e| ToolError::ExecutionFailed(format!("stdout read failed: {}", e)))?;
+                    if n == 0 {
+                        out_done = true;
+                        out_pipe = None;
+                    } else {
+                        let chunk = String::from_utf8_lossy(&out_buf[..n]).to_string();
+                        stdout.push_str(&chunk);
+                        on_chunk(chunk).await;
+                    }
+                }
+                err = async {
+                    match err_pipe.as_mut() {
+                        Some(pipe) => pipe.read(&mut err_buf).await,
+                        None => Ok(0),
+                    }
+                }, if !err_done => {
+                    let n = err.map_err(|e| ToolError::ExecutionFailed(format!("stderr read failed: {}", e)))?;
+                    if n == 0 {
+                        err_done = true;
+                        err_pipe = None;
+                    } else {
+                        let chunk = String::from_utf8_lossy(&err_buf[..n]).to_string();
+                        stderr.push_str(&chunk);
+                        on_chunk(format!("[stderr] {}", chunk)).await;
+                    }
+                }
+            }
+        }
+
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("Command execution failed: {}", e)))?;
+
+        let output = if stderr.is_empty() {
+            stdout
+        } else if stdout.is_empty() {
+            stderr
+        } else {
+            format!("{}\n\n--- stderr ---\n{}", stdout, stderr)
+        };
+        Ok::<_, ToolError>((truncate_output(&output), status.code().unwrap_or(-1)))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            let _ = child.kill().await;
+            Err(ToolError::Timeout(timeout))
+        }
     }
 }
 
