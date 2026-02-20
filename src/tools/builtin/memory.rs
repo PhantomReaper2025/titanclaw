@@ -426,11 +426,9 @@ impl Tool for MemoryGraphTool {
             .ast_graph_query(symbol, limit, depth)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("AST graph query failed: {}", e)))?;
-        let semantic_context = self
-            .workspace
-            .search(symbol, 3)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Semantic fusion search failed: {}", e)))?;
+        let semantic_context = self.workspace.search(symbol, 3).await.map_err(|e| {
+            ToolError::ExecutionFailed(format!("Semantic fusion search failed: {}", e))
+        })?;
 
         let output = serde_json::json!({
             "symbol": symbol,
