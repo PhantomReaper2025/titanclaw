@@ -14,12 +14,12 @@ pub mod skill_tools;
 mod time;
 
 pub use echo::EchoTool;
-pub use jit_tool::JitWasmTool;
 pub use extension_tools::{
     ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
 };
 pub use file::{ApplyPatchTool, ListDirTool, ReadFileTool, WriteFileTool};
 pub use http::HttpTool;
+pub use jit_tool::JitWasmTool;
 pub use job::{
     CancelJobTool, CreateJobTool, JobEventsTool, JobPromptTool, JobStatusTool, ListJobsTool,
     PromptQueue,

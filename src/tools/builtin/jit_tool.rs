@@ -9,7 +9,9 @@ use tokio::process::Command;
 
 use crate::context::JobContext;
 use crate::tools::tool::{Tool, ToolError, ToolOutput};
-use crate::tools::wasm::{Capabilities, EndpointPattern, HttpCapability, WasmToolRuntime, WasmToolWrapper};
+use crate::tools::wasm::{
+    Capabilities, EndpointPattern, HttpCapability, WasmToolRuntime, WasmToolWrapper,
+};
 
 const CARGO_TOML_TEMPLATE: &str = r#"[package]
 name = "jit-tool"
@@ -138,21 +140,30 @@ impl Tool for JitWasmTool {
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to create temp dir: {}", e)))?;
 
         let dir_path = temp_dir.path();
-        
+
         // Write Cargo.toml
         if let Err(e) = fs::write(dir_path.join("Cargo.toml"), CARGO_TOML_TEMPLATE).await {
-            return Err(ToolError::ExecutionFailed(format!("Failed to write Cargo.toml: {}", e)));
+            return Err(ToolError::ExecutionFailed(format!(
+                "Failed to write Cargo.toml: {}",
+                e
+            )));
         }
 
         // Write src/lib.rs
         let src_dir = dir_path.join("src");
         if let Err(e) = fs::create_dir(&src_dir).await {
-            return Err(ToolError::ExecutionFailed(format!("Failed to create src dir: {}", e)));
+            return Err(ToolError::ExecutionFailed(format!(
+                "Failed to create src dir: {}",
+                e
+            )));
         }
 
         let lib_rs = LIB_RS_TEMPLATE.replace("{{rust_code}}", rust_code);
         if let Err(e) = fs::write(src_dir.join("lib.rs"), lib_rs).await {
-            return Err(ToolError::ExecutionFailed(format!("Failed to write lib.rs: {}", e)));
+            return Err(ToolError::ExecutionFailed(format!(
+                "Failed to write lib.rs: {}",
+                e
+            )));
         }
 
         // Compile to WASM using cargo
@@ -164,28 +175,46 @@ impl Tool for JitWasmTool {
             .arg("--release")
             .output()
             .await;
-            
+
         let build_output = match build_output {
             Ok(out) => out,
-            Err(e) => return Err(ToolError::ExecutionFailed(format!("Cargo execution failed: {}", e))),
+            Err(e) => {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "Cargo execution failed: {}",
+                    e
+                )));
+            }
         };
 
         if !build_output.status.success() {
             let stderr = String::from_utf8_lossy(&build_output.stderr);
-            return Err(ToolError::ExecutionFailed(format!("Compilation failed:\n{}", stderr)));
+            return Err(ToolError::ExecutionFailed(format!(
+                "Compilation failed:\n{}",
+                stderr
+            )));
         }
 
         let wasm_path = dir_path.join("target/wasm32-wasip2/release/jit_tool.wasm");
         let wasm_bytes = match fs::read(&wasm_path).await {
             Ok(bytes) => bytes,
-            Err(e) => return Err(ToolError::ExecutionFailed(format!("Failed to read compiled wasm: {}", e))),
+            Err(e) => {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "Failed to read compiled wasm: {}",
+                    e
+                )));
+            }
         };
 
         // Instantiate and run
         let unique_name = format!("jit_tool_{}", uuid::Uuid::new_v4());
         let prepared = match self.runtime.prepare(&unique_name, &wasm_bytes, None).await {
             Ok(p) => p,
-            Err(e) => return Err(ToolError::ExecutionFailed(format!("Failed to prepare WASM: {}", e))),
+            Err(e) => {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "Failed to prepare WASM: {}",
+                    e
+                )));
+            }
         };
 
         // We only grant it the HTTP capability and logging capability.
@@ -206,7 +235,7 @@ impl Tool for JitWasmTool {
         };
 
         let result = wrapper.execute(run_params, ctx).await;
-        
+
         // Cleanup the unique module from the cache after execution
         self.runtime.remove(&unique_name).await;
 

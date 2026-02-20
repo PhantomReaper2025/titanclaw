@@ -478,9 +478,14 @@ where
     async fn complete_streaming(
         &self,
         request: CompletionRequest,
-        on_chunk: &(dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
-              + Send
-              + Sync),
+        on_chunk: &(
+             dyn Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+                 + Send
+                 + Sync
+         ),
     ) -> Result<CompletionResponse, LlmError>
     where
         M::StreamingResponse: Send + Sync + 'static,
@@ -543,9 +548,14 @@ where
     async fn complete_with_tools_streaming(
         &self,
         request: ToolCompletionRequest,
-        on_chunk: &(dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
-              + Send
-              + Sync),
+        on_chunk: &(
+             dyn Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+                 + Send
+                 + Sync
+         ),
     ) -> Result<ToolCompletionResponse, LlmError>
     where
         M::StreamingResponse: Send + Sync + 'static,

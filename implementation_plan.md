@@ -11,6 +11,16 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 > [!CAUTION]
 > This represents a paradigm shift from a linear conversational agent to a distributed orchestration mesh. Please confirm if this extreme scale of ambition aligns with your vision. 
 
+## Implementation Status (2026-02-20)
+
+| Track | Status | Notes |
+|---|---|---|
+| Swarm mesh runtime wiring | 🚧 | `swarm` module exists and is now wired into main runtime lifecycle behind config (`SWARM_ENABLED`, listen/heartbeat/max slots). |
+| Zero-latency text streaming | ✅ | Streaming chunk path is active in agent dispatcher to REPL/Web/WASM channels. |
+| Tool/block-level streaming | 🚧 | Tool start/completion/result events are live; token + tool piped execution still partial. |
+| Reflex compiler | 🚧 | Background reflex compiler loop is running; intent fast-path bypass not complete. |
+| GraphRAG + AST indexing | 🚧 | Tree-sitter AST graph indexing is integrated for Rust docs; full knowledge-graph behavior remains in progress. |
+
 ## Proposed Changes
 
 ### 1. The "Hive" Distributed Swarm Architecture

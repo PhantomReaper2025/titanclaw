@@ -40,12 +40,12 @@
 //! 3. **Self-documenting**: Use README.md files to describe directory structure
 //! 4. **Hybrid search**: Vector similarity + BM25 full-text via RRF
 
+pub mod ast;
 mod chunker;
 mod document;
 mod embeddings;
 pub mod graph_indexer;
 pub mod hygiene;
-pub mod ast;
 #[cfg(feature = "postgres")]
 mod repository;
 mod search;
@@ -648,7 +648,10 @@ impl Workspace {
 
         // Index AST graph (if indexer is available and file is a .rs file)
         if let Some(ref indexer) = self.ast_indexer {
-            if let Err(e) = indexer.index_document(document_id, &doc.content, &doc.path).await {
+            if let Err(e) = indexer
+                .index_document(document_id, &doc.content, &doc.path)
+                .await
+            {
                 tracing::warn!("AST graph indexing failed for {}: {}", doc.path, e);
             }
         }

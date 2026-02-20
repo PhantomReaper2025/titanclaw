@@ -682,11 +682,11 @@ impl AppBuilder {
         // Register dev tools if local tools are enabled
         if self.config.agent.allow_local_tools {
             tools.register_dev_tools();
-            
+
             if let Some(ref runtime) = wasm_tool_runtime {
                 tools.register_jit_tool(Arc::clone(runtime));
             }
-            
+
             tracing::info!(
                 "Local tools enabled (allow_local_tools=true), dev tools and JIT tools registered directly"
             );

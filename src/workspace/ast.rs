@@ -33,15 +33,15 @@ pub fn parse_rust_ast(content: &str) -> Result<Vec<AstNode>, String> {
         (function_item name: (identifier) @name) @function
         (impl_item type: (type_identifier) @impl_name) @impl
     "#;
-    
+
     let query = Query::new(&language, query_source).map_err(|e| e.to_string())?;
     let mut query_cursor = QueryCursor::new();
-    
+
     let mut results = Vec::new();
     let text_bytes = content.as_bytes();
 
     let mut matches = query_cursor.matches(&query, root_node, text_bytes);
-    
+
     while let Some(m) = matches.next() {
         let mut node_type = "";
         let mut name = "";
@@ -98,13 +98,13 @@ fn find_outgoing_calls(
     language: &tree_sitter::Language,
 ) -> HashSet<String> {
     let mut calls = HashSet::new();
-    
+
     let call_query_src = r#"
         (call_expression function: (identifier) @call_target)
         (call_expression function: (field_expression field: (field_identifier) @call_target))
         (call_expression function: (scoped_identifier name: (identifier) @call_target))
     "#;
-    
+
     if let Ok(query) = Query::new(language, call_query_src) {
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&query, root, source);
@@ -117,6 +117,6 @@ fn find_outgoing_calls(
             }
         }
     }
-    
+
     calls
 }

@@ -18,6 +18,7 @@ mod safety;
 mod sandbox;
 mod secrets;
 mod skills;
+mod swarm;
 mod tunnel;
 mod wasm;
 
@@ -43,6 +44,7 @@ pub use self::safety::SafetyConfig;
 pub use self::sandbox::{ClaudeCodeConfig, SandboxModeConfig};
 pub use self::secrets::SecretsConfig;
 pub use self::skills::SkillsConfig;
+pub use self::swarm::SwarmConfig;
 pub use self::tunnel::TunnelConfig;
 pub use self::wasm::WasmConfig;
 
@@ -68,6 +70,7 @@ pub struct Config {
     pub builder: BuilderModeConfig,
     pub heartbeat: HeartbeatConfig,
     pub routines: RoutineConfig,
+    pub swarm: SwarmConfig,
     pub sandbox: SandboxModeConfig,
     pub claude_code: ClaudeCodeConfig,
     pub skills: SkillsConfig,
@@ -191,6 +194,7 @@ impl Config {
             builder: BuilderModeConfig::resolve()?,
             heartbeat: HeartbeatConfig::resolve(settings)?,
             routines: RoutineConfig::resolve()?,
+            swarm: SwarmConfig::resolve(settings)?,
             sandbox: SandboxModeConfig::resolve()?,
             claude_code: ClaudeCodeConfig::resolve()?,
             skills: SkillsConfig::resolve()?,

@@ -12,9 +12,9 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use libp2p::{
-    gossipsub, identify, kad, mdns, noise,
+    Multiaddr, PeerId, SwarmBuilder, gossipsub, identify, kad, mdns, noise,
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux, Multiaddr, PeerId, SwarmBuilder,
+    tcp, yamux,
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;

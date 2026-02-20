@@ -434,9 +434,14 @@ Respond in JSON format:
     pub async fn respond_with_tools_streaming(
         &self,
         context: &ReasoningContext,
-        on_chunk: &(dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
-              + Send
-              + Sync),
+        on_chunk: &(
+             dyn Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+                 + Send
+                 + Sync
+         ),
     ) -> Result<RespondOutput, LlmError> {
         let system_prompt = self.build_conversation_prompt(context);
 

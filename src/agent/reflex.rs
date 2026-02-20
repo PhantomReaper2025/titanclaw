@@ -5,7 +5,9 @@ use crate::db::Database;
 use crate::llm::LlmProvider;
 use crate::safety::SafetyLayer;
 use crate::tools::ToolRegistry;
-use crate::tools::builder::{BuildRequirement, BuilderConfig, Language, LlmSoftwareBuilder, SoftwareBuilder, SoftwareType};
+use crate::tools::builder::{
+    BuildRequirement, BuilderConfig, Language, LlmSoftwareBuilder, SoftwareBuilder, SoftwareType,
+};
 use uuid::Uuid;
 
 /// Spawn the Reflex compiler background ticker.
@@ -23,12 +25,7 @@ pub fn spawn_reflex_compiler(
         // Skip immediate first tick
         ticker.tick().await;
 
-        let builder = LlmSoftwareBuilder::new(
-            BuilderConfig::default(),
-            llm,
-            safety,
-            tools.clone(),
-        );
+        let builder = LlmSoftwareBuilder::new(BuilderConfig::default(), llm, safety, tools.clone());
 
         loop {
             ticker.tick().await;
@@ -48,9 +45,17 @@ pub fn spawn_reflex_compiler(
                             continue;
                         }
 
-                        tracing::info!("Reflex compiler triggered for recurring pattern: {}", description);
+                        tracing::info!(
+                            "Reflex compiler triggered for recurring pattern: {}",
+                            description
+                        );
 
-                        let safe_name = Uuid::new_v4().simple().to_string().chars().take(8).collect::<String>();
+                        let safe_name = Uuid::new_v4()
+                            .simple()
+                            .to_string()
+                            .chars()
+                            .take(8)
+                            .collect::<String>();
                         let req = BuildRequirement {
                             name: format!("reflex_{}", safe_name),
                             description: format!("A specialized tool to handle: {}", description),

@@ -278,9 +278,14 @@ pub trait LlmProvider: Send + Sync {
     async fn complete_streaming(
         &self,
         request: CompletionRequest,
-        on_chunk: &(dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
-              + Send
-              + Sync),
+        on_chunk: &(
+             dyn Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+                 + Send
+                 + Sync
+         ),
     ) -> Result<CompletionResponse, LlmError> {
         let response = self.complete(request).await?;
         if !response.content.is_empty() {
@@ -299,9 +304,14 @@ pub trait LlmProvider: Send + Sync {
     async fn complete_with_tools_streaming(
         &self,
         request: ToolCompletionRequest,
-        on_chunk: &(dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
-              + Send
-              + Sync),
+        on_chunk: &(
+             dyn Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+                 + Send
+                 + Sync
+         ),
     ) -> Result<ToolCompletionResponse, LlmError> {
         let response = self.complete_with_tools(request).await?;
         if let Some(ref content) = response.content {

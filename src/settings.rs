@@ -97,6 +97,10 @@ pub struct Settings {
     /// Builder configuration.
     #[serde(default)]
     pub builder: BuilderSettings,
+
+    /// Swarm mesh configuration.
+    #[serde(default)]
+    pub swarm: SwarmSettings,
 }
 
 /// Source for the secrets master key.
@@ -545,6 +549,42 @@ impl Default for BuilderSettings {
             max_iterations: default_builder_max_iterations(),
             timeout_secs: default_builder_timeout(),
             auto_register: true,
+        }
+    }
+}
+
+/// Swarm mesh settings (libp2p Hive node).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmSettings {
+    /// Enable distributed swarm mesh node.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Port to listen on (0 = random ephemeral port).
+    #[serde(default)]
+    pub listen_port: u16,
+    /// Heartbeat interval in seconds.
+    #[serde(default = "default_swarm_heartbeat_interval")]
+    pub heartbeat_interval_secs: u64,
+    /// Number of local execution slots to advertise.
+    #[serde(default = "default_swarm_max_slots")]
+    pub max_slots: u32,
+}
+
+fn default_swarm_heartbeat_interval() -> u64 {
+    15
+}
+
+fn default_swarm_max_slots() -> u32 {
+    4
+}
+
+impl Default for SwarmSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_port: 0,
+            heartbeat_interval_secs: default_swarm_heartbeat_interval(),
+            max_slots: default_swarm_max_slots(),
         }
     }
 }

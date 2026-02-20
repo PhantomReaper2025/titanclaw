@@ -107,6 +107,18 @@ cargo build --release
 ./target/release/ironclaw service --help
 ```
 
+### Swarm Mesh (Experimental)
+
+Enable the distributed Hive mesh runtime:
+
+```bash
+export SWARM_ENABLED=true
+export SWARM_LISTEN_PORT=0
+export SWARM_HEARTBEAT_INTERVAL_SECS=15
+export SWARM_MAX_SLOTS=4
+./target/release/ironclaw run
+```
+
 ## Architecture
 
 ```text
@@ -126,7 +138,7 @@ Agent Loop + Router
           +--> Workspace + Hybrid Memory Store
 ```
 
-For detailed parity tracking and OpenClaw comparison, see `FEATURE_PARITY.md`.
+For roadmap detail and rollout context, see `implementation_plan.md`.
 
 ## Security Model
 
@@ -150,7 +162,7 @@ If you modify channel source packages, run `./scripts/build-all.sh` before a rel
 
 ## Project Lineage
 
-TitanClaw is built on IronClaw's Rust architecture and tracks OpenClaw parity progress in `FEATURE_PARITY.md`.
+TitanClaw is built on IronClaw's Rust architecture and follows `implementation_plan.md` for upgrade execution.
 
 ## License
 

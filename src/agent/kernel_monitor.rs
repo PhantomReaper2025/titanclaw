@@ -261,8 +261,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_and_detect_bottleneck() {
-        let monitor = KernelMonitor::new()
-            .with_threshold(100.0);
+        let monitor = KernelMonitor::new().with_threshold(100.0);
 
         // Record 15 slow executions
         for _ in 0..15 {

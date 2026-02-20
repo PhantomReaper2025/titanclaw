@@ -184,21 +184,18 @@ impl Agent {
             let channel_name = message.channel.clone();
             let metadata = message.metadata.clone();
 
-            let on_chunk =
-                |chunk: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
-                    let channels = channels.clone();
-                    let channel_name = channel_name.clone();
-                    let metadata = metadata.clone();
-                    Box::pin(async move {
-                        let _ = channels
-                            .send_status(
-                                &channel_name,
-                                StatusUpdate::StreamChunk(chunk),
-                                &metadata,
-                            )
-                            .await;
-                    })
-                };
+            let on_chunk = |chunk: String| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = ()> + Send + 'static>,
+            > {
+                let channels = channels.clone();
+                let channel_name = channel_name.clone();
+                let metadata = metadata.clone();
+                Box::pin(async move {
+                    let _ = channels
+                        .send_status(&channel_name, StatusUpdate::StreamChunk(chunk), &metadata)
+                        .await;
+                })
+            };
 
             let output = reasoning
                 .respond_with_tools_streaming(&context, &on_chunk)

@@ -265,7 +265,9 @@ impl JobStore for PgBackend {
         threshold: i64,
         limit: i64,
     ) -> Result<Vec<String>, DatabaseError> {
-        self.store.find_recurring_job_patterns(threshold, limit).await
+        self.store
+            .find_recurring_job_patterns(threshold, limit)
+            .await
     }
 }
 
@@ -657,9 +659,14 @@ use crate::db::{AstGraphStore, StoredAstEdge, StoredAstNode};
 #[async_trait]
 impl AstGraphStore for PgBackend {
     async fn delete_ast_nodes(&self, document_id: Uuid) -> Result<(), WorkspaceError> {
-        let client = self.store.pool().get().await.map_err(|e| WorkspaceError::SearchFailed {
-            reason: format!("Pool error: {}", e),
-        })?;
+        let client = self
+            .store
+            .pool()
+            .get()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Pool error: {}", e),
+            })?;
         client
             .execute(
                 "DELETE FROM memory_ast_nodes WHERE document_id = $1",
@@ -681,9 +688,14 @@ impl AstGraphStore for PgBackend {
         start_byte: i64,
         end_byte: i64,
     ) -> Result<Uuid, WorkspaceError> {
-        let client = self.store.pool().get().await.map_err(|e| WorkspaceError::SearchFailed {
-            reason: format!("Pool error: {}", e),
-        })?;
+        let client = self
+            .store
+            .pool()
+            .get()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Pool error: {}", e),
+            })?;
         let id = Uuid::new_v4();
         client
             .execute(
@@ -695,7 +707,15 @@ impl AstGraphStore for PgBackend {
                        content_preview = EXCLUDED.content_preview,
                        start_byte = EXCLUDED.start_byte,
                        end_byte = EXCLUDED.end_byte"#,
-                &[&id, &document_id, &node_type, &name, &content_preview, &(start_byte as i32), &(end_byte as i32)],
+                &[
+                    &id,
+                    &document_id,
+                    &node_type,
+                    &name,
+                    &content_preview,
+                    &(start_byte as i32),
+                    &(end_byte as i32),
+                ],
             )
             .await
             .map_err(|e| WorkspaceError::SearchFailed {
@@ -710,9 +730,14 @@ impl AstGraphStore for PgBackend {
         target_node_id: Uuid,
         edge_type: &str,
     ) -> Result<Uuid, WorkspaceError> {
-        let client = self.store.pool().get().await.map_err(|e| WorkspaceError::SearchFailed {
-            reason: format!("Pool error: {}", e),
-        })?;
+        let client = self
+            .store
+            .pool()
+            .get()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Pool error: {}", e),
+            })?;
         let id = Uuid::new_v4();
         client
             .execute(
@@ -728,9 +753,14 @@ impl AstGraphStore for PgBackend {
     }
 
     async fn get_ast_nodes(&self, document_id: Uuid) -> Result<Vec<StoredAstNode>, WorkspaceError> {
-        let client = self.store.pool().get().await.map_err(|e| WorkspaceError::SearchFailed {
-            reason: format!("Pool error: {}", e),
-        })?;
+        let client = self
+            .store
+            .pool()
+            .get()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Pool error: {}", e),
+            })?;
         let rows = client
             .query(
                 r#"SELECT id, document_id, node_type, name, content_preview, start_byte, end_byte
@@ -763,9 +793,14 @@ impl AstGraphStore for PgBackend {
         &self,
         source_node_id: Uuid,
     ) -> Result<Vec<StoredAstEdge>, WorkspaceError> {
-        let client = self.store.pool().get().await.map_err(|e| WorkspaceError::SearchFailed {
-            reason: format!("Pool error: {}", e),
-        })?;
+        let client = self
+            .store
+            .pool()
+            .get()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Pool error: {}", e),
+            })?;
         let rows = client
             .query(
                 "SELECT id, source_node_id, target_node_id, edge_type FROM memory_ast_edges WHERE source_node_id = $1",
@@ -790,9 +825,14 @@ impl AstGraphStore for PgBackend {
         &self,
         name: &str,
     ) -> Result<Vec<StoredAstNode>, WorkspaceError> {
-        let client = self.store.pool().get().await.map_err(|e| WorkspaceError::SearchFailed {
-            reason: format!("Pool error: {}", e),
-        })?;
+        let client = self
+            .store
+            .pool()
+            .get()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Pool error: {}", e),
+            })?;
         let rows = client
             .query(
                 r#"SELECT id, document_id, node_type, name, content_preview, start_byte, end_byte
@@ -821,4 +861,3 @@ impl AstGraphStore for PgBackend {
             .collect())
     }
 }
-

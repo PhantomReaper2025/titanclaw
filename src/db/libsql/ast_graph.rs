@@ -96,10 +96,7 @@ impl AstGraphStore for LibSqlBackend {
         Ok(id)
     }
 
-    async fn get_ast_nodes(
-        &self,
-        document_id: Uuid,
-    ) -> Result<Vec<StoredAstNode>, WorkspaceError> {
+    async fn get_ast_nodes(&self, document_id: Uuid) -> Result<Vec<StoredAstNode>, WorkspaceError> {
         let conn = self
             .connect()
             .await

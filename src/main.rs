@@ -1397,6 +1397,65 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Agent initialized, starting main loop...");
 
+    // Optional distributed swarm mesh node (libp2p Hive).
+    let mut swarm_handle: Option<ironclaw::swarm::node::SwarmHandle> = None;
+    let mut swarm_events_task: Option<tokio::task::JoinHandle<()>> = None;
+    if config.swarm.enabled {
+        let swarm_cfg = ironclaw::swarm::node::SwarmConfig {
+            listen_port: config.swarm.listen_port,
+            heartbeat_interval: config.swarm.heartbeat_interval,
+            max_slots: config.swarm.max_slots,
+        };
+        let swarm_node = ironclaw::swarm::node::SwarmNode::new(swarm_cfg);
+        match swarm_node.start().await {
+            Ok((handle, mut events_rx)) => {
+                tracing::info!(
+                    "Swarm mesh enabled (listen_port={}, heartbeat={}s, max_slots={})",
+                    config.swarm.listen_port,
+                    config.swarm.heartbeat_interval.as_secs(),
+                    config.swarm.max_slots
+                );
+                swarm_events_task = Some(tokio::spawn(async move {
+                    while let Some(event) = events_rx.recv().await {
+                        match event {
+                            ironclaw::swarm::node::SwarmEvent2::IncomingTask(task) => {
+                                tracing::info!(
+                                    task_id = %task.id,
+                                    tool_name = %task.tool_name,
+                                    job_id = %task.job_id,
+                                    "Swarm received remote task assignment"
+                                );
+                            }
+                            ironclaw::swarm::node::SwarmEvent2::TaskCompleted {
+                                task_id,
+                                success,
+                                duration_ms,
+                                ..
+                            } => {
+                                tracing::info!(
+                                    task_id = %task_id,
+                                    success,
+                                    duration_ms,
+                                    "Swarm task completion received"
+                                );
+                            }
+                            ironclaw::swarm::node::SwarmEvent2::PeerDiscovered(peer_id) => {
+                                tracing::info!(peer = %peer_id, "Swarm peer discovered");
+                            }
+                            ironclaw::swarm::node::SwarmEvent2::PeerLost(peer_id) => {
+                                tracing::info!(peer = %peer_id, "Swarm peer lost");
+                            }
+                        }
+                    }
+                }));
+                swarm_handle = Some(handle);
+            }
+            Err(e) => {
+                tracing::error!("Failed to start swarm mesh node: {}", e);
+            }
+        }
+    }
+
     // Print boot screen for interactive CLI mode (not single-message mode).
     if config.channels.cli.enabled && cli.message.is_none() {
         let boot_info = ironclaw::boot_screen::BootInfo {
@@ -1436,6 +1495,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Run the agent (blocks until shutdown)
     agent.run().await?;
+
+    // Shut down swarm node if enabled.
+    if let Some(handle) = swarm_handle.take() {
+        if let Err(e) = handle.shutdown().await {
+            tracing::warn!("Failed to stop swarm mesh cleanly: {}", e);
+        }
+    }
+    if let Some(task) = swarm_events_task.take() {
+        task.abort();
+    }
 
     // Shut down the webhook server if one was started
     if let Some(ref mut server) = webhook_server {

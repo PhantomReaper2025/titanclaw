@@ -473,4 +473,3 @@ pub trait Database:
     /// Run schema migrations for this backend.
     async fn run_migrations(&self) -> Result<(), DatabaseError>;
 }
-

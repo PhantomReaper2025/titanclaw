@@ -85,11 +85,7 @@ impl AstGraphIndexer {
             }
         }
 
-        tracing::debug!(
-            "Indexed {} AST nodes for {}",
-            ast_nodes.len(),
-            path
-        );
+        tracing::debug!("Indexed {} AST nodes for {}", ast_nodes.len(), path);
 
         Ok(())
     }
