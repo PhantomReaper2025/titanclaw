@@ -294,6 +294,8 @@ impl TestHarnessBuilder {
             skills_config: SkillsConfig::default(),
             hooks,
             cost_guard,
+            swarm_handle: None,
+            swarm_results: None,
         };
 
         TestHarness {

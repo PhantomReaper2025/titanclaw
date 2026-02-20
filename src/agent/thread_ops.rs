@@ -220,46 +220,87 @@ impl Agent {
                             "Routed via reflex pattern registry"
                         );
 
-                        let _ = self
-                            .channels
-                            .send_status(
-                                &message.channel,
-                                StatusUpdate::Thinking(format!(
-                                    "Reflex fast-path: executing {}",
-                                    tool_name
-                                )),
-                                &message.metadata,
-                            )
-                            .await;
-
                         let job_ctx = JobContext::with_user(
                             &message.user_id,
                             "chat",
                             "Reflex fast-path execution",
                         );
                         let params = serde_json::json!({ "input": content });
-                        let live_stream = tool_name == "shell";
-                        match self
-                            .execute_chat_tool(
-                                &tool_name,
-                                &params,
-                                &job_ctx,
-                                &message.channel,
-                                &message.metadata,
-                                live_stream,
-                            )
-                            .await
+                        let mut reflex_allowed = true;
+                        if let Some(tool) = self.tools().get(&tool_name).await
+                            && tool.requires_approval()
                         {
-                            Ok(output) => {
-                                let _ = store.bump_reflex_pattern_hit(&normalized).await;
-                                return Ok(SubmissionResult::response(output));
-                            }
-                            Err(e) => {
-                                tracing::warn!(
+                            let is_auto_approved = {
+                                let sess = session.lock().await;
+                                sess.is_tool_auto_approved(&tool_name)
+                            };
+                            if !is_auto_approved || tool.requires_approval_for(&params) {
+                                tracing::info!(
                                     tool = %tool_name,
-                                    "Reflex fast-path failed, falling back to agentic loop: {}",
-                                    e
+                                    "Reflex fast-path requires approval, falling back to agentic loop"
                                 );
+                                reflex_allowed = false;
+                            }
+                        }
+
+                        if reflex_allowed {
+                            let _ = self
+                                .channels
+                                .send_status(
+                                    &message.channel,
+                                    StatusUpdate::Thinking(format!(
+                                        "Reflex fast-path: executing {}",
+                                        tool_name
+                                    )),
+                                    &message.metadata,
+                                )
+                                .await;
+
+                            let live_stream = tool_name == "shell";
+                            match self
+                                .execute_chat_tool(
+                                    &tool_name,
+                                    &params,
+                                    &job_ctx,
+                                    &message.channel,
+                                    &message.metadata,
+                                    live_stream,
+                                )
+                                .await
+                            {
+                                Ok(output) => {
+                                    let _ = store.bump_reflex_pattern_hit(&normalized).await;
+                                    {
+                                        let mut sess = session.lock().await;
+                                        if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                                            thread.start_turn(content);
+                                            thread.complete_turn(&output);
+                                            self.persist_response_chain(thread);
+                                        }
+                                    }
+                                    let _ = self
+                                        .channels
+                                        .send_status(
+                                            &message.channel,
+                                            StatusUpdate::Status("Done".into()),
+                                            &message.metadata,
+                                        )
+                                        .await;
+                                    self.persist_turn(
+                                        thread_id,
+                                        &message.user_id,
+                                        content,
+                                        Some(&output),
+                                    );
+                                    return Ok(SubmissionResult::response(output));
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        tool = %tool_name,
+                                        "Reflex fast-path failed, falling back to agentic loop: {}",
+                                        e
+                                    );
+                                }
                             }
                         }
                     }

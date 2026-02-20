@@ -307,8 +307,8 @@ pub struct AgentSettings {
     #[serde(default = "default_session_idle_timeout")]
     pub session_idle_timeout_secs: u64,
 
-    /// Enable experimental token-to-tool piped execution path.
-    #[serde(default)]
+    /// Enable token-to-tool piped execution path.
+    #[serde(default = "default_true")]
     pub enable_piped_tool_execution: bool,
 }
 
@@ -355,7 +355,7 @@ impl Default for AgentSettings {
             repair_check_interval_secs: default_repair_interval(),
             max_repair_attempts: default_max_repair_attempts(),
             session_idle_timeout_secs: default_session_idle_timeout(),
-            enable_piped_tool_execution: false,
+            enable_piped_tool_execution: true,
         }
     }
 }

@@ -7,6 +7,7 @@
 //! 4. Broadcasts heartbeats so peers know each node's capacity
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -16,7 +17,7 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
 use super::protocol::{SwarmMessage, SwarmTask, TOPIC_HEARTBEAT, TOPIC_RESULTS, TOPIC_TASKS};
@@ -34,6 +35,39 @@ pub struct HiveBehaviour {
 #[derive(Clone)]
 pub struct SwarmHandle {
     cmd_tx: mpsc::Sender<SwarmCommand>,
+}
+
+/// Remote task completion payload delivered to local waiters.
+#[derive(Debug)]
+pub struct SwarmRemoteResult {
+    pub success: bool,
+    pub output: String,
+    pub duration_ms: u64,
+}
+
+/// Shared map used to route remote task results back to awaiting callers.
+#[derive(Clone, Default)]
+pub struct SwarmResultRouter {
+    pending: Arc<Mutex<HashMap<Uuid, oneshot::Sender<SwarmRemoteResult>>>>,
+}
+
+impl SwarmResultRouter {
+    /// Register interest in a task result and return a receiver for it.
+    pub async fn register(&self, task_id: Uuid) -> oneshot::Receiver<SwarmRemoteResult> {
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(task_id, tx);
+        rx
+    }
+
+    /// Resolve a task result for any local waiter.
+    pub async fn resolve(&self, task_id: Uuid, result: SwarmRemoteResult) -> bool {
+        if let Some(tx) = self.pending.lock().await.remove(&task_id) {
+            let _ = tx.send(result);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Commands that external code can send to the swarm event loop.

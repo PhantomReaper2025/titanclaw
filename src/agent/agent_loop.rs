@@ -28,6 +28,7 @@ use crate::hooks::HookRegistry;
 use crate::llm::LlmProvider;
 use crate::safety::SafetyLayer;
 use crate::skills::SkillRegistry;
+use crate::swarm::node::{SwarmHandle, SwarmResultRouter};
 use crate::tools::ToolRegistry;
 use crate::workspace::Workspace;
 
@@ -72,6 +73,10 @@ pub struct AgentDeps {
     pub hooks: Arc<HookRegistry>,
     /// Cost enforcement guardrails (daily budget, hourly rate limits).
     pub cost_guard: Arc<crate::agent::cost_guard::CostGuard>,
+    /// Optional distributed swarm handle for remote task offload.
+    pub swarm_handle: Option<SwarmHandle>,
+    /// Optional swarm result router used to await remote task completions.
+    pub swarm_results: Option<SwarmResultRouter>,
 }
 
 /// The main agent that coordinates all components.
@@ -115,6 +120,8 @@ impl Agent {
             deps.tools.clone(),
             deps.store.clone(),
             deps.hooks.clone(),
+            deps.swarm_handle.clone(),
+            deps.swarm_results.clone(),
         ));
 
         Self {

@@ -1365,6 +1365,167 @@ async fn main() -> anyhow::Result<()> {
     let boot_llm_model = llm.model_name().to_string();
     let boot_cheap_model = cheap_llm.as_ref().map(|c| c.model_name().to_string());
 
+    // Optional distributed swarm mesh node (libp2p Hive).
+    let mut swarm_handle: Option<ironclaw::swarm::node::SwarmHandle> = None;
+    let mut swarm_events_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut swarm_result_router: Option<ironclaw::swarm::node::SwarmResultRouter> = None;
+    if config.swarm.enabled {
+        let swarm_cfg = ironclaw::swarm::node::SwarmConfig {
+            listen_port: config.swarm.listen_port,
+            heartbeat_interval: config.swarm.heartbeat_interval,
+            max_slots: config.swarm.max_slots,
+        };
+        let swarm_node = ironclaw::swarm::node::SwarmNode::new(swarm_cfg);
+        match swarm_node.start().await {
+            Ok((handle, mut events_rx)) => {
+                let result_router = ironclaw::swarm::node::SwarmResultRouter::default();
+                let swarm_tools = Arc::clone(&tools);
+                let swarm_safety = Arc::clone(&safety);
+                let swarm_context_manager = Arc::clone(&context_manager);
+                let swarm_handle_for_events = handle.clone();
+                let swarm_results_for_events = result_router.clone();
+
+                tracing::info!(
+                    "Swarm mesh enabled (listen_port={}, heartbeat={}s, max_slots={})",
+                    config.swarm.listen_port,
+                    config.swarm.heartbeat_interval.as_secs(),
+                    config.swarm.max_slots
+                );
+                swarm_events_task = Some(tokio::spawn(async move {
+                    while let Some(event) = events_rx.recv().await {
+                        match event {
+                            ironclaw::swarm::node::SwarmEvent2::IncomingTask(task) => {
+                                tracing::info!(
+                                    task_id = %task.id,
+                                    tool_name = %task.tool_name,
+                                    job_id = %task.job_id,
+                                    "Swarm received remote task assignment"
+                                );
+                                let swarm_tools = Arc::clone(&swarm_tools);
+                                let swarm_safety = Arc::clone(&swarm_safety);
+                                let swarm_context_manager = Arc::clone(&swarm_context_manager);
+                                let swarm_handle = swarm_handle_for_events.clone();
+                                tokio::spawn(async move {
+                                    let started = std::time::Instant::now();
+                                    let exec = async {
+                                        let tool = swarm_tools
+                                            .get(&task.tool_name)
+                                            .await
+                                            .ok_or_else(|| {
+                                                format!("Tool '{}' not found", task.tool_name)
+                                            })?;
+
+                                        if tool.requires_approval()
+                                            || tool.requires_approval_for(&task.params)
+                                        {
+                                            return Err(format!(
+                                                "Tool '{}' requires approval and cannot run remotely",
+                                                task.tool_name
+                                            ));
+                                        }
+
+                                        let validation =
+                                            swarm_safety.validator().validate_tool_params(&task.params);
+                                        if !validation.is_valid {
+                                            let details = validation
+                                                .errors
+                                                .iter()
+                                                .map(|e| format!("{}: {}", e.field, e.message))
+                                                .collect::<Vec<_>>()
+                                                .join("; ");
+                                            return Err(format!("Invalid tool parameters: {}", details));
+                                        }
+
+                                        let job_ctx =
+                                            match swarm_context_manager.get_context(task.job_id).await {
+                                                Ok(ctx) => ctx,
+                                                Err(_) => ironclaw::context::JobContext::with_user(
+                                                    "swarm",
+                                                    "swarm",
+                                                    "Remote swarm task execution",
+                                                ),
+                                            };
+
+                                        let timeout = tool.execution_timeout();
+                                        let output = tokio::time::timeout(timeout, async {
+                                            tool.execute(task.params.clone(), &job_ctx).await
+                                        })
+                                        .await
+                                        .map_err(|_| {
+                                            format!(
+                                                "Tool '{}' timed out after {}s",
+                                                task.tool_name,
+                                                timeout.as_secs()
+                                            )
+                                        })?
+                                        .map_err(|e| e.to_string())?;
+
+                                        serde_json::to_string(&output.result)
+                                            .map_err(|e| format!("Serialize result failed: {}", e))
+                                    }
+                                    .await;
+
+                                    let duration_ms = started.elapsed().as_millis() as u64;
+                                    let (success, output) = match exec {
+                                        Ok(output) => (true, output),
+                                        Err(err) => (false, err),
+                                    };
+
+                                    if let Err(e) = swarm_handle
+                                        .publish_result(task.id, success, output, duration_ms)
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            task_id = %task.id,
+                                            "Failed to publish swarm task result: {}",
+                                            e
+                                        );
+                                    }
+                                });
+                            }
+                            ironclaw::swarm::node::SwarmEvent2::TaskCompleted {
+                                task_id,
+                                success,
+                                output,
+                                duration_ms,
+                            } => {
+                                let routed = swarm_results_for_events
+                                    .resolve(
+                                        task_id,
+                                        ironclaw::swarm::node::SwarmRemoteResult {
+                                            success,
+                                            output: output.clone(),
+                                            duration_ms,
+                                        },
+                                    )
+                                    .await;
+                                if !routed {
+                                    tracing::info!(
+                                        task_id = %task_id,
+                                        success,
+                                        duration_ms,
+                                        "Swarm task completion received"
+                                    );
+                                }
+                            }
+                            ironclaw::swarm::node::SwarmEvent2::PeerDiscovered(peer_id) => {
+                                tracing::info!(peer = %peer_id, "Swarm peer discovered");
+                            }
+                            ironclaw::swarm::node::SwarmEvent2::PeerLost(peer_id) => {
+                                tracing::info!(peer = %peer_id, "Swarm peer lost");
+                            }
+                        }
+                    }
+                }));
+                swarm_result_router = Some(result_router);
+                swarm_handle = Some(handle);
+            }
+            Err(e) => {
+                tracing::error!("Failed to start swarm mesh node: {}", e);
+            }
+        }
+    }
+
     // Create and run the agent
     let cost_guard = Arc::new(ironclaw::agent::cost_guard::CostGuard::new(
         ironclaw::agent::cost_guard::CostGuardConfig {
@@ -1384,6 +1545,8 @@ async fn main() -> anyhow::Result<()> {
         skills_config: config.skills.clone(),
         hooks,
         cost_guard,
+        swarm_handle: swarm_handle.clone(),
+        swarm_results: swarm_result_router.clone(),
     };
     let agent = Agent::new(
         config.agent.clone(),
@@ -1396,65 +1559,6 @@ async fn main() -> anyhow::Result<()> {
     );
 
     tracing::info!("Agent initialized, starting main loop...");
-
-    // Optional distributed swarm mesh node (libp2p Hive).
-    let mut swarm_handle: Option<ironclaw::swarm::node::SwarmHandle> = None;
-    let mut swarm_events_task: Option<tokio::task::JoinHandle<()>> = None;
-    if config.swarm.enabled {
-        let swarm_cfg = ironclaw::swarm::node::SwarmConfig {
-            listen_port: config.swarm.listen_port,
-            heartbeat_interval: config.swarm.heartbeat_interval,
-            max_slots: config.swarm.max_slots,
-        };
-        let swarm_node = ironclaw::swarm::node::SwarmNode::new(swarm_cfg);
-        match swarm_node.start().await {
-            Ok((handle, mut events_rx)) => {
-                tracing::info!(
-                    "Swarm mesh enabled (listen_port={}, heartbeat={}s, max_slots={})",
-                    config.swarm.listen_port,
-                    config.swarm.heartbeat_interval.as_secs(),
-                    config.swarm.max_slots
-                );
-                swarm_events_task = Some(tokio::spawn(async move {
-                    while let Some(event) = events_rx.recv().await {
-                        match event {
-                            ironclaw::swarm::node::SwarmEvent2::IncomingTask(task) => {
-                                tracing::info!(
-                                    task_id = %task.id,
-                                    tool_name = %task.tool_name,
-                                    job_id = %task.job_id,
-                                    "Swarm received remote task assignment"
-                                );
-                            }
-                            ironclaw::swarm::node::SwarmEvent2::TaskCompleted {
-                                task_id,
-                                success,
-                                duration_ms,
-                                ..
-                            } => {
-                                tracing::info!(
-                                    task_id = %task_id,
-                                    success,
-                                    duration_ms,
-                                    "Swarm task completion received"
-                                );
-                            }
-                            ironclaw::swarm::node::SwarmEvent2::PeerDiscovered(peer_id) => {
-                                tracing::info!(peer = %peer_id, "Swarm peer discovered");
-                            }
-                            ironclaw::swarm::node::SwarmEvent2::PeerLost(peer_id) => {
-                                tracing::info!(peer = %peer_id, "Swarm peer lost");
-                            }
-                        }
-                    }
-                }));
-                swarm_handle = Some(handle);
-            }
-            Err(e) => {
-                tracing::error!("Failed to start swarm mesh node: {}", e);
-            }
-        }
-    }
 
     // Print boot screen for interactive CLI mode (not single-message mode).
     if config.channels.cli.enabled && cli.message.is_none() {

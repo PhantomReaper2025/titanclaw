@@ -34,10 +34,10 @@ Based on `implementation_plan.md`, this is where the upgrade stands today.
 | Phase 0: provider independence + local inference | ✅ | NEAR AI, OpenAI-compatible, Ollama, Tinfoil, provider failover |
 | Phase 0: orchestration foundations | ✅ | Scheduler, parallel jobs, Docker worker/orchestrator flow |
 | Phase 0: secure extensibility | ✅ | WASM tool system, dynamic tool building, secure skills framework |
-| Phase 0: streaming everywhere | 🚧 | Gateway SSE/WebSocket exists; shell output streams live per chunk, tool-call deltas surface live shell command drafts, and feature-flagged early piped shell execution is available (`ENABLE_PIPED_TOOL_EXECUTION=true`) |
+| Phase 0: streaming everywhere | ✅ | Gateway SSE/WebSocket exists; shell output streams live per chunk, tool-call deltas surface live shell command drafts, early piped shell execution is default-on (disable with `ENABLE_PIPED_TOOL_EXECUTION=false`), and approval-required commands emit explicit waiting status |
 | Phase 0: reflex fast-path bypass | ✅ | Deterministic NL routing + persistent reflex pattern registry now route recurring prompts directly to compiled tools with LLM fallback |
 | Phase 1: deep context indexing | ✅ | Tree-sitter AST indexing is live and queryable with `memory_graph` (bounded multi-hop traversal, graph scoring, stable ranking, semantic context fusion) |
-| Phase 2: distributed swarm mesh | 🔮 | libp2p dependencies are integrated; mesh-level runtime behavior is roadmap work |
+| Phase 2: distributed swarm mesh | 🚧 | Mesh node lifecycle is live, incoming swarm tasks execute via local tool/safety stack, and scheduler tool subtasks now offload to swarm peers with fast local fallback |
 
 ## Capabilities
 
@@ -64,8 +64,8 @@ Based on `implementation_plan.md`, this is where the upgrade stands today.
 - [x] AST graph indexing + query access (`memory_graph`)
 - [x] Generalized reflex routing from recurring patterns
 - [x] Multi-hop GraphRAG quality hardening
-- [ ] Token-to-tool piped execution completion (feature-flagged path is live; default-on rollout remains)
-- [ ] Swarm task distribution beyond local runtime wiring
+- [x] Token-to-tool piped execution completion (default-on with approval-aware piped status)
+- [x] Swarm task distribution from scheduler tool subtasks into mesh peers (with remote-result routing and local fallback)
 
 ### Built For Operators
 

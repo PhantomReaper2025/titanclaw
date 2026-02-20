@@ -407,6 +407,16 @@ impl Agent {
                                             if !is_auto_approved
                                                 || tool.requires_approval_for(&args)
                                             {
+                                                let _ = channels
+                                                    .send_status(
+                                                        &channel_name,
+                                                        StatusUpdate::ToolResult {
+                                                            name: "shell".to_string(),
+                                                            preview: "[piped] awaiting approval; execution will start after confirmation".to_string(),
+                                                        },
+                                                        &metadata,
+                                                    )
+                                                    .await;
                                                 return;
                                             }
                                         }
@@ -565,6 +575,16 @@ impl Agent {
                                             if !is_auto_approved
                                                 || tool.requires_approval_for(&args)
                                             {
+                                                let _ = channels
+                                                    .send_status(
+                                                        &channel_name,
+                                                        StatusUpdate::ToolResult {
+                                                            name: "shell".to_string(),
+                                                            preview: "[piped] awaiting approval; execution will start after confirmation".to_string(),
+                                                        },
+                                                        &metadata,
+                                                    )
+                                                    .await;
                                                 return;
                                             }
                                         }

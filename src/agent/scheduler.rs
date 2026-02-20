@@ -17,6 +17,7 @@ use crate::error::{Error, JobError};
 use crate::hooks::HookRegistry;
 use crate::llm::LlmProvider;
 use crate::safety::SafetyLayer;
+use crate::swarm::node::{SwarmHandle, SwarmRemoteResult, SwarmResultRouter};
 use crate::tools::ToolRegistry;
 
 /// Message to send to a worker.
@@ -51,6 +52,8 @@ pub struct Scheduler {
     tools: Arc<ToolRegistry>,
     store: Option<Arc<dyn Database>>,
     hooks: Arc<HookRegistry>,
+    swarm_handle: Option<SwarmHandle>,
+    swarm_results: Option<SwarmResultRouter>,
     /// Running jobs (main LLM-driven jobs).
     jobs: Arc<RwLock<HashMap<Uuid, ScheduledJob>>>,
     /// Running sub-tasks (tool executions, background tasks).
@@ -67,6 +70,8 @@ impl Scheduler {
         tools: Arc<ToolRegistry>,
         store: Option<Arc<dyn Database>>,
         hooks: Arc<HookRegistry>,
+        swarm_handle: Option<SwarmHandle>,
+        swarm_results: Option<SwarmResultRouter>,
     ) -> Self {
         Self {
             config,
@@ -76,6 +81,8 @@ impl Scheduler {
             tools,
             store,
             hooks,
+            swarm_handle,
+            swarm_results,
             jobs: Arc::new(RwLock::new(HashMap::new())),
             subtasks: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -198,17 +205,89 @@ impl Scheduler {
                 let tools = self.tools.clone();
                 let context_manager = self.context_manager.clone();
                 let safety = self.safety.clone();
+                let swarm_handle = self.swarm_handle.clone();
+                let swarm_results = self.swarm_results.clone();
+                let task_id_for_remote = task_id;
+                let tool_name_for_remote = tool_name.clone();
+                let params_for_remote = params.clone();
 
                 tokio::spawn(async move {
-                    let result = Self::execute_tool_task(
-                        tools,
-                        context_manager,
-                        safety,
-                        tool_parent_id,
-                        &tool_name,
-                        params,
-                    )
-                    .await;
+                    // Try remote swarm execution first when mesh is enabled.
+                    // Fall back to local execution quickly if no remote result arrives.
+                    let result = if let (Some(handle), Some(router)) = (swarm_handle, swarm_results)
+                    {
+                        let remote_waiter = router.register(task_id_for_remote).await;
+                        let offload = handle
+                            .distribute_task(crate::swarm::protocol::SwarmTask {
+                                id: task_id_for_remote,
+                                job_id: tool_parent_id,
+                                tool_name: tool_name_for_remote.clone(),
+                                params: params_for_remote.clone(),
+                                priority: 5,
+                            })
+                            .await;
+
+                        if offload.is_ok() {
+                            match tokio::time::timeout(
+                                Duration::from_millis(300),
+                                remote_waiter,
+                            )
+                            .await
+                            {
+                                Ok(Ok(SwarmRemoteResult {
+                                    success: true,
+                                    output,
+                                    duration_ms,
+                                })) => {
+                                    let output_json = serde_json::from_str::<serde_json::Value>(&output)
+                                        .unwrap_or_else(|_| serde_json::json!({ "output": output }));
+                                    Ok(TaskOutput::new(
+                                        output_json,
+                                        Duration::from_millis(duration_ms),
+                                    ))
+                                }
+                                Ok(Ok(SwarmRemoteResult {
+                                    success: false,
+                                    output,
+                                    ..
+                                })) => Err(Error::Tool(crate::error::ToolError::ExecutionFailed {
+                                    name: tool_name_for_remote.clone(),
+                                    reason: format!("Remote swarm execution failed: {}", output),
+                                })),
+                                _ => {
+                                    Self::execute_tool_task(
+                                        tools,
+                                        context_manager,
+                                        safety,
+                                        tool_parent_id,
+                                        &tool_name,
+                                        params,
+                                    )
+                                    .await
+                                }
+                            }
+                        } else {
+                            Self::execute_tool_task(
+                                tools,
+                                context_manager,
+                                safety,
+                                tool_parent_id,
+                                &tool_name,
+                                params,
+                            )
+                            .await
+                        }
+                    } else {
+                        Self::execute_tool_task(
+                            tools,
+                            context_manager,
+                            safety,
+                            tool_parent_id,
+                            &tool_name,
+                            params,
+                        )
+                        .await
+                    };
 
                     // Send result (ignore if receiver dropped)
                     let _ = result_tx.send(result);

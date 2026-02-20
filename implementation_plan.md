@@ -15,9 +15,9 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 
 | Track | Status | Notes |
 |---|---|---|
-| Swarm mesh runtime wiring | 🚧 | `swarm` module exists and is now wired into main runtime lifecycle behind config (`SWARM_ENABLED`, listen/heartbeat/max slots). |
+| Swarm mesh runtime wiring | 🚧 | `swarm` module is wired into runtime lifecycle behind config (`SWARM_ENABLED`, listen/heartbeat/max slots), incoming remote tasks execute through the local tool/safety stack, and remote completions route back to local waiters. |
 | Zero-latency text streaming | ✅ | Streaming chunk path is active in agent dispatcher to REPL/Web/WASM channels. |
-| Tool/block-level streaming | 🚧 | Tool start/completion/result events are live; shell tool streams incremental stdout/stderr, streamed tool-call deltas surface live shell command drafts (`[draft]`), and feature-flagged early piped shell execution is enabled for safe auto-approved commands (`ENABLE_PIPED_TOOL_EXECUTION=true`). |
+| Tool/block-level streaming | ✅ | Tool start/completion/result events are live; shell tool streams incremental stdout/stderr, streamed tool-call deltas surface live shell command drafts (`[draft]`), piped early execution is default-on (toggle with `ENABLE_PIPED_TOOL_EXECUTION=false`), and approval-required commands emit explicit waiting status before execution. |
 | Reflex compiler | ✅ | Background reflex compiler now persists normalized recurring patterns to a reflex registry and routes matching prompts directly to compiled tools before LLM fallback. |
 | GraphRAG + AST indexing | ✅ | `memory_graph` now supports bounded multi-hop traversal, graph scoring, stable ranking, and semantic context fusion in responses. |
 
@@ -29,8 +29,8 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 - [x] AST graph indexing + symbol-level query tool (`memory_graph`)
 - [x] Generalized reflex routing from recurring patterns to compiled tools
 - [x] Multi-hop GraphRAG retrieval quality hardening
-- [ ] Token-to-tool piped execution completion (feature-flagged early execution is live; broad default-on rollout and approval UX hardening remain)
-- [ ] Swarm workload distribution from scheduler into mesh peers
+- [x] Token-to-tool piped execution completion (default-on with explicit approval-aware piped status)
+- [x] Swarm workload distribution from scheduler into mesh peers (scheduler tool subtasks offload to swarm with fast local fallback)
 
 ## Proposed Changes
 
