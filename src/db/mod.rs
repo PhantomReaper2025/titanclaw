@@ -392,6 +392,67 @@ pub trait WorkspaceStore: Send + Sync {
     ) -> Result<Vec<SearchResult>, WorkspaceError>;
 }
 
+/// AST graph node stored in the database.
+#[derive(Debug, Clone)]
+pub struct StoredAstNode {
+    pub id: Uuid,
+    pub document_id: Uuid,
+    pub node_type: String,
+    pub name: String,
+    pub content_preview: String,
+    pub start_byte: i64,
+    pub end_byte: i64,
+}
+
+/// AST graph edge stored in the database.
+#[derive(Debug, Clone)]
+pub struct StoredAstEdge {
+    pub id: Uuid,
+    pub source_node_id: Uuid,
+    pub target_node_id: Uuid,
+    pub edge_type: String,
+}
+
+#[async_trait]
+pub trait AstGraphStore: Send + Sync {
+    /// Delete all AST nodes (and cascaded edges) for a document.
+    async fn delete_ast_nodes(&self, document_id: Uuid) -> Result<(), WorkspaceError>;
+
+    /// Insert an AST node for a document.
+    async fn insert_ast_node(
+        &self,
+        document_id: Uuid,
+        node_type: &str,
+        name: &str,
+        content_preview: &str,
+        start_byte: i64,
+        end_byte: i64,
+    ) -> Result<Uuid, WorkspaceError>;
+
+    /// Insert an edge between two AST nodes.
+    async fn insert_ast_edge(
+        &self,
+        source_node_id: Uuid,
+        target_node_id: Uuid,
+        edge_type: &str,
+    ) -> Result<Uuid, WorkspaceError>;
+
+    /// Get all AST nodes for a document.
+    async fn get_ast_nodes(&self, document_id: Uuid) -> Result<Vec<StoredAstNode>, WorkspaceError>;
+
+    /// Get all outgoing edges from a node.
+    async fn get_ast_edges_from(
+        &self,
+        source_node_id: Uuid,
+    ) -> Result<Vec<StoredAstEdge>, WorkspaceError>;
+
+    /// Find AST nodes by name (across all documents).
+    async fn find_ast_nodes_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Vec<StoredAstNode>, WorkspaceError>;
+}
+
 /// Backend-agnostic database supertrait.
 ///
 /// Combines all sub-traits into one. Existing `Arc<dyn Database>` consumers
@@ -405,9 +466,11 @@ pub trait Database:
     + ToolFailureStore
     + SettingsStore
     + WorkspaceStore
+    + AstGraphStore
     + Send
     + Sync
 {
     /// Run schema migrations for this backend.
     async fn run_migrations(&self) -> Result<(), DatabaseError>;
 }
+

@@ -228,6 +228,35 @@ CREATE TABLE IF NOT EXISTS memory_chunks (
 
 CREATE INDEX IF NOT EXISTS idx_memory_chunks_document ON memory_chunks(document_id);
 
+-- ==================== Workspace: AST Graph Nodes ====================
+
+CREATE TABLE IF NOT EXISTS memory_ast_nodes (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES memory_documents(id) ON DELETE CASCADE,
+    node_type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    content_preview TEXT NOT NULL,
+    start_byte INTEGER NOT NULL,
+    end_byte INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (document_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_ast_nodes_doc ON memory_ast_nodes(document_id);
+
+-- ==================== Workspace: AST Graph Edges ====================
+
+CREATE TABLE IF NOT EXISTS memory_ast_edges (
+    id TEXT PRIMARY KEY,
+    source_node_id TEXT NOT NULL REFERENCES memory_ast_nodes(id) ON DELETE CASCADE,
+    target_node_id TEXT NOT NULL REFERENCES memory_ast_nodes(id) ON DELETE CASCADE,
+    edge_type TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_ast_edges_source ON memory_ast_edges(source_node_id);
+CREATE INDEX IF NOT EXISTS idx_memory_ast_edges_target ON memory_ast_edges(target_node_id);
+
 -- Vector index for semantic search (libSQL native)
 CREATE INDEX IF NOT EXISTS idx_memory_chunks_embedding
     ON memory_chunks (libsql_vector_idx(embedding));

@@ -6,6 +6,7 @@
 //! - Turso cloud with embedded replica (sync to cloud)
 //! - In-memory (for testing)
 
+mod ast_graph;
 mod conversations;
 mod jobs;
 mod routines;

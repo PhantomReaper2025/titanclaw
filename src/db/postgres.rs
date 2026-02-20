@@ -649,3 +649,176 @@ impl WorkspaceStore for PgBackend {
             .await
     }
 }
+
+// ==================== AstGraphStore ====================
+
+use crate::db::{AstGraphStore, StoredAstEdge, StoredAstNode};
+
+#[async_trait]
+impl AstGraphStore for PgBackend {
+    async fn delete_ast_nodes(&self, document_id: Uuid) -> Result<(), WorkspaceError> {
+        let client = self.store.pool().get().await.map_err(|e| WorkspaceError::SearchFailed {
+            reason: format!("Pool error: {}", e),
+        })?;
+        client
+            .execute(
+                "DELETE FROM memory_ast_nodes WHERE document_id = $1",
+                &[&document_id],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Delete AST nodes failed: {}", e),
+            })?;
+        Ok(())
+    }
+
+    async fn insert_ast_node(
+        &self,
+        document_id: Uuid,
+        node_type: &str,
+        name: &str,
+        content_preview: &str,
+        start_byte: i64,
+        end_byte: i64,
+    ) -> Result<Uuid, WorkspaceError> {
+        let client = self.store.pool().get().await.map_err(|e| WorkspaceError::SearchFailed {
+            reason: format!("Pool error: {}", e),
+        })?;
+        let id = Uuid::new_v4();
+        client
+            .execute(
+                r#"INSERT INTO memory_ast_nodes
+                   (id, document_id, node_type, name, content_preview, start_byte, end_byte)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)
+                   ON CONFLICT (document_id, name) DO UPDATE
+                   SET node_type = EXCLUDED.node_type,
+                       content_preview = EXCLUDED.content_preview,
+                       start_byte = EXCLUDED.start_byte,
+                       end_byte = EXCLUDED.end_byte"#,
+                &[&id, &document_id, &node_type, &name, &content_preview, &(start_byte as i32), &(end_byte as i32)],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Insert AST node failed: {}", e),
+            })?;
+        Ok(id)
+    }
+
+    async fn insert_ast_edge(
+        &self,
+        source_node_id: Uuid,
+        target_node_id: Uuid,
+        edge_type: &str,
+    ) -> Result<Uuid, WorkspaceError> {
+        let client = self.store.pool().get().await.map_err(|e| WorkspaceError::SearchFailed {
+            reason: format!("Pool error: {}", e),
+        })?;
+        let id = Uuid::new_v4();
+        client
+            .execute(
+                r#"INSERT INTO memory_ast_edges (id, source_node_id, target_node_id, edge_type)
+                   VALUES ($1, $2, $3, $4)"#,
+                &[&id, &source_node_id, &target_node_id, &edge_type],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Insert AST edge failed: {}", e),
+            })?;
+        Ok(id)
+    }
+
+    async fn get_ast_nodes(&self, document_id: Uuid) -> Result<Vec<StoredAstNode>, WorkspaceError> {
+        let client = self.store.pool().get().await.map_err(|e| WorkspaceError::SearchFailed {
+            reason: format!("Pool error: {}", e),
+        })?;
+        let rows = client
+            .query(
+                r#"SELECT id, document_id, node_type, name, content_preview, start_byte, end_byte
+                   FROM memory_ast_nodes WHERE document_id = $1"#,
+                &[&document_id],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Query AST nodes failed: {}", e),
+            })?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let start: i32 = row.get("start_byte");
+                let end: i32 = row.get("end_byte");
+                StoredAstNode {
+                    id: row.get("id"),
+                    document_id: row.get("document_id"),
+                    node_type: row.get("node_type"),
+                    name: row.get("name"),
+                    content_preview: row.get("content_preview"),
+                    start_byte: start as i64,
+                    end_byte: end as i64,
+                }
+            })
+            .collect())
+    }
+
+    async fn get_ast_edges_from(
+        &self,
+        source_node_id: Uuid,
+    ) -> Result<Vec<StoredAstEdge>, WorkspaceError> {
+        let client = self.store.pool().get().await.map_err(|e| WorkspaceError::SearchFailed {
+            reason: format!("Pool error: {}", e),
+        })?;
+        let rows = client
+            .query(
+                "SELECT id, source_node_id, target_node_id, edge_type FROM memory_ast_edges WHERE source_node_id = $1",
+                &[&source_node_id],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Query AST edges failed: {}", e),
+            })?;
+        Ok(rows
+            .iter()
+            .map(|row| StoredAstEdge {
+                id: row.get("id"),
+                source_node_id: row.get("source_node_id"),
+                target_node_id: row.get("target_node_id"),
+                edge_type: row.get("edge_type"),
+            })
+            .collect())
+    }
+
+    async fn find_ast_nodes_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Vec<StoredAstNode>, WorkspaceError> {
+        let client = self.store.pool().get().await.map_err(|e| WorkspaceError::SearchFailed {
+            reason: format!("Pool error: {}", e),
+        })?;
+        let rows = client
+            .query(
+                r#"SELECT id, document_id, node_type, name, content_preview, start_byte, end_byte
+                   FROM memory_ast_nodes WHERE name = $1"#,
+                &[&name],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Query AST nodes by name failed: {}", e),
+            })?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let start: i32 = row.get("start_byte");
+                let end: i32 = row.get("end_byte");
+                StoredAstNode {
+                    id: row.get("id"),
+                    document_id: row.get("document_id"),
+                    node_type: row.get("node_type"),
+                    name: row.get("name"),
+                    content_preview: row.get("content_preview"),
+                    start_byte: start as i64,
+                    end_byte: end as i64,
+                }
+            })
+            .collect())
+    }
+}
+

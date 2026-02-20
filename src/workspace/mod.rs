@@ -43,7 +43,9 @@
 mod chunker;
 mod document;
 mod embeddings;
+pub mod graph_indexer;
 pub mod hygiene;
+pub mod ast;
 #[cfg(feature = "postgres")]
 mod repository;
 mod search;
@@ -275,6 +277,8 @@ pub struct Workspace {
     storage: WorkspaceStorage,
     /// Embedding provider for semantic search.
     embeddings: Option<Arc<dyn EmbeddingProvider>>,
+    /// AST graph indexer for GraphRAG.
+    ast_indexer: Option<graph_indexer::AstGraphIndexer>,
 }
 
 impl Workspace {
@@ -286,6 +290,7 @@ impl Workspace {
             agent_id: None,
             storage: WorkspaceStorage::Repo(Repository::new(pool)),
             embeddings: None,
+            ast_indexer: None,
         }
     }
 
@@ -293,11 +298,13 @@ impl Workspace {
     ///
     /// Use this for libSQL or any other backend that implements the Database trait.
     pub fn new_with_db(user_id: impl Into<String>, db: Arc<dyn crate::db::Database>) -> Self {
+        let ast_indexer = Some(graph_indexer::AstGraphIndexer::new(db.clone()));
         Self {
             user_id: user_id.into(),
             agent_id: None,
             storage: WorkspaceStorage::Db(db),
             embeddings: None,
+            ast_indexer,
         }
     }
 
@@ -637,6 +644,13 @@ impl Workspace {
             self.storage
                 .insert_chunk(document_id, index as i32, &content, embedding.as_deref())
                 .await?;
+        }
+
+        // Index AST graph (if indexer is available and file is a .rs file)
+        if let Some(ref indexer) = self.ast_indexer {
+            if let Err(e) = indexer.index_document(document_id, &doc.content, &doc.path).await {
+                tracing::warn!("AST graph indexing failed for {}: {}", doc.path, e);
+            }
         }
 
         Ok(())

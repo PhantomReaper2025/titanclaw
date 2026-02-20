@@ -135,6 +135,9 @@ bytes = "1"
 base64 = "0.22.1"
 mime_guess = "2.0.5"
 tempfile = "3"
+tree-sitter = "0.26.5"
+tree-sitter-rust = "0.24.0"
+streaming-iterator = "0.1.9"
 
 # macOS keychain
 [target.'cfg(target_os = "macos")'.dependencies]
