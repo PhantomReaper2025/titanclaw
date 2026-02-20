@@ -229,6 +229,12 @@ impl ToolRegistry {
         tracing::info!("Registered 5 development tools");
     }
 
+    /// Register JIT WASM compilation tool
+    pub fn register_jit_tool(&self, runtime: Arc<crate::tools::wasm::WasmToolRuntime>) {
+        self.register_sync(Arc::new(crate::tools::builtin::JitWasmTool::new(runtime)));
+        tracing::info!("Registered JIT WASM tool");
+    }
+
     /// Register memory tools with a workspace.
     ///
     /// Memory tools require a workspace for persistence. Call this after

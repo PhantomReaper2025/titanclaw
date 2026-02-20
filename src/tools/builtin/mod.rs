@@ -4,6 +4,7 @@ mod echo;
 pub mod extension_tools;
 mod file;
 mod http;
+pub mod jit_tool;
 mod job;
 mod json;
 mod memory;
@@ -13,6 +14,7 @@ pub mod skill_tools;
 mod time;
 
 pub use echo::EchoTool;
+pub use jit_tool::JitWasmTool;
 pub use extension_tools::{
     ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
 };

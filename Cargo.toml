@@ -134,6 +134,7 @@ http-body-util = "0.1"
 bytes = "1"
 base64 = "0.22.1"
 mime_guess = "2.0.5"
+tempfile = "3"
 
 # macOS keychain
 [target.'cfg(target_os = "macos")'.dependencies]
