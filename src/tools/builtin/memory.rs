@@ -426,11 +426,25 @@ impl Tool for MemoryGraphTool {
             .ast_graph_query(symbol, limit, depth)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("AST graph query failed: {}", e)))?;
+        let semantic_context = self
+            .workspace
+            .search(symbol, 3)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("Semantic fusion search failed: {}", e)))?;
 
         let output = serde_json::json!({
             "symbol": symbol,
             "matches": matches,
             "match_count": matches.len(),
+            "semantic_context": semantic_context
+                .iter()
+                .map(|r| serde_json::json!({
+                    "path_hint": r.content.lines().next().unwrap_or(""),
+                    "score": r.score,
+                    "document_id": r.document_id.to_string(),
+                    "content": r.content,
+                }))
+                .collect::<Vec<_>>(),
         });
 
         Ok(ToolOutput::success(output, start.elapsed()))

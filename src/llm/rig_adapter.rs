@@ -14,7 +14,7 @@ use rig::message::{
     Message as RigMessage, ToolChoice as RigToolChoice, ToolFunction, ToolResult as RigToolResult,
     ToolResultContent, UserContent,
 };
-use rig::streaming::StreamedAssistantContent;
+use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 use rust_decimal::Decimal;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -35,6 +35,10 @@ pub struct RigAdapter<M: CompletionModel> {
     input_cost: Decimal,
     output_cost: Decimal,
 }
+
+/// Internal prefix used to forward streamed tool-call metadata through the
+/// existing text chunk callback without exposing raw control payloads to users.
+const TOOL_STREAM_EVENT_PREFIX: &str = "\u{001e}IRON_TOOL_EVENT:";
 
 impl<M: CompletionModel> RigAdapter<M> {
     /// Create a new adapter wrapping the given rig-core model.
@@ -595,13 +599,40 @@ where
                 }
                 Ok(StreamedAssistantContent::ToolCall {
                     tool_call,
-                    internal_call_id: _,
+                    internal_call_id,
                 }) => {
+                    let payload = serde_json::json!({
+                        "t": "tool_call",
+                        "id": tool_call.id,
+                        "internal_call_id": internal_call_id,
+                        "name": tool_call.function.name,
+                        "arguments": tool_call.function.arguments,
+                    });
+                    on_chunk(format!("{}{}", TOOL_STREAM_EVENT_PREFIX, payload)).await;
+
                     tool_calls.push(IronToolCall {
                         id: tool_call.id,
                         name: tool_call.function.name,
                         arguments: tool_call.function.arguments,
                     });
+                }
+                Ok(StreamedAssistantContent::ToolCallDelta {
+                    id,
+                    internal_call_id,
+                    content,
+                }) => {
+                    let (delta_type, delta_content) = match content {
+                        ToolCallDeltaContent::Name(name) => ("name", name),
+                        ToolCallDeltaContent::Delta(delta) => ("delta", delta),
+                    };
+                    let payload = serde_json::json!({
+                        "t": "tool_call_delta",
+                        "id": id,
+                        "internal_call_id": internal_call_id,
+                        "delta_type": delta_type,
+                        "content": delta_content,
+                    });
+                    on_chunk(format!("{}{}", TOOL_STREAM_EVENT_PREFIX, payload)).await;
                 }
                 Ok(StreamedAssistantContent::Final(ref resp)) => {
                     if let Some(usage) = resp.token_usage() {

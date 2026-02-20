@@ -3,6 +3,7 @@
 //! Extracted from `agent_loop.rs` to keep the core agentic tool execution
 //! loop (LLM call -> tool calls -> repeat) in its own focused module.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -18,6 +19,67 @@ use crate::tools::ToolStreamCallback;
 
 const TOOL_RESULT_CHUNK_CHARS: usize = 700;
 const TOOL_RESULT_MAX_CHUNKS: usize = 12;
+const TOOL_STREAM_EVENT_PREFIX: &str = "\u{001e}IRON_TOOL_EVENT:";
+const TOOL_DRAFT_PREVIEW_CHARS: usize = 240;
+
+#[derive(Debug, Clone)]
+struct StreamedToolCallState {
+    name: Option<String>,
+    args_buffer: String,
+    last_preview: Option<String>,
+}
+
+impl StreamedToolCallState {
+    fn new() -> Self {
+        Self {
+            name: None,
+            args_buffer: String::new(),
+            last_preview: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "t")]
+enum ToolStreamEvent {
+    #[serde(rename = "tool_call")]
+    ToolCall {
+        id: String,
+        internal_call_id: String,
+        name: String,
+        arguments: serde_json::Value,
+    },
+    #[serde(rename = "tool_call_delta")]
+    ToolCallDelta {
+        id: String,
+        internal_call_id: String,
+        delta_type: String,
+        content: String,
+    },
+}
+
+fn parse_tool_stream_event(chunk: &str) -> Option<ToolStreamEvent> {
+    let payload = chunk.strip_prefix(TOOL_STREAM_EVENT_PREFIX)?;
+    serde_json::from_str(payload).ok()
+}
+
+fn truncate_preview_chars(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        s.to_string()
+    } else {
+        let truncated = s.chars().take(max_chars).collect::<String>();
+        format!("{}…", truncated)
+    }
+}
+
+fn shell_preview_from_args(args_value: &serde_json::Value) -> Option<String> {
+    let command = args_value.get("command")?.as_str()?.trim();
+    if command.is_empty() {
+        return None;
+    }
+    Some(truncate_preview_chars(command, TOOL_DRAFT_PREVIEW_CHARS))
+}
 
 fn chunk_tool_result_preview(output: &str) -> Vec<String> {
     if output.is_empty() {
@@ -231,6 +293,9 @@ impl Agent {
             let channels = self.channels.clone();
             let channel_name = message.channel.clone();
             let metadata = message.metadata.clone();
+            let streamed_tool_calls: Arc<Mutex<HashMap<String, StreamedToolCallState>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+            let streamed_tool_calls_for_cb = Arc::clone(&streamed_tool_calls);
 
             let on_chunk = |chunk: String| -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = ()> + Send + 'static>,
@@ -238,7 +303,107 @@ impl Agent {
                 let channels = channels.clone();
                 let channel_name = channel_name.clone();
                 let metadata = metadata.clone();
+                let streamed_tool_calls = Arc::clone(&streamed_tool_calls_for_cb);
                 Box::pin(async move {
+                    if let Some(event) = parse_tool_stream_event(&chunk) {
+                        match event {
+                            ToolStreamEvent::ToolCall {
+                                id: _id,
+                                internal_call_id,
+                                name,
+                                arguments,
+                            } => {
+                                let preview = if name == "shell" {
+                                    shell_preview_from_args(&arguments)
+                                } else {
+                                    None
+                                };
+
+                                {
+                                    let mut guard = streamed_tool_calls.lock().await;
+                                    let entry = guard
+                                        .entry(internal_call_id)
+                                        .or_insert_with(StreamedToolCallState::new);
+                                    entry.name = Some(name.clone());
+                                    entry.args_buffer = arguments.to_string();
+                                    if let Some(ref p) = preview {
+                                        entry.last_preview = Some(p.clone());
+                                    }
+                                }
+
+                                if let Some(preview) = preview {
+                                    let _ = channels
+                                        .send_status(
+                                            &channel_name,
+                                            StatusUpdate::ToolResult {
+                                                name,
+                                                preview: format!("[draft] {}", preview),
+                                            },
+                                            &metadata,
+                                        )
+                                        .await;
+                                }
+                            }
+                            ToolStreamEvent::ToolCallDelta {
+                                id: _id,
+                                internal_call_id,
+                                delta_type,
+                                content,
+                            } => {
+                                let mut maybe_preview = None;
+                                let mut tool_name_for_preview = None;
+
+                                {
+                                    let mut guard = streamed_tool_calls.lock().await;
+                                    let entry = guard
+                                        .entry(internal_call_id)
+                                        .or_insert_with(StreamedToolCallState::new);
+
+                                    if delta_type == "name" {
+                                        entry.name = Some(content);
+                                    } else {
+                                        entry.args_buffer.push_str(&content);
+                                    }
+
+                                    if entry.name.as_deref() == Some("shell")
+                                        && let Ok(args_value) =
+                                            serde_json::from_str::<serde_json::Value>(
+                                                &entry.args_buffer,
+                                            )
+                                        && let Some(preview) = shell_preview_from_args(&args_value)
+                                    {
+                                        let should_emit = entry
+                                            .last_preview
+                                            .as_ref()
+                                            .map(|last| last != &preview)
+                                            .unwrap_or(true);
+                                        if should_emit {
+                                            entry.last_preview = Some(preview.clone());
+                                            maybe_preview = Some(preview);
+                                            tool_name_for_preview = Some("shell".to_string());
+                                        }
+                                    }
+                                }
+
+                                if let (Some(preview), Some(tool_name)) =
+                                    (maybe_preview, tool_name_for_preview)
+                                {
+                                    let _ = channels
+                                        .send_status(
+                                            &channel_name,
+                                            StatusUpdate::ToolResult {
+                                                name: tool_name,
+                                                preview: format!("[draft] {}", preview),
+                                            },
+                                            &metadata,
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                        return;
+                    }
+
                     let _ = channels
                         .send_status(&channel_name, StatusUpdate::StreamChunk(chunk), &metadata)
                         .await;
@@ -709,7 +874,11 @@ pub(super) fn detect_auth_awaiting(
 mod tests {
     use crate::error::Error;
 
-    use super::{TOOL_RESULT_CHUNK_CHARS, chunk_tool_result_preview, detect_auth_awaiting};
+    use super::{
+        TOOL_RESULT_CHUNK_CHARS, TOOL_STREAM_EVENT_PREFIX, ToolStreamEvent,
+        chunk_tool_result_preview, detect_auth_awaiting, parse_tool_stream_event,
+        shell_preview_from_args,
+    };
 
     #[test]
     fn test_chunk_tool_result_preview_empty() {
@@ -729,6 +898,33 @@ mod tests {
         let result = chunk_tool_result_preview(&input);
         assert!(result.len() >= 2);
         assert!(result[0].starts_with("[1/"));
+    }
+
+    #[test]
+    fn test_parse_tool_stream_event_delta() {
+        let chunk = format!(
+            "{}{}",
+            TOOL_STREAM_EVENT_PREFIX,
+            r#"{"t":"tool_call_delta","id":"c1","internal_call_id":"i1","delta_type":"delta","content":"{\"command\":\"echo hi\"}"}"#
+        );
+        match parse_tool_stream_event(&chunk) {
+            Some(ToolStreamEvent::ToolCallDelta {
+                internal_call_id,
+                delta_type,
+                ..
+            }) => {
+                assert_eq!(internal_call_id, "i1");
+                assert_eq!(delta_type, "delta");
+            }
+            other => panic!("unexpected parse result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_shell_preview_from_args() {
+        let args = serde_json::json!({"command":"echo hello world"});
+        let preview = shell_preview_from_args(&args).expect("preview");
+        assert!(preview.contains("echo hello world"));
     }
 
     #[test]

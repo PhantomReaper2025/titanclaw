@@ -722,9 +722,18 @@ impl Workspace {
                 "outgoing_calls": outgoing_calls,
                 "outgoing_edge_count": edges.len(),
                 "related_symbols": related_symbols,
+                "graph_score": (edges.len() as f64) + (related_symbols.len() as f64 * 0.5),
                 "traversal_depth": depth.min(3),
             }));
         }
+
+        results.sort_by(|a, b| {
+            let a_score = a.get("graph_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let b_score = b.get("graph_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            b_score
+                .partial_cmp(&a_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         Ok(results)
     }
