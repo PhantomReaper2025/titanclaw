@@ -10,6 +10,7 @@
 //! 7. Heartbeat (background tasks)
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[cfg(feature = "postgres")]
@@ -19,7 +20,7 @@ use secrecy::{ExposeSecret, SecretString};
 use tokio_postgres::NoTls;
 
 use crate::channels::wasm::{
-    ChannelCapabilitiesFile, available_channel_names, install_bundled_channel,
+    ChannelCapabilitiesFile, bundled_channel_names, install_bundled_channel,
 };
 use crate::llm::{SessionConfig, SessionManager};
 use crate::secrets::{SecretsCrypto, SecretsStore};
@@ -580,7 +581,19 @@ impl SetupWizard {
                 println!();
                 println!("  export SECRETS_MASTER_KEY={}", key_hex);
                 println!();
-                print_info("Add this to your shell profile or .env file.");
+                if let Err(e) = crate::bootstrap::save_bootstrap_env(&[(
+                    "SECRETS_MASTER_KEY",
+                    key_hex.as_str(),
+                )]) {
+                    print_info(&format!(
+                        "Could not auto-save SECRETS_MASTER_KEY to ~/.ironclaw/.env: {}",
+                        e
+                    ));
+                    print_info("Add this to your shell profile or .env file.");
+                } else {
+                    print_success("Saved SECRETS_MASTER_KEY to ~/.ironclaw/.env");
+                    print_info("Tip: restart shell if you rely on exported environment vars.");
+                }
 
                 self.settings.secrets_master_key_source = KeySource::Env;
                 print_success("Configured for environment variable");
@@ -601,11 +614,19 @@ impl SetupWizard {
     async fn step_inference_provider(&mut self) -> Result<(), SetupError> {
         // Show current provider if already configured
         if let Some(ref current) = self.settings.llm_backend {
+            let is_openrouter = current == "openai_compatible"
+                && self
+                    .settings
+                    .openai_compatible_base_url
+                    .as_deref()
+                    .map(is_openrouter_base_url)
+                    .unwrap_or(false);
             let display = match current.as_str() {
                 "nearai" => "NEAR AI",
                 "anthropic" => "Anthropic (Claude)",
                 "openai" => "OpenAI",
                 "ollama" => "Ollama (local)",
+                "openai_compatible" if is_openrouter => "OpenRouter",
                 "openai_compatible" => "OpenAI-compatible endpoint",
                 other => other,
             };
@@ -624,6 +645,7 @@ impl SetupWizard {
                     "anthropic" => return self.setup_anthropic().await,
                     "openai" => return self.setup_openai().await,
                     "ollama" => return self.setup_ollama(),
+                    "openai_compatible" if is_openrouter => return self.setup_openrouter().await,
                     "openai_compatible" => return self.setup_openai_compatible().await,
                     _ => {
                         return Err(SetupError::Config(format!(
@@ -650,6 +672,7 @@ impl SetupWizard {
             "Anthropic        - Claude models (direct API key)",
             "OpenAI           - GPT models (direct API key)",
             "Ollama           - local models, no API key needed",
+            "OpenRouter       - OpenRouter hosted models (API key + model only)",
             "OpenAI-compatible - custom endpoint (vLLM, LiteLLM, Together, etc.)",
         ];
 
@@ -660,7 +683,8 @@ impl SetupWizard {
             1 => self.setup_anthropic().await?,
             2 => self.setup_openai().await?,
             3 => self.setup_ollama()?,
-            4 => self.setup_openai_compatible().await?,
+            4 => self.setup_openrouter().await?,
+            5 => self.setup_openai_compatible().await?,
             _ => return Err(SetupError::Config("Invalid provider selection".to_string())),
         }
 
@@ -850,7 +874,15 @@ impl SetupWizard {
             ));
         }
 
-        self.settings.openai_compatible_base_url = Some(url.clone());
+        let normalized = normalize_openai_compatible_base_url(&url);
+        if normalized != url {
+            print_info(&format!(
+                "Normalized endpoint to OpenAI-compatible base URL: {}",
+                normalized
+            ));
+        }
+
+        self.settings.openai_compatible_base_url = Some(normalized.clone());
 
         // Optional API key
         if confirm("Does this endpoint require an API key?", false).map_err(SetupError::Io)? {
@@ -871,7 +903,40 @@ impl SetupWizard {
             }
         }
 
-        print_success(&format!("OpenAI-compatible configured ({})", url));
+        print_success(&format!("OpenAI-compatible configured ({})", normalized));
+        Ok(())
+    }
+
+    /// OpenRouter convenience setup: fixed endpoint + API key prompt.
+    async fn setup_openrouter(&mut self) -> Result<(), SetupError> {
+        self.settings.llm_backend = Some("openai_compatible".to_string());
+        self.settings.openai_compatible_base_url = Some("https://openrouter.ai/api/v1".to_string());
+        if self.settings.selected_model.is_some() {
+            self.settings.selected_model = None;
+        }
+
+        print_info("OpenRouter endpoint configured automatically: https://openrouter.ai/api/v1");
+        println!();
+        print_info("Get your API key from: https://openrouter.ai/keys");
+        println!();
+
+        let key = secret_input("OpenRouter API key").map_err(SetupError::Io)?;
+        let key_str = key.expose_secret();
+        if key_str.is_empty() {
+            return Err(SetupError::Config("API key cannot be empty".to_string()));
+        }
+
+        if let Ok(ctx) = self.init_secrets_context().await {
+            ctx.save_secret("llm_compatible_api_key", &key)
+                .await
+                .map_err(|e| SetupError::Config(format!("Failed to save API key: {}", e)))?;
+            print_success("API key encrypted and saved");
+        } else {
+            print_info("Secrets not available. Set LLM_API_KEY in your environment.");
+        }
+
+        self.llm_api_key = Some(SecretString::from(key_str.to_string()));
+        print_success("OpenRouter configured");
         Ok(())
     }
 
@@ -928,8 +993,18 @@ impl SetupWizard {
             }
             "openai_compatible" => {
                 // No standard API for listing models on arbitrary endpoints
-                let model_id = input("Model name (e.g., meta-llama/Llama-3-8b-chat-hf)")
-                    .map_err(SetupError::Io)?;
+                let prompt = if self
+                    .settings
+                    .openai_compatible_base_url
+                    .as_deref()
+                    .map(is_openrouter_base_url)
+                    .unwrap_or(false)
+                {
+                    "Model name (e.g., stepfun/step-3.5-flash:free)"
+                } else {
+                    "Model name (e.g., meta-llama/Llama-3-8b-chat-hf)"
+                };
+                let model_id = input(prompt).map_err(SetupError::Io)?;
                 if model_id.is_empty() {
                     return Err(SetupError::Config("Model name is required".to_string()));
                 }
@@ -1280,6 +1355,11 @@ impl SetupWizard {
             .map(|(name, _)| name.clone())
             .collect();
         let wasm_channel_names = wasm_channel_option_names(&discovered_channels);
+        if !wasm_channel_names.is_empty() {
+            print_info(
+                "WASM channels can be auto-built and installed when selected (if sources are available).",
+            );
+        }
 
         // Build options list dynamically
         let mut options: Vec<(String, bool)> = vec![
@@ -1592,11 +1672,19 @@ impl SetupWizard {
         }
 
         if let Some(ref provider) = self.settings.llm_backend {
+            let is_openrouter = provider == "openai_compatible"
+                && self
+                    .settings
+                    .openai_compatible_base_url
+                    .as_deref()
+                    .map(is_openrouter_base_url)
+                    .unwrap_or(false);
             let display = match provider.as_str() {
                 "nearai" => "NEAR AI",
                 "anthropic" => "Anthropic",
                 "openai" => "OpenAI",
                 "ollama" => "Ollama",
+                "openai_compatible" if is_openrouter => "OpenRouter",
                 "openai_compatible" => "OpenAI-compatible",
                 other => other,
             };
@@ -2047,7 +2135,10 @@ async fn install_missing_bundled_channels(
 ) -> Result<Vec<String>, SetupError> {
     let mut installed = Vec::new();
 
-    for name in available_channel_names().iter().copied() {
+    for name in crate::channels::wasm::available_channel_names()
+        .iter()
+        .copied()
+    {
         if already_installed.contains(name) {
             continue;
         }
@@ -2064,7 +2155,7 @@ async fn install_missing_bundled_channels(
 fn wasm_channel_option_names(discovered: &[(String, ChannelCapabilitiesFile)]) -> Vec<String> {
     let mut names: Vec<String> = discovered.iter().map(|(name, _)| name.clone()).collect();
 
-    for bundled in available_channel_names().iter().copied() {
+    for bundled in bundled_channel_names().iter().copied() {
         if !names.iter().any(|name| name == bundled) {
             names.push(bundled.to_string());
         }
@@ -2073,12 +2164,45 @@ fn wasm_channel_option_names(discovered: &[(String, ChannelCapabilitiesFile)]) -
     names
 }
 
+fn channel_build_script(name: &str) -> Option<PathBuf> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("channels-src").join(name).join("build.sh");
+    if script.exists() { Some(script) } else { None }
+}
+
+async fn try_build_channel_artifacts(name: &str) -> Result<bool, SetupError> {
+    let Some(script) = channel_build_script(name) else {
+        return Ok(false);
+    };
+
+    print_info(&format!(
+        "Building '{}' channel artifacts automatically...",
+        name
+    ));
+    let status = tokio::process::Command::new("bash")
+        .arg(script.as_os_str())
+        .status()
+        .await
+        .map_err(|e| SetupError::Channel(format!("Failed to run {}: {}", script.display(), e)))?;
+
+    if status.success() {
+        print_success(&format!("Built '{}' channel artifacts", name));
+        Ok(true)
+    } else {
+        Err(SetupError::Channel(format!(
+            "Failed to build '{}' channel artifacts (exit status: {}). \
+Install prerequisites (`rustup target add wasm32-wasip2`, `cargo install wasm-tools`) and retry.",
+            name, status
+        )))
+    }
+}
+
 async fn install_selected_bundled_channels(
     channels_dir: &std::path::Path,
     selected_channels: &[String],
     already_installed: &HashSet<String>,
 ) -> Result<Option<Vec<String>>, SetupError> {
-    let bundled: HashSet<&str> = available_channel_names().iter().copied().collect();
+    let bundled: HashSet<&str> = bundled_channel_names().iter().copied().collect();
     let selected_missing: HashSet<String> = selected_channels
         .iter()
         .filter(|name| bundled.contains(name.as_str()) && !already_installed.contains(*name))
@@ -2091,14 +2215,41 @@ async fn install_selected_bundled_channels(
 
     let mut installed = Vec::new();
     for name in selected_missing {
-        install_bundled_channel(&name, channels_dir, false)
-            .await
-            .map_err(SetupError::Channel)?;
+        let install_res = install_bundled_channel(&name, channels_dir, false).await;
+        if install_res.is_err() {
+            let built = try_build_channel_artifacts(&name).await?;
+            if built {
+                install_bundled_channel(&name, channels_dir, false)
+                    .await
+                    .map_err(SetupError::Channel)?;
+            } else {
+                return Err(SetupError::Channel(format!(
+                    "Channel '{}' is selected but artifacts are missing. \
+Run ./channels-src/{}/build.sh, then retry onboarding.",
+                    name, name
+                )));
+            }
+        }
         installed.push(name);
     }
 
     installed.sort();
     Ok(Some(installed))
+}
+
+fn normalize_openai_compatible_base_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    let normalized = trimmed
+        .strip_suffix("/chat/completions")
+        .or_else(|| trimmed.strip_suffix("/completions"))
+        .unwrap_or(trimmed);
+    normalized.to_string()
+}
+
+fn is_openrouter_base_url(url: &str) -> bool {
+    normalize_openai_compatible_base_url(url)
+        .to_lowercase()
+        .contains("openrouter.ai/api/v1")
 }
 
 #[cfg(test)]
@@ -2166,7 +2317,7 @@ mod tests {
     async fn test_install_missing_bundled_channels_installs_telegram() {
         // WASM artifacts only exist in dev builds (not CI). Skip gracefully
         // rather than fail when the telegram channel hasn't been compiled.
-        if !available_channel_names().contains(&"telegram") {
+        if !crate::channels::wasm::available_channel_names().contains(&"telegram") {
             eprintln!("skipping: telegram WASM artifacts not built");
             return;
         }
@@ -2186,7 +2337,7 @@ mod tests {
     fn test_wasm_channel_option_names_includes_available_when_missing() {
         let discovered = Vec::new();
         let options = wasm_channel_option_names(&discovered);
-        let available = available_channel_names();
+        let available = crate::channels::wasm::available_channel_names();
         // All available (built) channels should appear
         for name in &available {
             assert!(
@@ -2195,6 +2346,40 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn test_wasm_channel_option_names_includes_known_bundled_names() {
+        let discovered = Vec::new();
+        let options = wasm_channel_option_names(&discovered);
+        assert!(options.contains(&"telegram".to_string()));
+        assert!(options.contains(&"slack".to_string()));
+        assert!(options.contains(&"whatsapp".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_openai_compatible_base_url() {
+        assert_eq!(
+            normalize_openai_compatible_base_url("https://openrouter.ai/api/v1/chat/completions"),
+            "https://openrouter.ai/api/v1"
+        );
+        assert_eq!(
+            normalize_openai_compatible_base_url("https://openrouter.ai/api/v1/"),
+            "https://openrouter.ai/api/v1"
+        );
+        assert_eq!(
+            normalize_openai_compatible_base_url(" http://localhost:8000/v1/completions "),
+            "http://localhost:8000/v1"
+        );
+    }
+
+    #[test]
+    fn test_is_openrouter_base_url() {
+        assert!(is_openrouter_base_url("https://openrouter.ai/api/v1"));
+        assert!(is_openrouter_base_url(
+            "https://openrouter.ai/api/v1/chat/completions"
+        ));
+        assert!(!is_openrouter_base_url("https://api.openai.com/v1"));
     }
 
     #[test]
