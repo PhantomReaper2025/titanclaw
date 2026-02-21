@@ -11,7 +11,7 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 > [!CAUTION]
 > This represents a paradigm shift from a linear conversational agent to a distributed orchestration mesh. Please confirm if this extreme scale of ambition aligns with your vision. 
 
-## Implementation Status (2026-02-20)
+## Implementation Status (2026-02-21)
 
 | Track | Status | Notes |
 |---|---|---|
@@ -20,6 +20,7 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 | Tool/block-level streaming | ✅ | Tool start/completion/result events are live; shell tool streams incremental stdout/stderr, streamed tool-call deltas surface live shell command drafts (`[draft]`), piped early execution is default-on (toggle with `ENABLE_PIPED_TOOL_EXECUTION=false`), and approval-required commands emit explicit waiting status before execution. |
 | Reflex compiler | ✅ | Background reflex compiler now persists normalized recurring patterns to a reflex registry and routes matching prompts directly to compiled tools before LLM fallback. |
 | GraphRAG + AST indexing | ✅ | `memory_graph` now supports bounded multi-hop traversal, graph scoring, stable ranking, and semantic context fusion in responses. |
+| Docker worker image provisioning hardening | ✅ | Orchestrator `job_manager` now preflights worker image availability and auto-pulls when missing (respects `sandbox.auto_pull_image`), eliminating first-run `No such image` container creation failures. |
 
 ## Execution TODO (Live)
 
@@ -31,6 +32,7 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 - [x] Multi-hop GraphRAG retrieval quality hardening
 - [x] Token-to-tool piped execution completion (default-on with explicit approval-aware piped status)
 - [x] Swarm workload distribution from scheduler into mesh peers (scheduler tool subtasks offload to swarm with fast local fallback)
+- [x] Docker job runner preflight image check + auto-pull fallback for first-run reliability
 
 ## Proposed Changes
 

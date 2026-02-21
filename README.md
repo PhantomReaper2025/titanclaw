@@ -38,6 +38,7 @@ Based on `implementation_plan.md`, this is where the upgrade stands today.
 | Phase 0: reflex fast-path bypass | ✅ | Deterministic NL routing + persistent reflex pattern registry now route recurring prompts directly to compiled tools with LLM fallback |
 | Phase 1: deep context indexing | ✅ | Tree-sitter AST indexing is live and queryable with `memory_graph` (bounded multi-hop traversal, graph scoring, stable ranking, semantic context fusion) |
 | Phase 2: distributed swarm mesh | ✅ | Mesh node lifecycle is live, incoming swarm tasks execute via local tool/safety stack, scheduler tool subtasks offload to capability-matching peers, remote waiters are bounded/cleaned up, and local fallback is deterministic |
+| Runtime reliability hardening | ✅ | Docker job containers now preflight the configured image and auto-pull on first use when `sandbox.auto_pull_image=true`, preventing first-run `No such image` failures |
 
 ## Capabilities
 
@@ -50,6 +51,7 @@ Based on `implementation_plan.md`, this is where the upgrade stands today.
 - Web gateway with WebSocket + SSE for real-time interaction
 - Routines/automation engine for scheduled and event-driven tasks
 - Docker-isolated workers for higher-risk or heavier executions
+- First-run Docker image preflight + auto-pull for container jobs
 - OpenAI-compatible API endpoints for external integration
 - LLM-bypassed fast-path for common job ops in natural language
 - Persistent reflex pattern routing from recurring prompts to compiled tools

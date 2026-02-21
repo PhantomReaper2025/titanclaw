@@ -965,6 +965,7 @@ async fn main() -> anyhow::Result<()> {
             memory_limit_mb: config.sandbox.memory_limit_mb,
             cpu_shares: config.sandbox.cpu_shares,
             orchestrator_port: 50051,
+            auto_pull_image: config.sandbox.auto_pull_image,
             claude_code_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
             claude_code_oauth_token: ironclaw::config::ClaudeCodeConfig::extract_oauth_token(),
             claude_code_model: config.claude_code.model.clone(),

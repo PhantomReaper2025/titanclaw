@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use bollard::image::CreateImageOptions;
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -50,6 +52,8 @@ pub struct ContainerJobConfig {
     pub cpu_shares: u32,
     /// Port the orchestrator internal API listens on.
     pub orchestrator_port: u16,
+    /// Whether to auto-pull image if not found locally.
+    pub auto_pull_image: bool,
     /// Anthropic API key for Claude Code containers (read from ANTHROPIC_API_KEY).
     /// Takes priority over OAuth token.
     pub claude_code_api_key: Option<String>,
@@ -74,6 +78,7 @@ impl Default for ContainerJobConfig {
             memory_limit_mb: 2048,
             cpu_shares: 1024,
             orchestrator_port: 50051,
+            auto_pull_image: true,
             claude_code_api_key: None,
             claude_code_oauth_token: None,
             claude_code_model: "sonnet".to_string(),
@@ -238,6 +243,48 @@ impl ContainerJobManager {
         Ok(docker)
     }
 
+    async fn ensure_image_ready(
+        &self,
+        docker: &bollard::Docker,
+        job_id: Uuid,
+    ) -> Result<(), OrchestratorError> {
+        if docker.inspect_image(&self.config.image).await.is_ok() {
+            return Ok(());
+        }
+
+        if !self.config.auto_pull_image {
+            return Err(OrchestratorError::ContainerCreationFailed {
+                job_id,
+                reason: format!(
+                    "docker image {} not found and sandbox.auto_pull_image is disabled",
+                    self.config.image
+                ),
+            });
+        }
+
+        tracing::info!("Docker image not found locally, pulling {}", self.config.image);
+
+        let mut stream = docker.create_image(
+            Some(CreateImageOptions {
+                from_image: self.config.image.clone(),
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
+
+        while let Some(result) = stream.next().await {
+            if let Err(e) = result {
+                return Err(OrchestratorError::ContainerCreationFailed {
+                    job_id,
+                    reason: format!("failed to pull docker image {}: {}", self.config.image, e),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     /// Create and start a new container for a job.
     ///
     /// The caller provides the `job_id` so it can be persisted to the database
@@ -300,6 +347,7 @@ impl ContainerJobManager {
     ) -> Result<(), OrchestratorError> {
         // Connect to Docker (reuses cached connection)
         let docker = self.docker().await?;
+        self.ensure_image_ready(&docker, job_id).await?;
 
         // Build container configuration
         let orchestrator_host = if cfg!(target_os = "linux") {
