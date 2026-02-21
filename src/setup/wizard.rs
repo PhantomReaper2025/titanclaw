@@ -1546,7 +1546,11 @@ impl SetupWizard {
     }
 
     async fn preflight_sandbox_image(&mut self) -> Result<(), SetupError> {
-        let image = self.settings.sandbox.image.clone();
+        let image = std::env::var("SANDBOX_IMAGE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| self.settings.sandbox.image.clone());
+        self.settings.sandbox.image = image.clone();
         if image.trim().is_empty() {
             return Ok(());
         }
