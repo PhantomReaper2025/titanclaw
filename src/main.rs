@@ -305,6 +305,12 @@ async fn main() -> anyhow::Result<()> {
         println!();
         let mut wizard = SetupWizard::new();
         wizard.run().await?;
+
+        // The wizard may write bootstrap vars (e.g. LLM_API_KEY, LLM_BACKEND,
+        // LLM_BASE_URL, SECRETS_MASTER_KEY) to ~/.ironclaw/.env. Reload env
+        // sources so this same process sees them before Config::from_env_*.
+        let _ = dotenvy::dotenv();
+        ironclaw::bootstrap::load_ironclaw_env();
     }
 
     // Load initial config from env + disk + optional TOML (before DB is available)

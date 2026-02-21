@@ -202,8 +202,13 @@ fn create_openai_compatible_provider(config: &LlmConfig) -> Result<Arc<dyn LlmPr
     let api_key = compat
         .api_key
         .as_ref()
-        .map(|k| k.expose_secret().to_string())
-        .unwrap_or_else(|| "no-key".to_string());
+        .map(|k| k.expose_secret().to_string());
+    if is_openrouter_base_url(&compat.base_url) && api_key.is_none() {
+        return Err(LlmError::AuthFailed {
+            provider: "openai_compatible".to_string(),
+        });
+    }
+    let api_key = api_key.unwrap_or_else(|| "no-key".to_string());
 
     let client: openai::Client = openai::Client::builder()
         .base_url(&compat.base_url)
@@ -223,6 +228,21 @@ fn create_openai_compatible_provider(config: &LlmConfig) -> Result<Arc<dyn LlmPr
         compat.model
     );
     Ok(Arc::new(RigAdapter::new(model, &compat.model)))
+}
+
+fn normalize_openai_compatible_base_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    trimmed
+        .strip_suffix("/chat/completions")
+        .or_else(|| trimmed.strip_suffix("/completions"))
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn is_openrouter_base_url(url: &str) -> bool {
+    normalize_openai_compatible_base_url(url)
+        .to_lowercase()
+        .contains("openrouter.ai/api/v1")
 }
 
 /// Create a cheap/fast LLM provider for lightweight tasks (heartbeat, routing, evaluation).

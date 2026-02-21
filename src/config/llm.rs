@@ -312,6 +312,12 @@ impl LlmConfig {
                     hint: "Set LLM_BASE_URL when LLM_BACKEND=openai_compatible".to_string(),
                 })?;
             let api_key = optional_env("LLM_API_KEY")?.map(SecretString::from);
+            if is_openrouter_base_url(&base_url) && api_key.is_none() {
+                return Err(ConfigError::MissingRequired {
+                    key: "LLM_API_KEY".to_string(),
+                    hint: "Set LLM_API_KEY when using OpenRouter (LLM_BASE_URL=https://openrouter.ai/api/v1)".to_string(),
+                });
+            }
             let model = optional_env("LLM_MODEL")?
                 .or_else(|| settings.selected_model.clone())
                 .unwrap_or_else(|| "default".to_string());
@@ -349,6 +355,21 @@ impl LlmConfig {
     }
 }
 
+fn normalize_openai_compatible_base_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    trimmed
+        .strip_suffix("/chat/completions")
+        .or_else(|| trimmed.strip_suffix("/completions"))
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn is_openrouter_base_url(url: &str) -> bool {
+    normalize_openai_compatible_base_url(url)
+        .to_lowercase()
+        .contains("openrouter.ai/api/v1")
+}
+
 /// Get the default session file path (~/.ironclaw/session.json).
 fn default_session_path() -> PathBuf {
     dirs::home_dir()
@@ -373,6 +394,7 @@ mod tests {
             std::env::remove_var("LLM_BACKEND");
             std::env::remove_var("LLM_BASE_URL");
             std::env::remove_var("LLM_MODEL");
+            std::env::remove_var("LLM_API_KEY");
         }
     }
 
@@ -380,6 +402,10 @@ mod tests {
     fn openai_compatible_uses_selected_model_when_llm_model_unset() {
         let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
         clear_openai_compatible_env();
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("LLM_API_KEY", "test-key");
+        }
 
         let settings = Settings {
             llm_backend: Some("openai_compatible".to_string()),
@@ -394,6 +420,10 @@ mod tests {
             .expect("openai-compatible config should be present");
 
         assert_eq!(compat.model, "openai/gpt-5.1-codex");
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("LLM_API_KEY");
+        }
     }
 
     #[test]
@@ -403,6 +433,7 @@ mod tests {
         // SAFETY: Under ENV_MUTEX.
         unsafe {
             std::env::set_var("LLM_MODEL", "openai/gpt-5-codex");
+            std::env::set_var("LLM_API_KEY", "test-key");
         }
 
         let settings = Settings {
@@ -422,6 +453,26 @@ mod tests {
         // SAFETY: Under ENV_MUTEX.
         unsafe {
             std::env::remove_var("LLM_MODEL");
+            std::env::remove_var("LLM_API_KEY");
+        }
+    }
+
+    #[test]
+    fn openrouter_requires_api_key() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_openai_compatible_env();
+
+        let settings = Settings {
+            llm_backend: Some("openai_compatible".to_string()),
+            openai_compatible_base_url: Some("https://openrouter.ai/api/v1".to_string()),
+            selected_model: Some("stepfun/step-3.5-flash:free".to_string()),
+            ..Default::default()
+        };
+
+        let err = LlmConfig::resolve(&settings).expect_err("resolve should fail without key");
+        match err {
+            ConfigError::MissingRequired { key, .. } => assert_eq!(key, "LLM_API_KEY"),
+            other => panic!("expected MissingRequired(LLM_API_KEY), got: {other}"),
         }
     }
 }

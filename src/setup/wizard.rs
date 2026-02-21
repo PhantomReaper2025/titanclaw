@@ -809,9 +809,21 @@ impl SetupWizard {
                 .map_err(|e| SetupError::Config(format!("Failed to save API key: {e}")))?;
             print_success("API key encrypted and saved");
         } else {
-            print_info(&format!(
-                "Secrets not available. Set {env_var} in your environment."
-            ));
+            match crate::bootstrap::save_bootstrap_env(&[(env_var, key_str)]) {
+                Ok(()) => {
+                    print_success(&format!("Saved {env_var} to ~/.ironclaw/.env"));
+                    print_info("Secrets not available. Loaded from bootstrap env on startup.");
+                }
+                Err(e) => {
+                    print_info(&format!(
+                        "Could not auto-save {env_var} to ~/.ironclaw/.env: {}",
+                        e
+                    ));
+                    print_info(&format!(
+                        "Secrets not available. Set {env_var} in your environment."
+                    ));
+                }
+            }
         }
 
         // Cache key in memory for model fetching later in the wizard
@@ -1361,6 +1373,17 @@ impl SetupWizard {
 
     /// Step 6: Channel configuration.
     async fn step_channels(&mut self) -> Result<(), SetupError> {
+        if self.settings.sandbox.enabled
+            && let Err(e) = self.preflight_sandbox_image().await
+        {
+            print_error(&format!("Sandbox preflight failed: {}", e));
+            if !confirm("Continue onboarding without sandbox image pre-pull?", false)
+                .map_err(SetupError::Io)?
+            {
+                return Err(e);
+            }
+        }
+
         // First, configure tunnel (shared across all channels that need webhooks)
         match setup_tunnel(&self.settings) {
             Ok(tunnel_settings) => {
@@ -1519,6 +1542,86 @@ impl SetupWizard {
 
         self.settings.channels.wasm_channels = enabled_wasm_channels;
 
+        Ok(())
+    }
+
+    async fn preflight_sandbox_image(&mut self) -> Result<(), SetupError> {
+        let image = self.settings.sandbox.image.clone();
+        if image.trim().is_empty() {
+            return Ok(());
+        }
+
+        if !command_exists("docker").await {
+            return Err(SetupError::Config(
+                "Docker is not installed or not in PATH. Install Docker Desktop (Windows/macOS) or Docker Engine (Linux).".to_string(),
+            ));
+        }
+
+        let inspect = tokio::process::Command::new("docker")
+            .args(["image", "inspect", &image])
+            .status()
+            .await
+            .map_err(|e| SetupError::Config(format!("Failed to run docker inspect: {}", e)))?;
+
+        if inspect.success() {
+            print_success(&format!("Sandbox image ready: {}", image));
+            return Ok(());
+        }
+
+        print_info(&format!(
+            "Sandbox image '{}' not found locally. Pulling now...",
+            image
+        ));
+        let pull = tokio::process::Command::new("docker")
+            .args(["pull", &image])
+            .status()
+            .await
+            .map_err(|e| SetupError::Config(format!("Failed to run docker pull: {}", e)))?;
+
+        if pull.success() {
+            print_success(&format!("Pulled sandbox image: {}", image));
+            return Ok(());
+        }
+
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let dockerfile = repo_root.join("Dockerfile.worker");
+        if !dockerfile.exists() {
+            return Err(SetupError::Config(format!(
+                "Could not pull '{}', and {} is missing for local fallback build.",
+                image,
+                dockerfile.display()
+            )));
+        }
+
+        let fallback_image = "titanclaw-worker:latest";
+        print_info(&format!(
+            "Pull failed. Building local fallback image '{}' from Dockerfile.worker...",
+            fallback_image
+        ));
+        let build = tokio::process::Command::new("docker")
+            .arg("build")
+            .arg("-f")
+            .arg(dockerfile.as_os_str())
+            .arg("-t")
+            .arg(fallback_image)
+            .arg(".")
+            .current_dir(&repo_root)
+            .status()
+            .await
+            .map_err(|e| SetupError::Config(format!("Failed to run docker build: {}", e)))?;
+
+        if !build.success() {
+            return Err(SetupError::Config(format!(
+                "Failed to pull '{}' and failed to build local fallback image '{}'.",
+                image, fallback_image
+            )));
+        }
+
+        self.settings.sandbox.image = fallback_image.to_string();
+        print_success(&format!(
+            "Built local sandbox image and switched to '{}'",
+            fallback_image
+        ));
         Ok(())
     }
 
@@ -2194,35 +2297,158 @@ fn wasm_channel_option_names(discovered: &[(String, ChannelCapabilitiesFile)]) -
 
 fn channel_build_script(name: &str) -> Option<PathBuf> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let script = root.join("channels-src").join(name).join("build.sh");
-    if script.exists() { Some(script) } else { None }
+    let dir = root.join("channels-src").join(name);
+    #[cfg(target_os = "windows")]
+    {
+        let ps1 = dir.join("build.ps1");
+        if ps1.exists() {
+            return Some(ps1);
+        }
+    }
+    let sh = dir.join("build.sh");
+    if sh.exists() {
+        return Some(sh);
+    }
+    None
 }
 
 async fn try_build_channel_artifacts(name: &str) -> Result<bool, SetupError> {
-    let Some(script) = channel_build_script(name) else {
-        return Ok(false);
-    };
+    ensure_wasm_build_prerequisites().await?;
 
     print_info(&format!(
         "Building '{}' channel artifacts automatically...",
         name
     ));
-    let status = tokio::process::Command::new("bash")
-        .arg(script.as_os_str())
+
+    if let Some(script) = channel_build_script(name) {
+        let script_name = script
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let status = if script_name.ends_with(".ps1") {
+            tokio::process::Command::new("powershell")
+                .arg("-NoProfile")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-File")
+                .arg(script.as_os_str())
+                .status()
+                .await
+                .map_err(|e| {
+                    SetupError::Channel(format!("Failed to run {}: {}", script.display(), e))
+                })?
+        } else if command_exists("bash").await {
+            tokio::process::Command::new("bash")
+                .arg(script.as_os_str())
+                .status()
+                .await
+                .map_err(|e| {
+                    SetupError::Channel(format!("Failed to run {}: {}", script.display(), e))
+                })?
+        } else {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let channel_dir = root.join("channels-src").join(name);
+            tokio::process::Command::new("cargo")
+                .args(["build", "--release", "--target", "wasm32-wasip2"])
+                .current_dir(&channel_dir)
+                .status()
+                .await
+                .map_err(|e| {
+                    SetupError::Channel(format!("Failed to run cargo build for '{}': {}", name, e))
+                })?
+        };
+
+        if status.success() {
+            print_success(&format!("Built '{}' channel artifacts", name));
+            return Ok(true);
+        }
+    }
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let channel_dir = root.join("channels-src").join(name);
+    if !channel_dir.exists() {
+        return Ok(false);
+    }
+
+    let status = tokio::process::Command::new("cargo")
+        .args(["build", "--release", "--target", "wasm32-wasip2"])
+        .current_dir(&channel_dir)
         .status()
         .await
-        .map_err(|e| SetupError::Channel(format!("Failed to run {}: {}", script.display(), e)))?;
-
+        .map_err(|e| {
+            SetupError::Channel(format!(
+                "Failed to run cargo build for channel '{}': {}",
+                name, e
+            ))
+        })?;
     if status.success() {
         print_success(&format!("Built '{}' channel artifacts", name));
         Ok(true)
     } else {
         Err(SetupError::Channel(format!(
             "Failed to build '{}' channel artifacts (exit status: {}). \
-Install prerequisites (`rustup target add wasm32-wasip2`, `cargo install wasm-tools`) and retry.",
+Install prerequisites (`rustup target add wasm32-wasip2`) and retry.",
             name, status
         )))
     }
+}
+
+async fn ensure_wasm_build_prerequisites() -> Result<(), SetupError> {
+    if !command_exists("cargo").await {
+        return Err(SetupError::Channel(
+            "Rust toolchain (cargo) is not installed. Install Rust from https://rustup.rs/"
+                .to_string(),
+        ));
+    }
+
+    if !command_exists("rustup").await {
+        return Err(SetupError::Channel(
+            "rustup is required to auto-install wasm32-wasip2 target. Install Rust from https://rustup.rs/".to_string(),
+        ));
+    }
+
+    let installed = tokio::process::Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+        .await
+        .map_err(|e| {
+            SetupError::Channel(format!(
+                "Failed to check installed Rust targets via rustup: {}",
+                e
+            ))
+        })?;
+    let stdout = String::from_utf8_lossy(&installed.stdout);
+    if stdout.lines().any(|line| line.trim() == "wasm32-wasip2") {
+        return Ok(());
+    }
+
+    print_info("Rust target 'wasm32-wasip2' is missing. Installing automatically...");
+    let add = tokio::process::Command::new("rustup")
+        .args(["target", "add", "wasm32-wasip2"])
+        .status()
+        .await
+        .map_err(|e| SetupError::Channel(format!("Failed to run rustup target add: {}", e)))?;
+    if add.success() {
+        print_success("Installed Rust target: wasm32-wasip2");
+        Ok(())
+    } else {
+        Err(SetupError::Channel(
+            "Failed to install Rust target 'wasm32-wasip2'.".to_string(),
+        ))
+    }
+}
+
+async fn command_exists(command: &str) -> bool {
+    tokio::process::Command::new(command)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 async fn install_selected_bundled_channels(
