@@ -898,7 +898,23 @@ impl SetupWizard {
                         })?;
                     print_success("API key encrypted and saved");
                 } else {
-                    print_info("Secrets not available. Set LLM_API_KEY in your environment.");
+                    match crate::bootstrap::save_bootstrap_env(&[("LLM_API_KEY", key_str)]) {
+                        Ok(()) => {
+                            print_success("Saved LLM_API_KEY to ~/.ironclaw/.env");
+                            print_info(
+                                "Secrets not available. Loaded from bootstrap env on startup.",
+                            );
+                        }
+                        Err(e) => {
+                            print_info(&format!(
+                                "Could not auto-save LLM_API_KEY to ~/.ironclaw/.env: {}",
+                                e
+                            ));
+                            print_info(
+                                "Secrets not available. Set LLM_API_KEY in your environment.",
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -932,7 +948,19 @@ impl SetupWizard {
                 .map_err(|e| SetupError::Config(format!("Failed to save API key: {}", e)))?;
             print_success("API key encrypted and saved");
         } else {
-            print_info("Secrets not available. Set LLM_API_KEY in your environment.");
+            match crate::bootstrap::save_bootstrap_env(&[("LLM_API_KEY", key_str)]) {
+                Ok(()) => {
+                    print_success("Saved LLM_API_KEY to ~/.ironclaw/.env");
+                    print_info("Secrets not available. Loaded from bootstrap env on startup.");
+                }
+                Err(e) => {
+                    print_info(&format!(
+                        "Could not auto-save LLM_API_KEY to ~/.ironclaw/.env: {}",
+                        e
+                    ));
+                    print_info("Secrets not available. Set LLM_API_KEY in your environment.");
+                }
+            }
         }
 
         self.llm_api_key = Some(SecretString::from(key_str.to_string()));

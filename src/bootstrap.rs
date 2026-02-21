@@ -96,13 +96,29 @@ pub fn save_bootstrap_env(vars: &[(&str, &str)]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut content = String::new();
+
+    // Merge with existing .env entries so repeated onboarding steps do not
+    // clobber previously saved bootstrap vars (e.g. SECRETS_MASTER_KEY).
+    let mut merged = std::collections::BTreeMap::<String, String>::new();
+    if path.exists() {
+        let existing = dotenvy::from_path_iter(&path).map_err(std::io::Error::other)?;
+        for (k, v) in existing.flatten() {
+            merged.insert(k, v);
+        }
+    }
+
     for (key, value) in vars {
+        merged.insert((*key).to_string(), (*value).to_string());
+    }
+
+    let mut content = String::new();
+    for (key, value) in merged {
         // Escape backslashes and double quotes to prevent env var injection
         // (e.g. a value containing `"\nINJECTED="x` would break out of quotes).
         let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
         content.push_str(&format!("{}=\"{}\"\n", key, escaped));
     }
+
     std::fs::write(&path, content)
 }
 
