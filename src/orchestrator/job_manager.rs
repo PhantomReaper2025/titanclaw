@@ -262,7 +262,10 @@ impl ContainerJobManager {
             });
         }
 
-        tracing::info!("Docker image not found locally, pulling {}", self.config.image);
+        tracing::info!(
+            "Docker image not found locally, pulling {}",
+            self.config.image
+        );
 
         let mut stream = docker.create_image(
             Some(CreateImageOptions {

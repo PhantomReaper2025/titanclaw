@@ -238,7 +238,14 @@ impl Scheduler {
                     let mut used_local_fallback = false;
                     let result = if let (Some(handle), Some(router)) = (swarm_handle, swarm_results)
                     {
-                        match decide_offload(&tools, &handle, &tool_name_for_remote, &params_for_remote).await {
+                        match decide_offload(
+                            &tools,
+                            &handle,
+                            &tool_name_for_remote,
+                            &params_for_remote,
+                        )
+                        .await
+                        {
                             OffloadDecision::LocalOnly => {
                                 metrics.remote_ineligible.fetch_add(1, Ordering::Relaxed);
                                 used_local_fallback = true;
@@ -254,21 +261,26 @@ impl Scheduler {
                             }
                             OffloadDecision::RemotePreferred => {
                                 metrics.remote_attempts.fetch_add(1, Ordering::Relaxed);
-                                match router.register(task_id_for_remote, REMOTE_WAIT_TIMEOUT).await {
+                                match router
+                                    .register(task_id_for_remote, REMOTE_WAIT_TIMEOUT)
+                                    .await
+                                {
                                     Ok(remote_waiter) => {
                                         let mut dispatched = false;
                                         for attempt in 0..=REMOTE_DISTRIBUTE_RETRIES {
                                             let dispatch_res = handle
-                                                .distribute_task(crate::swarm::protocol::SwarmTask {
-                                                    id: task_id_for_remote,
-                                                    job_id: tool_parent_id,
-                                                    tool_name: tool_name_for_remote.clone(),
-                                                    params: params_for_remote.clone(),
-                                                    priority: 5,
-                                                    attempt: attempt as u8,
-                                                    deadline_ms: None,
-                                                    origin_node: None,
-                                                })
+                                                .distribute_task(
+                                                    crate::swarm::protocol::SwarmTask {
+                                                        id: task_id_for_remote,
+                                                        job_id: tool_parent_id,
+                                                        tool_name: tool_name_for_remote.clone(),
+                                                        params: params_for_remote.clone(),
+                                                        priority: 5,
+                                                        attempt: attempt as u8,
+                                                        deadline_ms: None,
+                                                        origin_node: None,
+                                                    },
+                                                )
                                                 .await;
                                             if dispatch_res.is_ok() {
                                                 dispatched = true;
@@ -277,15 +289,28 @@ impl Scheduler {
                                         }
 
                                         if dispatched {
-                                            match tokio::time::timeout(REMOTE_WAIT_TIMEOUT, remote_waiter).await {
+                                            match tokio::time::timeout(
+                                                REMOTE_WAIT_TIMEOUT,
+                                                remote_waiter,
+                                            )
+                                            .await
+                                            {
                                                 Ok(Ok(SwarmRemoteResult {
                                                     success: true,
                                                     output,
                                                     duration_ms,
                                                 })) => {
-                                                    metrics.remote_successes.fetch_add(1, Ordering::Relaxed);
-                                                    let output_json = serde_json::from_str::<serde_json::Value>(&output)
-                                                        .unwrap_or_else(|_| serde_json::json!({ "output": output }));
+                                                    metrics
+                                                        .remote_successes
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                    let output_json = serde_json::from_str::<
+                                                        serde_json::Value,
+                                                    >(
+                                                        &output
+                                                    )
+                                                    .unwrap_or_else(
+                                                        |_| serde_json::json!({ "output": output }),
+                                                    );
                                                     Ok(TaskOutput::new(
                                                         output_json,
                                                         Duration::from_millis(duration_ms),
@@ -296,7 +321,9 @@ impl Scheduler {
                                                     output,
                                                     ..
                                                 })) => {
-                                                    metrics.remote_failures.fetch_add(1, Ordering::Relaxed);
+                                                    metrics
+                                                        .remote_failures
+                                                        .fetch_add(1, Ordering::Relaxed);
                                                     used_local_fallback = true;
                                                     tracing::warn!(
                                                         tool = %tool_name_for_remote,
@@ -314,7 +341,9 @@ impl Scheduler {
                                                     .await
                                                 }
                                                 _ => {
-                                                    metrics.remote_timeouts.fetch_add(1, Ordering::Relaxed);
+                                                    metrics
+                                                        .remote_timeouts
+                                                        .fetch_add(1, Ordering::Relaxed);
                                                     used_local_fallback = true;
                                                     Self::execute_tool_task(
                                                         tools,
