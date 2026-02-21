@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/PhantomReaper2025/titanclaw/compare/v0.6.1...v0.6.2) - 2026-02-21
+
+### Fixed
+
+- OpenRouter/OpenAI-compatible onboarding now persists `LLM_API_KEY` to `~/.ironclaw/.env` when OS secrets storage is unavailable, preventing first-run `401 Missing Authentication header` failures.
+- Bootstrap env persistence now merges with existing `~/.ironclaw/.env` entries instead of overwriting them, preserving previously saved keys such as `SECRETS_MASTER_KEY` and `LLM_API_KEY`.
+- Container job startup reliability remains hardened with missing-image auto-pull support (respects `sandbox.auto_pull_image`).
+
 ## [0.6.1](https://github.com/PhantomReaper2025/titanclaw/compare/v0.6.0...v0.6.1) - 2026-02-21
 
 ### Added
