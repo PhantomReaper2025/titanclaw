@@ -33,12 +33,21 @@
   <div id="app">
     <!-- Tab Bar -->
     <div class="tab-bar">
-      <button class="active" data-tab="chat">Chat</button>
-      <button data-tab="memory">Memory</button>
-      <button data-tab="jobs">Jobs</button>
-      <button data-tab="logs">Logs</button>
-      <button data-tab="routines">Routines</button>
-      <button data-tab="extensions">Extensions</button>
+      <div class="tab-brand">
+        <span class="tab-brand-mark"></span>
+        <div class="tab-brand-copy">
+          <strong>TitanClaw</strong>
+          <small>Control Surface</small>
+        </div>
+      </div>
+      <div class="tab-buttons">
+        <button class="active" data-tab="chat">Chat</button>
+        <button data-tab="memory">Memory</button>
+        <button data-tab="jobs">Jobs</button>
+        <button data-tab="logs">Logs</button>
+        <button data-tab="routines">Routines</button>
+        <button data-tab="extensions">Extensions</button>
+      </div>
       <div class="spacer"></div>
       <div class="status" id="gateway-status-trigger">
         <div class="dot" id="sse-dot"></div>
@@ -65,6 +74,12 @@
         <div class="thread-list" id="thread-list"></div>
       </div>
       <div class="chat-container">
+        <div class="chat-header">
+          <div>
+            <h2>Mission Thread</h2>
+            <p>Streamed agent execution with approvals and live job events</p>
+          </div>
+        </div>
         <div class="chat-messages" id="chat-messages"></div>
         <div class="chat-status" id="chat-status"></div>
         <div class="chat-input">

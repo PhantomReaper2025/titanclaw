@@ -2540,3 +2540,397 @@ mark {
     width: 100%;
   }
 }
+
+/* =========================================================
+   Titan UI Refresh (Modern Layout + Surface System)
+   ========================================================= */
+
+:root {
+  --shell-0: #07090d;
+  --shell-1: #0c1017;
+  --shell-2: #131926;
+  --shell-3: #1a2333;
+  --glass: rgba(18, 24, 36, 0.72);
+  --glass-strong: rgba(16, 20, 29, 0.9);
+  --line-soft: rgba(255, 255, 255, 0.08);
+  --line-hard: rgba(255, 255, 255, 0.14);
+  --red-1: #f05d5e;
+  --red-2: #dc2626;
+  --red-3: #8b1e24;
+}
+
+body {
+  background:
+    radial-gradient(1200px 600px at -10% -15%, rgba(240, 93, 94, 0.26), transparent 58%),
+    radial-gradient(1000px 700px at 110% -20%, rgba(167, 29, 35, 0.2), transparent 55%),
+    linear-gradient(140deg, var(--shell-0), var(--shell-1) 35%, #0d1220 60%, var(--shell-0));
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.015) 1px, transparent 1px);
+  background-size: 38px 38px;
+  mask-image: radial-gradient(circle at center, rgba(0, 0, 0, 0.5), transparent 78%);
+}
+
+#app {
+  padding: 18px;
+  gap: 14px;
+}
+
+#auth-screen {
+  padding: 18px;
+}
+
+.auth-card-login {
+  max-width: 460px;
+  border-radius: 24px;
+  border: 1px solid var(--line-soft);
+  background:
+    linear-gradient(165deg, rgba(16, 21, 31, 0.95), rgba(11, 15, 23, 0.95));
+  box-shadow:
+    0 24px 60px rgba(0, 0, 0, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+.auth-brand h1 {
+  letter-spacing: 0.08em;
+  text-shadow: 0 10px 30px rgba(220, 38, 38, 0.45);
+}
+
+.auth-tagline {
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  font-size: 11px;
+}
+
+#auth-screen button {
+  border-radius: 14px;
+  background: linear-gradient(145deg, var(--red-1), var(--red-2));
+  box-shadow: 0 10px 22px rgba(220, 38, 38, 0.35);
+}
+
+.tab-bar {
+  border: 1px solid var(--line-soft);
+  border-radius: 20px;
+  padding: 10px 14px;
+  gap: 14px;
+  background: linear-gradient(180deg, rgba(18, 23, 33, 0.96), rgba(13, 18, 27, 0.9));
+  box-shadow: var(--shadow), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.tab-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-right: 8px;
+}
+
+.tab-brand-mark {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 30% 30%, #ff9e9e, #ef4444 50%, #64121b 100%);
+  box-shadow: 0 0 0 6px rgba(239, 68, 68, 0.16), 0 0 24px rgba(239, 68, 68, 0.55);
+}
+
+.tab-brand-copy {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.05;
+}
+
+.tab-brand-copy strong {
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.tab-brand-copy small {
+  font-size: 10px;
+  color: var(--text-secondary);
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+}
+
+.tab-buttons {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  padding: 4px;
+}
+
+.tab-bar button {
+  margin-top: 0;
+  border-radius: 999px;
+  border-bottom: none;
+  padding: 9px 14px;
+  font-size: 13px;
+}
+
+.tab-bar button.active {
+  color: #fff;
+  background: linear-gradient(135deg, rgba(240, 93, 94, 0.96), rgba(185, 35, 41, 0.95));
+  box-shadow: 0 10px 20px rgba(220, 38, 38, 0.28);
+}
+
+.tab-bar .status {
+  margin: 0;
+  border-color: var(--line-hard);
+  background: rgba(255, 255, 255, 0.03);
+  padding: 7px 12px;
+}
+
+.tab-panel.active {
+  border: 1px solid var(--line-soft);
+  border-radius: 20px;
+  background: linear-gradient(180deg, rgba(15, 20, 30, 0.88), rgba(9, 13, 20, 0.86));
+  box-shadow: var(--shadow), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+#tab-chat {
+  flex-direction: row;
+}
+
+.thread-sidebar {
+  background: linear-gradient(180deg, rgba(16, 22, 34, 0.82), rgba(13, 18, 29, 0.74));
+  border-right: 1px solid var(--line-soft);
+}
+
+.thread-sidebar-header,
+.threads-section-header {
+  backdrop-filter: blur(8px);
+}
+
+.assistant-item,
+.thread-item {
+  border-radius: 12px;
+  margin: 3px 8px;
+  border: 1px solid transparent;
+}
+
+.assistant-item:hover,
+.thread-item:hover {
+  border-color: var(--line-soft);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.chat-container {
+  padding: 0;
+}
+
+.chat-header {
+  border-bottom: 1px solid var(--line-soft);
+  padding: 16px 20px;
+  background: linear-gradient(180deg, rgba(22, 30, 44, 0.75), rgba(16, 21, 31, 0.3));
+}
+
+.chat-header h2 {
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  margin-bottom: 4px;
+}
+
+.chat-header p {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.chat-messages {
+  padding: 18px 22px 14px;
+}
+
+.message {
+  border-radius: 16px;
+  border: 1px solid var(--line-soft);
+}
+
+.message.user {
+  background: linear-gradient(135deg, #cf2f3a, #8f1f27);
+  border: none;
+}
+
+.message.assistant {
+  background: linear-gradient(170deg, rgba(31, 41, 58, 0.76), rgba(20, 27, 40, 0.78));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.chat-status,
+.chat-input {
+  background: rgba(11, 15, 22, 0.85);
+  border-top: 1px solid var(--line-soft);
+}
+
+.chat-input {
+  padding: 14px 16px 18px;
+}
+
+.chat-input textarea {
+  background: rgba(255, 255, 255, 0.02);
+  border-color: var(--line-hard);
+  border-radius: 14px;
+}
+
+.chat-input button {
+  border-radius: 14px;
+  background: linear-gradient(145deg, var(--red-1), var(--red-2));
+  box-shadow: 0 12px 26px rgba(220, 38, 38, 0.32);
+}
+
+.memory-container,
+.jobs-container,
+.logs-container,
+.routines-container,
+.extensions-container {
+  background: transparent;
+}
+
+.memory-sidebar,
+.memory-content,
+.jobs-container,
+.logs-container,
+.routines-container,
+.extensions-section {
+  background: var(--glass);
+  border: 1px solid var(--line-soft);
+  border-radius: 16px;
+}
+
+.memory-container {
+  gap: 14px;
+  padding: 14px;
+}
+
+.memory-sidebar {
+  border-right: 1px solid var(--line-soft);
+}
+
+.memory-content {
+  overflow: hidden;
+}
+
+.memory-breadcrumb,
+.logs-toolbar {
+  border-bottom: 1px solid var(--line-soft);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.logs-output,
+.memory-viewer,
+.memory-editor textarea {
+  background: rgba(8, 12, 19, 0.74);
+}
+
+.jobs-container,
+.logs-container,
+.routines-container,
+.extensions-container {
+  margin: 14px;
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px solid var(--line-soft);
+  background: linear-gradient(170deg, rgba(15, 20, 30, 0.78), rgba(11, 16, 25, 0.8));
+}
+
+.jobs-table,
+.routines-table,
+.tools-table {
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+}
+
+.jobs-table th,
+.jobs-table td,
+.routines-table th,
+.routines-table td,
+.tools-table th,
+.tools-table td {
+  border-color: rgba(255, 255, 255, 0.06);
+}
+
+.jobs-table th,
+.routines-table th,
+.tools-table th {
+  background: linear-gradient(180deg, rgba(31, 39, 55, 0.92), rgba(22, 29, 42, 0.9));
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+button,
+.ext-install-form button,
+.btn-save,
+#logs-pause-btn {
+  border-radius: 12px;
+}
+
+input,
+select,
+textarea {
+  border-radius: 12px;
+  border-color: var(--line-hard);
+}
+
+.gateway-popover {
+  border: 1px solid var(--line-hard);
+  border-radius: 14px;
+  background: rgba(9, 13, 20, 0.97);
+  backdrop-filter: blur(10px);
+}
+
+@media (max-width: 1000px) {
+  #app {
+    padding: 10px;
+    gap: 10px;
+  }
+
+  .tab-bar {
+    flex-wrap: wrap;
+    row-gap: 10px;
+    padding: 10px;
+  }
+
+  .tab-brand {
+    order: 0;
+  }
+
+  .tab-buttons {
+    order: 2;
+    width: 100%;
+    overflow-x: auto;
+    justify-content: flex-start;
+    padding: 4px;
+  }
+
+  .tab-bar .status {
+    order: 1;
+    margin-left: auto;
+  }
+
+  #tab-chat {
+    flex-direction: column;
+  }
+
+  .chat-header {
+    padding: 12px 14px;
+  }
+
+  .jobs-container,
+  .logs-container,
+  .routines-container,
+  .extensions-container,
+  .memory-container {
+    margin: 8px;
+    padding: 10px;
+  }
+}
