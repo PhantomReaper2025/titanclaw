@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/PhantomReaper2025/titanclaw/compare/v0.6.0...v0.6.1) - 2026-02-21
+
+### Added
+
+- Production-core swarm hardening:
+  - capability-gated remote offload from scheduler
+  - deterministic local fallback on timeout/failure
+  - bounded remote waiter routing with expiry cleanup
+
+### Changed
+
+- Rebranded release package identity from `ironclaw` to `titanclaw`
+- Updated package metadata links to the TitanClaw repository
+- Updated benchmark dependency mapping to track the renamed package
+
+### Fixed
+
+- Regenerated WiX installer metadata to match `titanclaw` binary/product naming:
+  - MSI product name and install path
+  - executable filename/path (`titanclaw.exe`)
+  - installer help link URL
+
 ## [0.6.0](https://github.com/nearai/ironclaw/compare/ironclaw-v0.5.0...ironclaw-v0.6.0) - 2026-02-19
 
 ### Added

@@ -60,7 +60,7 @@
 
     <Product
         Id='*'
-        Name='ironclaw'
+        Name='titanclaw'
         UpgradeCode='D0156E61-BA37-451E-8AB9-1A2ECCCFA48F'
         Manufacturer='NEAR AI'
         Language='1033'
@@ -83,11 +83,11 @@
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
 
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
-        <Property Id='DiskPrompt' Value='ironclaw Installation'/>
+        <Property Id='DiskPrompt' Value='titanclaw Installation'/>
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
             <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
-                <Directory Id='APPLICATIONFOLDER' Name='ironclaw'>
+                <Directory Id='APPLICATIONFOLDER' Name='titanclaw'>
                     
                     <!--
                       Enabling the license sidecar file in the installer is a four step process:
@@ -123,9 +123,9 @@
                         <Component Id='binary0' Guid='*'>
                             <File
                                 Id='exe0'
-                                Name='ironclaw.exe'
+                                Name='titanclaw.exe'
                                 DiskId='1'
-                                Source='$(var.CargoTargetBinDir)\ironclaw.exe'
+                                Source='$(var.CargoTargetBinDir)\titanclaw.exe'
                                 KeyPath='yes'/>
                         </Component>
                     </Directory>
@@ -173,7 +173,7 @@
         <!--<Icon Id='ProductICO' SourceFile='wix\Product.ico'/>-->
         <!--<Property Id='ARPPRODUCTICON' Value='ProductICO' />-->
 
-        <Property Id='ARPHELPLINK' Value='https://github.com/nearai/ironclaw'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/PhantomReaper2025/titanclaw'/>
         
         <UI>
             <UIRef Id='WixUI_FeatureTree'/>
