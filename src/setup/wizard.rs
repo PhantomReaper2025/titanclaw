@@ -126,7 +126,7 @@ impl SetupWizard {
 
     /// Run the setup wizard.
     pub async fn run(&mut self) -> Result<(), SetupError> {
-        print_header("IronClaw Setup Wizard");
+        print_header("TitanClaw Setup Wizard");
 
         if self.config.channels_only {
             // Channels-only mode: just step 6
@@ -1877,11 +1877,11 @@ impl SetupWizard {
 
         println!();
         println!("To start the agent, run:");
-        println!("  ironclaw");
+        println!("  titanclaw");
         println!();
         println!("To change settings later:");
-        println!("  ironclaw config set <setting> <value>");
-        println!("  ironclaw onboard");
+        println!("  titanclaw config set <setting> <value>");
+        println!("  titanclaw onboard");
         println!();
 
         Ok(())
