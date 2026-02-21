@@ -3,6 +3,10 @@
 let token = '';
 let eventSource = null;
 let logEventSource = null;
+let chatReconnectTimer = null;
+let logReconnectTimer = null;
+let chatReconnectAttempts = 0;
+let logReconnectAttempts = 0;
 let currentTab = 'chat';
 let currentThreadId = null;
 let assistantThreadId = null;
@@ -13,6 +17,32 @@ let jobEvents = new Map(); // job_id -> Array of events
 let jobListRefreshTimer = null;
 const JOB_EVENTS_CAP = 500;
 const MEMORY_SEARCH_QUERY_MAX_LENGTH = 100;
+
+function reconnectDelay(attempt) {
+  const base = Math.min(30000, 1000 * Math.pow(2, Math.min(attempt, 5)));
+  const jitter = Math.floor(Math.random() * 500);
+  return base + jitter;
+}
+
+function scheduleChatReconnect() {
+  if (chatReconnectTimer || !token) return;
+  const delay = reconnectDelay(chatReconnectAttempts);
+  chatReconnectTimer = setTimeout(() => {
+    chatReconnectTimer = null;
+    chatReconnectAttempts += 1;
+    connectSSE();
+  }, delay);
+}
+
+function scheduleLogReconnect() {
+  if (logReconnectTimer || !token) return;
+  const delay = reconnectDelay(logReconnectAttempts);
+  logReconnectTimer = setTimeout(() => {
+    logReconnectTimer = null;
+    logReconnectAttempts += 1;
+    connectLogSSE();
+  }, delay);
+}
 
 // --- Auth ---
 
@@ -92,10 +122,15 @@ function apiFetch(path, options) {
 
 function connectSSE() {
   if (eventSource) eventSource.close();
+  if (chatReconnectTimer) {
+    clearTimeout(chatReconnectTimer);
+    chatReconnectTimer = null;
+  }
 
   eventSource = new EventSource('/api/chat/events?token=' + encodeURIComponent(token));
 
   eventSource.onopen = () => {
+    chatReconnectAttempts = 0;
     document.getElementById('sse-dot').classList.remove('disconnected');
     document.getElementById('sse-status').textContent = 'Connected';
   };
@@ -103,6 +138,9 @@ function connectSSE() {
   eventSource.onerror = () => {
     document.getElementById('sse-dot').classList.add('disconnected');
     document.getElementById('sse-status').textContent = 'Reconnecting...';
+    // EventSource has native retry, but some startup/network interruption
+    // paths can get stuck in CONNECTING. Force a fresh connection with backoff.
+    scheduleChatReconnect();
   };
 
   eventSource.addEventListener('response', (e) => {
@@ -1060,8 +1098,16 @@ let logBuffer = []; // buffer while paused
 
 function connectLogSSE() {
   if (logEventSource) logEventSource.close();
+  if (logReconnectTimer) {
+    clearTimeout(logReconnectTimer);
+    logReconnectTimer = null;
+  }
 
   logEventSource = new EventSource('/api/logs/events?token=' + encodeURIComponent(token));
+
+  logEventSource.onopen = () => {
+    logReconnectAttempts = 0;
+  };
 
   logEventSource.addEventListener('log', (e) => {
     const entry = JSON.parse(e.data);
@@ -1073,7 +1119,8 @@ function connectLogSSE() {
   });
 
   logEventSource.onerror = () => {
-    // Silent reconnect
+    // EventSource retries automatically, but force recreate on repeated errors.
+    scheduleLogReconnect();
   };
 }
 
@@ -2153,6 +2200,13 @@ function showToast(message, type) {
     toast.addEventListener('transitionend', () => toast.remove());
   }, 4000);
 }
+
+window.addEventListener('beforeunload', () => {
+  if (eventSource) eventSource.close();
+  if (logEventSource) logEventSource.close();
+  if (chatReconnectTimer) clearTimeout(chatReconnectTimer);
+  if (logReconnectTimer) clearTimeout(logReconnectTimer);
+});
 
 // --- Utilities ---
 
