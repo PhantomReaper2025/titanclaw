@@ -37,6 +37,7 @@ pub use session::{SessionConfig, SessionManager, create_session_manager};
 
 use std::sync::Arc;
 
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rig::client::CompletionClient;
 use secrecy::ExposeSecret;
 
@@ -210,14 +211,29 @@ fn create_openai_compatible_provider(config: &LlmConfig) -> Result<Arc<dyn LlmPr
     }
     let api_key = api_key.unwrap_or_else(|| "no-key".to_string());
 
-    let client: openai::Client = openai::Client::builder()
-        .base_url(&compat.base_url)
-        .api_key(api_key)
-        .build()
-        .map_err(|e| LlmError::RequestFailed {
-            provider: "openai_compatible".to_string(),
-            reason: format!("Failed to create OpenAI-compatible client: {}", e),
-        })?;
+    let mut builder = openai::Client::builder().base_url(&compat.base_url).api_key(api_key);
+
+    // OpenRouter app attribution headers so requests show the correct app
+    // identity instead of "unknown" in OpenRouter logs/analytics.
+    if is_openrouter_base_url(&compat.base_url) {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-title"),
+            HeaderValue::from_static("TitanClaw"),
+        );
+        if let Ok(referer) = HeaderValue::from_str(openrouter_app_referer()) {
+            headers.insert(
+                HeaderName::from_static("http-referer"),
+                referer,
+            );
+        }
+        builder = builder.http_headers(headers);
+    }
+
+    let client: openai::Client = builder.build().map_err(|e| LlmError::RequestFailed {
+        provider: "openai_compatible".to_string(),
+        reason: format!("Failed to create OpenAI-compatible client: {}", e),
+    })?;
 
     // OpenAI-compatible providers (e.g. OpenRouter) are most reliable on Chat Completions.
     // This avoids Responses-API-specific assumptions such as required tool call IDs.
@@ -243,6 +259,15 @@ fn is_openrouter_base_url(url: &str) -> bool {
     normalize_openai_compatible_base_url(url)
         .to_lowercase()
         .contains("openrouter.ai/api/v1")
+}
+
+fn openrouter_app_referer() -> &'static str {
+    let repo = env!("CARGO_PKG_REPOSITORY");
+    if repo.is_empty() {
+        "https://github.com/PhantomReaper2025/titanclaw"
+    } else {
+        repo
+    }
 }
 
 /// Create a cheap/fast LLM provider for lightweight tasks (heartbeat, routing, evaluation).
