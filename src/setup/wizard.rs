@@ -1752,6 +1752,13 @@ impl SetupWizard {
             if let Some(ref url) = self.settings.ollama_base_url {
                 env_vars.push(("OLLAMA_BASE_URL", url.clone()));
             }
+            if !self.settings.sandbox.image.trim().is_empty() {
+                env_vars.push(("SANDBOX_IMAGE", self.settings.sandbox.image.clone()));
+            }
+            env_vars.push((
+                "SANDBOX_AUTO_PULL",
+                self.settings.sandbox.auto_pull_image.to_string(),
+            ));
 
             if !env_vars.is_empty() {
                 let pairs: Vec<(&str, &str)> =
