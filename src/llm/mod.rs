@@ -211,7 +211,9 @@ fn create_openai_compatible_provider(config: &LlmConfig) -> Result<Arc<dyn LlmPr
     }
     let api_key = api_key.unwrap_or_else(|| "no-key".to_string());
 
-    let mut builder = openai::Client::builder().base_url(&compat.base_url).api_key(api_key);
+    let mut builder = openai::Client::builder()
+        .base_url(&compat.base_url)
+        .api_key(api_key);
 
     // OpenRouter app attribution headers so requests show the correct app
     // identity instead of "unknown" in OpenRouter logs/analytics.
@@ -222,10 +224,7 @@ fn create_openai_compatible_provider(config: &LlmConfig) -> Result<Arc<dyn LlmPr
             HeaderValue::from_static("TitanClaw"),
         );
         if let Ok(referer) = HeaderValue::from_str(openrouter_app_referer()) {
-            headers.insert(
-                HeaderName::from_static("http-referer"),
-                referer,
-            );
+            headers.insert(HeaderName::from_static("http-referer"), referer);
         }
         builder = builder.http_headers(headers);
     }

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3](https://github.com/PhantomReaper2025/titanclaw/compare/v0.6.2...v0.6.3) - 2026-02-21
+
+### Fixed
+
+- OpenRouter attribution now sends `X-Title: TitanClaw` and `HTTP-Referer: https://github.com/PhantomReaper2025/titanclaw`, so OpenRouter logs no longer show app identity as unknown.
+- Auto-onboarding in `run` now reloads `.env` + `~/.ironclaw/.env` in-process after wizard completion, preventing first-run missing-key states.
+- OpenRouter auth validation now fails early with a clear configuration error when `LLM_API_KEY` is missing, avoiding delayed runtime 401 failures.
+- API-key providers (OpenAI/Anthropic/OpenAI-compatible) now persist env fallback keys to `~/.ironclaw/.env` when encrypted secrets storage is unavailable.
+- Onboarding now preflights sandbox image readiness and auto-recovers by building local fallback image `titanclaw-worker:latest` when registry pull fails.
+- Onboarding now persists `SANDBOX_IMAGE` and `SANDBOX_AUTO_PULL` to bootstrap env so runtime job manager uses the same image selected/built during setup.
+- Sandbox preflight now prefers configured `SANDBOX_IMAGE` first, preventing repeated attempts to pull `ghcr.io/nearai/sandbox:latest` after fallback image is already configured.
+- `Dockerfile.worker` now builds and runs the correct `titanclaw` binary (instead of `ironclaw`), fixing worker-image fallback builds.
+- Web gateway now has resilient SSE reconnect/backoff for both chat and logs streams, reducing cases that required manual page refresh.
+
 ## [0.6.2](https://github.com/PhantomReaper2025/titanclaw/compare/v0.6.1...v0.6.2) - 2026-02-21
 
 ### Fixed
