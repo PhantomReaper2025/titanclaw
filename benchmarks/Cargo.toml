@@ -12,7 +12,7 @@ name = "ironclaw-bench"
 path = "src/main.rs"
 
 [dependencies]
-ironclaw = { path = ".." }
+ironclaw = { package = "titanclaw", path = ".." }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
