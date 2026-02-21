@@ -86,11 +86,11 @@ Based on `implementation_plan.md`, this is where the upgrade stands today.
 
 ### Install
 
-Use upstream release assets:
+Use TitanClaw release assets:
 
-- Windows MSI: `https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-x86_64-pc-windows-msvc.msi`
-- PowerShell installer: `irm https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-installer.ps1 | iex`
-- Shell installer: `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nearai/ironclaw/releases/latest/download/ironclaw-installer.sh | sh`
+- Windows MSI: `https://github.com/PhantomReaper2025/titanclaw/releases/latest/download/titanclaw-x86_64-pc-windows-msvc.msi`
+- PowerShell installer: `irm https://github.com/PhantomReaper2025/titanclaw/releases/latest/download/titanclaw-installer.ps1 | iex`
+- Shell installer: `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/PhantomReaper2025/titanclaw/releases/latest/download/titanclaw-installer.sh | sh`
 
 Or build from source:
 
@@ -104,25 +104,25 @@ cargo build --release
 
 ```bash
 # Interactive setup wizard
-./target/release/ironclaw onboard
+./target/release/titanclaw onboard
 
 # Start agent runtime (default command)
-./target/release/ironclaw run
+./target/release/titanclaw run
 ```
 
 ### Useful Commands
 
 ```bash
 # Health and diagnostics
-./target/release/ironclaw status
-./target/release/ironclaw doctor
+./target/release/titanclaw status
+./target/release/titanclaw doctor
 
 # Tool and memory management
-./target/release/ironclaw tool --help
-./target/release/ironclaw memory --help
+./target/release/titanclaw tool --help
+./target/release/titanclaw memory --help
 
 # Service management
-./target/release/ironclaw service --help
+./target/release/titanclaw service --help
 ```
 
 ### Swarm Mesh (Experimental)
@@ -134,7 +134,7 @@ export SWARM_ENABLED=true
 export SWARM_LISTEN_PORT=0
 export SWARM_HEARTBEAT_INTERVAL_SECS=15
 export SWARM_MAX_SLOTS=4
-./target/release/ironclaw run
+./target/release/titanclaw run
 ```
 
 ## Architecture
