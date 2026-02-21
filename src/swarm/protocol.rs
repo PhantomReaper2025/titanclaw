@@ -18,6 +18,15 @@ pub struct SwarmTask {
     pub params: serde_json::Value,
     /// Priority (higher = more urgent).
     pub priority: u8,
+    /// Dispatch attempt count from origin scheduler.
+    #[serde(default)]
+    pub attempt: u8,
+    /// Soft deadline in unix epoch milliseconds for remote execution.
+    #[serde(default)]
+    pub deadline_ms: Option<i64>,
+    /// Origin node id for tracing/correlation.
+    #[serde(default)]
+    pub origin_node: Option<String>,
 }
 
 /// Messages exchanged between swarm peers.

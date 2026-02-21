@@ -37,7 +37,7 @@ Based on `implementation_plan.md`, this is where the upgrade stands today.
 | Phase 0: streaming everywhere | ✅ | Gateway SSE/WebSocket exists; shell output streams live per chunk, tool-call deltas surface live shell command drafts, early piped shell execution is default-on (disable with `ENABLE_PIPED_TOOL_EXECUTION=false`), and approval-required commands emit explicit waiting status |
 | Phase 0: reflex fast-path bypass | ✅ | Deterministic NL routing + persistent reflex pattern registry now route recurring prompts directly to compiled tools with LLM fallback |
 | Phase 1: deep context indexing | ✅ | Tree-sitter AST indexing is live and queryable with `memory_graph` (bounded multi-hop traversal, graph scoring, stable ranking, semantic context fusion) |
-| Phase 2: distributed swarm mesh | 🚧 | Mesh node lifecycle is live, incoming swarm tasks execute via local tool/safety stack, and scheduler tool subtasks now offload to swarm peers with fast local fallback |
+| Phase 2: distributed swarm mesh | ✅ | Mesh node lifecycle is live, incoming swarm tasks execute via local tool/safety stack, scheduler tool subtasks offload to capability-matching peers, remote waiters are bounded/cleaned up, and local fallback is deterministic |
 
 ## Capabilities
 

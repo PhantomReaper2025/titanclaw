@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{RwLock, mpsc, oneshot};
@@ -19,6 +20,25 @@ use crate::llm::LlmProvider;
 use crate::safety::SafetyLayer;
 use crate::swarm::node::{SwarmHandle, SwarmRemoteResult, SwarmResultRouter};
 use crate::tools::ToolRegistry;
+
+const REMOTE_WAIT_TIMEOUT: Duration = Duration::from_millis(300);
+const REMOTE_DISTRIBUTE_RETRIES: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffloadDecision {
+    LocalOnly,
+    RemotePreferred,
+}
+
+#[derive(Default)]
+struct SchedulerMetrics {
+    remote_attempts: AtomicU64,
+    remote_successes: AtomicU64,
+    remote_failures: AtomicU64,
+    remote_timeouts: AtomicU64,
+    local_fallbacks: AtomicU64,
+    remote_ineligible: AtomicU64,
+}
 
 /// Message to send to a worker.
 #[derive(Debug)]
@@ -54,6 +74,7 @@ pub struct Scheduler {
     hooks: Arc<HookRegistry>,
     swarm_handle: Option<SwarmHandle>,
     swarm_results: Option<SwarmResultRouter>,
+    metrics: Arc<SchedulerMetrics>,
     /// Running jobs (main LLM-driven jobs).
     jobs: Arc<RwLock<HashMap<Uuid, ScheduledJob>>>,
     /// Running sub-tasks (tool executions, background tasks).
@@ -83,6 +104,7 @@ impl Scheduler {
             hooks,
             swarm_handle,
             swarm_results,
+            metrics: Arc::new(SchedulerMetrics::default()),
             jobs: Arc::new(RwLock::new(HashMap::new())),
             subtasks: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -210,74 +232,133 @@ impl Scheduler {
                 let task_id_for_remote = task_id;
                 let tool_name_for_remote = tool_name.clone();
                 let params_for_remote = params.clone();
+                let metrics = Arc::clone(&self.metrics);
 
                 tokio::spawn(async move {
-                    // Try remote swarm execution first when mesh is enabled.
-                    // Fall back to local execution quickly if no remote result arrives.
+                    let mut used_local_fallback = false;
                     let result = if let (Some(handle), Some(router)) = (swarm_handle, swarm_results)
                     {
-                        let remote_waiter = router.register(task_id_for_remote).await;
-                        let offload = handle
-                            .distribute_task(crate::swarm::protocol::SwarmTask {
-                                id: task_id_for_remote,
-                                job_id: tool_parent_id,
-                                tool_name: tool_name_for_remote.clone(),
-                                params: params_for_remote.clone(),
-                                priority: 5,
-                            })
-                            .await;
+                        match decide_offload(&tools, &handle, &tool_name_for_remote, &params_for_remote).await {
+                            OffloadDecision::LocalOnly => {
+                                metrics.remote_ineligible.fetch_add(1, Ordering::Relaxed);
+                                used_local_fallback = true;
+                                Self::execute_tool_task(
+                                    tools,
+                                    context_manager,
+                                    safety,
+                                    tool_parent_id,
+                                    &tool_name,
+                                    params,
+                                )
+                                .await
+                            }
+                            OffloadDecision::RemotePreferred => {
+                                metrics.remote_attempts.fetch_add(1, Ordering::Relaxed);
+                                match router.register(task_id_for_remote, REMOTE_WAIT_TIMEOUT).await {
+                                    Ok(remote_waiter) => {
+                                        let mut dispatched = false;
+                                        for attempt in 0..=REMOTE_DISTRIBUTE_RETRIES {
+                                            let dispatch_res = handle
+                                                .distribute_task(crate::swarm::protocol::SwarmTask {
+                                                    id: task_id_for_remote,
+                                                    job_id: tool_parent_id,
+                                                    tool_name: tool_name_for_remote.clone(),
+                                                    params: params_for_remote.clone(),
+                                                    priority: 5,
+                                                    attempt: attempt as u8,
+                                                    deadline_ms: None,
+                                                    origin_node: None,
+                                                })
+                                                .await;
+                                            if dispatch_res.is_ok() {
+                                                dispatched = true;
+                                                break;
+                                            }
+                                        }
 
-                        if offload.is_ok() {
-                            match tokio::time::timeout(
-                                Duration::from_millis(300),
-                                remote_waiter,
-                            )
-                            .await
-                            {
-                                Ok(Ok(SwarmRemoteResult {
-                                    success: true,
-                                    output,
-                                    duration_ms,
-                                })) => {
-                                    let output_json = serde_json::from_str::<serde_json::Value>(&output)
-                                        .unwrap_or_else(|_| serde_json::json!({ "output": output }));
-                                    Ok(TaskOutput::new(
-                                        output_json,
-                                        Duration::from_millis(duration_ms),
-                                    ))
-                                }
-                                Ok(Ok(SwarmRemoteResult {
-                                    success: false,
-                                    output,
-                                    ..
-                                })) => Err(Error::Tool(crate::error::ToolError::ExecutionFailed {
-                                    name: tool_name_for_remote.clone(),
-                                    reason: format!("Remote swarm execution failed: {}", output),
-                                })),
-                                _ => {
-                                    Self::execute_tool_task(
-                                        tools,
-                                        context_manager,
-                                        safety,
-                                        tool_parent_id,
-                                        &tool_name,
-                                        params,
-                                    )
-                                    .await
+                                        if dispatched {
+                                            match tokio::time::timeout(REMOTE_WAIT_TIMEOUT, remote_waiter).await {
+                                                Ok(Ok(SwarmRemoteResult {
+                                                    success: true,
+                                                    output,
+                                                    duration_ms,
+                                                })) => {
+                                                    metrics.remote_successes.fetch_add(1, Ordering::Relaxed);
+                                                    let output_json = serde_json::from_str::<serde_json::Value>(&output)
+                                                        .unwrap_or_else(|_| serde_json::json!({ "output": output }));
+                                                    Ok(TaskOutput::new(
+                                                        output_json,
+                                                        Duration::from_millis(duration_ms),
+                                                    ))
+                                                }
+                                                Ok(Ok(SwarmRemoteResult {
+                                                    success: false,
+                                                    output,
+                                                    ..
+                                                })) => {
+                                                    metrics.remote_failures.fetch_add(1, Ordering::Relaxed);
+                                                    used_local_fallback = true;
+                                                    tracing::warn!(
+                                                        tool = %tool_name_for_remote,
+                                                        "Remote swarm execution failed, falling back to local: {}",
+                                                        output
+                                                    );
+                                                    Self::execute_tool_task(
+                                                        tools,
+                                                        context_manager,
+                                                        safety,
+                                                        tool_parent_id,
+                                                        &tool_name,
+                                                        params,
+                                                    )
+                                                    .await
+                                                }
+                                                _ => {
+                                                    metrics.remote_timeouts.fetch_add(1, Ordering::Relaxed);
+                                                    used_local_fallback = true;
+                                                    Self::execute_tool_task(
+                                                        tools,
+                                                        context_manager,
+                                                        safety,
+                                                        tool_parent_id,
+                                                        &tool_name,
+                                                        params,
+                                                    )
+                                                    .await
+                                                }
+                                            }
+                                        } else {
+                                            metrics.remote_failures.fetch_add(1, Ordering::Relaxed);
+                                            used_local_fallback = true;
+                                            Self::execute_tool_task(
+                                                tools,
+                                                context_manager,
+                                                safety,
+                                                tool_parent_id,
+                                                &tool_name,
+                                                params,
+                                            )
+                                            .await
+                                        }
+                                    }
+                                    Err(_) => {
+                                        metrics.remote_ineligible.fetch_add(1, Ordering::Relaxed);
+                                        used_local_fallback = true;
+                                        Self::execute_tool_task(
+                                            tools,
+                                            context_manager,
+                                            safety,
+                                            tool_parent_id,
+                                            &tool_name,
+                                            params,
+                                        )
+                                        .await
+                                    }
                                 }
                             }
-                        } else {
-                            Self::execute_tool_task(
-                                tools,
-                                context_manager,
-                                safety,
-                                tool_parent_id,
-                                &tool_name,
-                                params,
-                            )
-                            .await
                         }
                     } else {
+                        used_local_fallback = true;
                         Self::execute_tool_task(
                             tools,
                             context_manager,
@@ -288,6 +369,9 @@ impl Scheduler {
                         )
                         .await
                     };
+                    if used_local_fallback {
+                        metrics.local_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    }
 
                     // Send result (ignore if receiver dropped)
                     let _ = result_tx.send(result);
@@ -610,11 +694,50 @@ impl Scheduler {
     }
 }
 
+fn required_swarm_capability(tool_name: &str) -> &'static str {
+    match tool_name {
+        "shell" => "shell",
+        "memory_search" | "memory_graph" => "memory_search",
+        _ => "tool_exec",
+    }
+}
+
+async fn decide_offload(
+    tools: &Arc<ToolRegistry>,
+    swarm: &SwarmHandle,
+    tool_name: &str,
+    params: &serde_json::Value,
+) -> OffloadDecision {
+    let Some(tool) = tools.get(tool_name).await else {
+        return OffloadDecision::LocalOnly;
+    };
+
+    if tool.requires_approval() || tool.requires_approval_for(params) {
+        return OffloadDecision::LocalOnly;
+    }
+
+    let capability = required_swarm_capability(tool_name);
+    match swarm.has_capability(capability).await {
+        Ok(true) => OffloadDecision::RemotePreferred,
+        Ok(false) | Err(_) => OffloadDecision::LocalOnly,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::required_swarm_capability;
+
     #[test]
     fn test_scheduler_creation() {
         // Would need to mock dependencies for proper testing
+    }
+
+    #[test]
+    fn test_required_swarm_capability_mapping() {
+        assert_eq!(required_swarm_capability("shell"), "shell");
+        assert_eq!(required_swarm_capability("memory_search"), "memory_search");
+        assert_eq!(required_swarm_capability("memory_graph"), "memory_search");
+        assert_eq!(required_swarm_capability("list_jobs"), "tool_exec");
     }
 
     #[tokio::test]

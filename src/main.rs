@@ -1369,6 +1369,7 @@ async fn main() -> anyhow::Result<()> {
     let mut swarm_handle: Option<ironclaw::swarm::node::SwarmHandle> = None;
     let mut swarm_events_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut swarm_result_router: Option<ironclaw::swarm::node::SwarmResultRouter> = None;
+    let mut swarm_router_cleanup_task: Option<tokio::task::JoinHandle<()>> = None;
     if config.swarm.enabled {
         let swarm_cfg = ironclaw::swarm::node::SwarmConfig {
             listen_port: config.swarm.listen_port,
@@ -1391,6 +1392,22 @@ async fn main() -> anyhow::Result<()> {
                     config.swarm.heartbeat_interval.as_secs(),
                     config.swarm.max_slots
                 );
+                let cleanup_router = result_router.clone();
+                swarm_router_cleanup_task = Some(tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+                    loop {
+                        ticker.tick().await;
+                        let removed = cleanup_router.cleanup_expired().await;
+                        if removed > 0 {
+                            let pending = cleanup_router.pending_count().await;
+                            tracing::warn!(
+                                removed,
+                                pending,
+                                "Cleaned up expired swarm result waiters"
+                            );
+                        }
+                    }
+                }));
                 swarm_events_task = Some(tokio::spawn(async move {
                     while let Some(event) = events_rx.recv().await {
                         match event {
@@ -1607,6 +1624,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     if let Some(task) = swarm_events_task.take() {
+        task.abort();
+    }
+    if let Some(task) = swarm_router_cleanup_task.take() {
         task.abort();
     }
 

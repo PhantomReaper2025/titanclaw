@@ -15,7 +15,7 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 
 | Track | Status | Notes |
 |---|---|---|
-| Swarm mesh runtime wiring | 🚧 | `swarm` module is wired into runtime lifecycle behind config (`SWARM_ENABLED`, listen/heartbeat/max slots), incoming remote tasks execute through the local tool/safety stack, and remote completions route back to local waiters. |
+| Swarm mesh runtime wiring | ✅ | `swarm` module is wired into runtime lifecycle behind config (`SWARM_ENABLED`, listen/heartbeat/max slots), incoming remote tasks execute through the local tool/safety stack, scheduler offload is capability-gated with deterministic local fallback, and remote completion waiters are bounded with expiry cleanup. |
 | Zero-latency text streaming | ✅ | Streaming chunk path is active in agent dispatcher to REPL/Web/WASM channels. |
 | Tool/block-level streaming | ✅ | Tool start/completion/result events are live; shell tool streams incremental stdout/stderr, streamed tool-call deltas surface live shell command drafts (`[draft]`), piped early execution is default-on (toggle with `ENABLE_PIPED_TOOL_EXECUTION=false`), and approval-required commands emit explicit waiting status before execution. |
 | Reflex compiler | ✅ | Background reflex compiler now persists normalized recurring patterns to a reflex registry and routes matching prompts directly to compiled tools before LLM fallback. |

@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 
@@ -48,25 +48,68 @@ pub struct SwarmRemoteResult {
 /// Shared map used to route remote task results back to awaiting callers.
 #[derive(Clone, Default)]
 pub struct SwarmResultRouter {
-    pending: Arc<Mutex<HashMap<Uuid, oneshot::Sender<SwarmRemoteResult>>>>,
+    pending: Arc<Mutex<HashMap<Uuid, PendingWaiter>>>,
+}
+
+#[derive(Debug)]
+struct PendingWaiter {
+    sender: oneshot::Sender<SwarmRemoteResult>,
+    expires_at: Instant,
+}
+
+#[derive(Debug)]
+pub enum SwarmRouterError {
+    Saturated { max_pending: usize },
 }
 
 impl SwarmResultRouter {
+    pub const MAX_PENDING_WAITERS: usize = 4096;
+
     /// Register interest in a task result and return a receiver for it.
-    pub async fn register(&self, task_id: Uuid) -> oneshot::Receiver<SwarmRemoteResult> {
+    pub async fn register(
+        &self,
+        task_id: Uuid,
+        timeout: Duration,
+    ) -> Result<oneshot::Receiver<SwarmRemoteResult>, SwarmRouterError> {
+        let _ = self.cleanup_expired().await;
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(task_id, tx);
-        rx
+        let mut pending = self.pending.lock().await;
+        if pending.len() >= Self::MAX_PENDING_WAITERS {
+            return Err(SwarmRouterError::Saturated {
+                max_pending: Self::MAX_PENDING_WAITERS,
+            });
+        }
+        pending.insert(
+            task_id,
+            PendingWaiter {
+                sender: tx,
+                expires_at: Instant::now() + timeout,
+            },
+        );
+        Ok(rx)
     }
 
     /// Resolve a task result for any local waiter.
     pub async fn resolve(&self, task_id: Uuid, result: SwarmRemoteResult) -> bool {
-        if let Some(tx) = self.pending.lock().await.remove(&task_id) {
-            let _ = tx.send(result);
+        if let Some(waiter) = self.pending.lock().await.remove(&task_id) {
+            let _ = waiter.sender.send(result);
             true
         } else {
             false
         }
+    }
+
+    /// Remove expired waiters and return number removed.
+    pub async fn cleanup_expired(&self) -> usize {
+        let now = Instant::now();
+        let mut pending = self.pending.lock().await;
+        let before = pending.len();
+        pending.retain(|_, waiter| waiter.expires_at > now);
+        before.saturating_sub(pending.len())
+    }
+
+    pub async fn pending_count(&self) -> usize {
+        self.pending.lock().await.len()
     }
 }
 
@@ -82,6 +125,11 @@ pub enum SwarmCommand {
         success: bool,
         output: String,
         duration_ms: u64,
+    },
+    /// Query whether any known peer currently advertises a capability.
+    HasCapability {
+        capability: String,
+        respond_to: oneshot::Sender<bool>,
     },
     /// Shut down the swarm.
     Shutdown,
@@ -127,6 +175,12 @@ impl Default for SwarmConfig {
 /// The Hive swarm node.
 pub struct SwarmNode {
     config: SwarmConfig,
+}
+
+#[derive(Debug, Clone)]
+struct PeerState {
+    available_slots: u32,
+    capabilities: Vec<String>,
 }
 
 impl SwarmNode {
@@ -225,7 +279,13 @@ impl SwarmNode {
         // Spawn the event loop
         tokio::spawn(async move {
             let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
-            let mut peers: HashMap<PeerId, u32> = HashMap::new();
+            let mut peers: HashMap<PeerId, PeerState> = HashMap::new();
+            let advertised_capabilities = vec![
+                "tool_exec".to_string(),
+                "shell".to_string(),
+                "memory_search".to_string(),
+                "wasm".to_string(),
+            ];
 
             loop {
                 tokio::select! {
@@ -245,9 +305,15 @@ impl SwarmNode {
                                                 task_id, success, output, duration_ms,
                                             }).await;
                                         }
-                                        SwarmMessage::Heartbeat { node_id: _, available_slots, .. } => {
+                                        SwarmMessage::Heartbeat { node_id: _, available_slots, capabilities } => {
                                             if let Some(source) = message.source {
-                                                peers.insert(source, available_slots);
+                                                peers.insert(
+                                                    source,
+                                                    PeerState {
+                                                        available_slots,
+                                                        capabilities,
+                                                    },
+                                                );
                                             }
                                         }
                                         _ => {}
@@ -299,16 +365,19 @@ impl SwarmNode {
                                 let msg = SwarmMessage::Heartbeat {
                                     node_id: swarm.local_peer_id().to_string(),
                                     available_slots,
-                                    capabilities: vec![
-                                        "wasm".into(),
-                                        "llm".into(),
-                                        "search".into(),
-                                    ],
+                                    capabilities: advertised_capabilities.clone(),
                                 };
                                 if let Ok(data) = serde_json::to_vec(&msg) {
                                     let topic = gossipsub::IdentTopic::new(TOPIC_HEARTBEAT);
                                     let _ = swarm.behaviour_mut().gossipsub.publish(topic, data);
                                 }
+                            }
+                            Some(SwarmCommand::HasCapability { capability, respond_to }) => {
+                                let has_peer = peers.values().any(|peer| {
+                                    peer.available_slots > 0
+                                        && peer.capabilities.iter().any(|c| c == &capability)
+                                });
+                                let _ = respond_to.send(has_peer);
                             }
                             Some(SwarmCommand::Shutdown) | None => {
                                 tracing::info!("Hive swarm node shutting down");
@@ -322,11 +391,7 @@ impl SwarmNode {
                         let msg = SwarmMessage::Heartbeat {
                             node_id: swarm.local_peer_id().to_string(),
                             available_slots: max_slots,
-                            capabilities: vec![
-                                "wasm".into(),
-                                "llm".into(),
-                                "search".into(),
-                            ],
+                            capabilities: advertised_capabilities.clone(),
                         };
                         if let Ok(data) = serde_json::to_vec(&msg) {
                             let topic = gossipsub::IdentTopic::new(TOPIC_HEARTBEAT);
@@ -369,11 +434,69 @@ impl SwarmHandle {
             .map_err(|e| format!("Swarm channel closed: {}", e))
     }
 
+    /// Check if any currently known peer advertises a given capability.
+    pub async fn has_capability(&self, capability: &str) -> Result<bool, String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::HasCapability {
+                capability: capability.to_string(),
+                respond_to: tx,
+            })
+            .await
+            .map_err(|e| format!("Swarm channel closed: {}", e))?;
+        rx.await
+            .map_err(|e| format!("Swarm capability query failed: {}", e))
+    }
+
     /// Shut down the swarm node.
     pub async fn shutdown(&self) -> Result<(), String> {
         self.cmd_tx
             .send(SwarmCommand::Shutdown)
             .await
             .map_err(|e| format!("Swarm channel closed: {}", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SwarmRemoteResult, SwarmResultRouter};
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn router_register_resolve_roundtrip() {
+        let router = SwarmResultRouter::default();
+        let task_id = Uuid::new_v4();
+        let rx = router
+            .register(task_id, Duration::from_secs(1))
+            .await
+            .expect("register should succeed");
+        let resolved = router
+            .resolve(
+                task_id,
+                SwarmRemoteResult {
+                    success: true,
+                    output: "ok".to_string(),
+                    duration_ms: 12,
+                },
+            )
+            .await;
+        assert!(resolved);
+        let msg = rx.await.expect("receiver should get result");
+        assert!(msg.success);
+        assert_eq!(msg.output, "ok");
+    }
+
+    #[tokio::test]
+    async fn router_cleanup_expired_waiters() {
+        let router = SwarmResultRouter::default();
+        let _ = router
+            .register(Uuid::new_v4(), Duration::from_millis(10))
+            .await
+            .expect("register should succeed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let removed = router.cleanup_expired().await;
+        assert_eq!(removed, 1);
+        assert_eq!(router.pending_count().await, 0);
     }
 }
