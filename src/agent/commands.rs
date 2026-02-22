@@ -361,6 +361,7 @@ impl Agent {
                 "System:\n",
                 "  /help             Show this help\n",
                 "  /model [name]     Show or switch the active model\n",
+                "  /kernel <action>  Manage kernel patch proposals (list|approve|reject|deploy)\n",
                 "  /version          Show version info\n",
                 "  /tools            List available tools\n",
                 "  /debug            Toggle debug mode\n",
@@ -474,6 +475,96 @@ impl Agent {
                             e
                         ))),
                     }
+                }
+            }
+
+            "kernel" => {
+                let Some(orchestrator) = self.kernel_orchestrator() else {
+                    return Ok(SubmissionResult::error(
+                        "Kernel orchestrator is not enabled.",
+                    ));
+                };
+
+                if args.is_empty() || args[0].eq_ignore_ascii_case("list") {
+                    let patches = orchestrator.list_patches().await;
+                    if patches.is_empty() {
+                        return Ok(SubmissionResult::ok_with_message(
+                            "No kernel patch proposals yet.",
+                        ));
+                    }
+                    let mut out = String::from("Kernel patch proposals:\n");
+                    for p in patches {
+                        out.push_str(&format!(
+                            "- {} [{}] tool={} speedup≈{:.2}x\n  reason: {}\n",
+                            p.id,
+                            format!("{:?}", p.status),
+                            p.tool_name,
+                            p.expected_speedup,
+                            p.reason
+                        ));
+                    }
+                    return Ok(SubmissionResult::response(out));
+                }
+
+                if args.len() < 2 {
+                    return Ok(SubmissionResult::error(
+                        "Usage: /kernel <approve|reject|deploy> <patch_uuid>",
+                    ));
+                }
+
+                let patch_id = match Uuid::parse_str(&args[1]) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        return Ok(SubmissionResult::error(format!(
+                            "Invalid patch UUID: {}",
+                            e
+                        )));
+                    }
+                };
+
+                match args[0].to_lowercase().as_str() {
+                    "approve" => {
+                        let ok = orchestrator.approve_patch(patch_id).await;
+                        if ok {
+                            Ok(SubmissionResult::ok_with_message(format!(
+                                "Approved patch {}",
+                                patch_id
+                            )))
+                        } else {
+                            Ok(SubmissionResult::error(format!(
+                                "Patch {} not found",
+                                patch_id
+                            )))
+                        }
+                    }
+                    "reject" => {
+                        let ok = orchestrator.reject_patch(patch_id).await;
+                        if ok {
+                            Ok(SubmissionResult::ok_with_message(format!(
+                                "Rejected patch {}",
+                                patch_id
+                            )))
+                        } else {
+                            Ok(SubmissionResult::error(format!(
+                                "Patch {} not found",
+                                patch_id
+                            )))
+                        }
+                    }
+                    "deploy" => match orchestrator.deploy_patch_by_id(patch_id).await {
+                        Ok(()) => Ok(SubmissionResult::ok_with_message(format!(
+                            "Deployed patch {}",
+                            patch_id
+                        ))),
+                        Err(e) => Ok(SubmissionResult::error(format!(
+                            "Deploy failed for {}: {}",
+                            patch_id, e
+                        ))),
+                    },
+                    other => Ok(SubmissionResult::error(format!(
+                        "Unknown kernel action '{}'. Use list|approve|reject|deploy.",
+                        other
+                    ))),
                 }
             }
 

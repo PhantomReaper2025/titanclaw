@@ -127,6 +127,33 @@ impl CreateJobTool {
         self.job_manager.is_some()
     }
 
+    fn parse_job_mode(raw: &str) -> Option<JobMode> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "worker" => Some(JobMode::Worker),
+            "claude_code" => Some(JobMode::ClaudeCode),
+            "opencode" => Some(JobMode::OpenCode),
+            _ => None,
+        }
+    }
+
+    async fn resolve_default_mode(&self, user_id: &str) -> JobMode {
+        if let Some(store) = &self.store
+            && let Ok(Some(value)) = store.get_setting(user_id, "coding_runtime_default").await
+            && let Some(raw) = value.as_str()
+            && let Some(mode) = Self::parse_job_mode(raw)
+        {
+            return mode;
+        }
+
+        if let Ok(raw) = std::env::var("CODING_RUNTIME_DEFAULT")
+            && let Some(mode) = Self::parse_job_mode(&raw)
+        {
+            return mode;
+        }
+
+        JobMode::Worker
+    }
+
     /// Parse and validate the `credentials` parameter.
     ///
     /// Each key is a secret name (must exist in SecretsStore), each value is the
@@ -316,13 +343,14 @@ impl CreateJobTool {
         });
 
         // Persist the job mode to DB
-        if mode == JobMode::ClaudeCode
+        if mode != JobMode::Worker
             && let Some(store) = self.store.clone()
         {
             let job_id_copy = job_id;
+            let mode_value = mode.as_str().to_string();
             tokio::spawn(async move {
                 if let Err(e) = store
-                    .update_sandbox_job_mode(job_id_copy, "claude_code")
+                    .update_sandbox_job_mode(job_id_copy, &mode_value)
                     .await
                 {
                     tracing::warn!(job_id = %job_id_copy, "Failed to set job mode: {}", e);
@@ -642,7 +670,7 @@ impl Tool for CreateJobTool {
              whenever the user asks you to build, create, or work on something. The task \
              description should be detailed enough for the sub-agent to work independently. \
              Set wait=false to start immediately while continuing the conversation. Set mode \
-             to 'claude_code' for complex software engineering tasks."
+             to 'claude_code' or 'opencode' for complex software engineering tasks."
         } else {
             "Create a new job or task for the agent to work on. Use this when the user wants \
              you to do something substantial that should be tracked as a separate job."
@@ -669,9 +697,11 @@ impl Tool for CreateJobTool {
                     },
                     "mode": {
                         "type": "string",
-                        "enum": ["worker", "claude_code"],
-                        "description": "Execution mode. 'worker' (default) uses the IronClaw sub-agent. \
-                                        'claude_code' uses Claude Code CLI for full agentic software engineering."
+                        "enum": ["worker", "claude_code", "opencode"],
+                        "description": "Execution mode. If omitted, the onboarded sandbox runtime default is used. \
+                                        'worker' uses the IronClaw sub-agent. \
+                                        'claude_code' uses Claude Code CLI for full agentic software engineering. \
+                                        'opencode' uses OpenCode-oriented sandbox runtime."
                     },
                     "project_dir": {
                         "type": "string",
@@ -726,10 +756,36 @@ impl Tool for CreateJobTool {
 
         if self.sandbox_enabled() {
             let wait = params.get("wait").and_then(|v| v.as_bool()).unwrap_or(true);
-
-            let mode = match params.get("mode").and_then(|v| v.as_str()) {
-                Some("claude_code") => JobMode::ClaudeCode,
-                _ => JobMode::Worker,
+            let default_mode = self.resolve_default_mode(&ctx.user_id).await;
+            let requested_mode = params
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .and_then(Self::parse_job_mode)
+                .unwrap_or(default_mode);
+            let mode = if requested_mode == JobMode::ClaudeCode {
+                if let Some(jm) = &self.job_manager {
+                    if !jm.claude_code_available() {
+                        let fallback = match default_mode {
+                            JobMode::ClaudeCode => JobMode::OpenCode,
+                            other => other,
+                        };
+                        if fallback != JobMode::ClaudeCode {
+                            tracing::warn!(
+                                "create_job requested claude_code but no Claude credentials are configured; falling back to {}",
+                                fallback
+                            );
+                            fallback
+                        } else {
+                            requested_mode
+                        }
+                    } else {
+                        requested_mode
+                    }
+                } else {
+                    requested_mode
+                }
+            } else {
+                requested_mode
             };
 
             let explicit_dir = params

@@ -21,6 +21,12 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 | Reflex compiler | ✅ | Background reflex compiler now persists normalized recurring patterns to a reflex registry and routes matching prompts directly to compiled tools before LLM fallback. |
 | GraphRAG + AST indexing | ✅ | `memory_graph` now supports bounded multi-hop traversal, graph scoring, stable ranking, and semantic context fusion in responses. |
 | Docker worker image provisioning hardening | ✅ | Orchestrator `job_manager` now preflights worker image availability and auto-pulls when missing (respects `sandbox.auto_pull_image`), eliminating first-run `No such image` container creation failures. |
+| Chat lifecycle controls | ✅ | Web gateway now supports hard-delete for a single thread and clear-all chats (chat scope only), with UI actions. |
+| Sandbox artifact export | ✅ | Web gateway now supports direct archive download of sandbox project output (`/api/jobs/{id}/files/download`). |
+| OpenCode bridge runtime | ✅ | `JobMode::OpenCode` now launches a dedicated `opencode-bridge` worker command (not generic `worker` fallback), passes model defaults through, and streams OpenCode output/events to orchestrator channels. |
+| Routine FullJob scheduler integration | ✅ | `RoutineAction::FullJob` now creates a real job context, schedules it through `Scheduler`, and reports success/failure from terminal job state instead of lightweight fallback. |
+| Anticipatory execution (shadow workers) | ✅ | New `shadow_engine` precomputes likely next-turn responses via bounded cheap-LLM workers, caches by normalized prompt, and serves cache hits instantly with TTL + background pruning. |
+| Self-modifying kernel orchestration | ✅ | New `kernel_orchestrator` loop records live tool latencies from dispatcher execution, detects bottlenecks, creates patch proposals in `KernelMonitor`, and can auto-approve/auto-deploy via `jit_wasm_run` (config-gated). User-facing control is live via `kernel_patch` tool, `/kernel ...` commands, and gateway `/api/kernel/patches*` endpoints. |
 
 ## Execution TODO (Live)
 
@@ -33,6 +39,8 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 - [x] Token-to-tool piped execution completion (default-on with explicit approval-aware piped status)
 - [x] Swarm workload distribution from scheduler into mesh peers (scheduler tool subtasks offload to swarm with fast local fallback)
 - [x] Docker job runner preflight image check + auto-pull fallback for first-run reliability
+- [x] Shadow-worker speculative execution cache with bounded concurrency + TTL
+- [x] Kernel monitor runtime loop with proposal generation + optional auto deploy
 
 ## Proposed Changes
 

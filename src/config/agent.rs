@@ -25,6 +25,26 @@ pub struct AgentConfig {
     pub max_actions_per_hour: Option<u64>,
     /// Enable token-to-tool piped execution path.
     pub enable_piped_tool_execution: bool,
+    /// Enable speculative shadow workers.
+    pub shadow_workers_enabled: bool,
+    /// Number of follow-up prompts to precompute per turn.
+    pub shadow_max_predictions: usize,
+    /// Speculative response cache TTL.
+    pub shadow_cache_ttl: Duration,
+    /// Max concurrent speculative jobs.
+    pub shadow_max_parallel: usize,
+    /// Minimum user-input length before shadow speculation.
+    pub shadow_min_input_chars: usize,
+    /// Enable kernel monitor orchestration loop.
+    pub kernel_monitor_enabled: bool,
+    /// Kernel monitor analysis cadence.
+    pub kernel_monitor_interval: Duration,
+    /// Slow-tool threshold used by kernel monitor.
+    pub kernel_slow_threshold_ms: f64,
+    /// Auto-approve generated kernel patch proposals.
+    pub kernel_auto_approve_patches: bool,
+    /// Auto-deploy approved kernel patch proposals.
+    pub kernel_auto_deploy_patches: bool,
 }
 
 impl AgentConfig {
@@ -125,6 +145,90 @@ impl AgentConfig {
                     message: format!("must be 'true' or 'false': {e}"),
                 })?
                 .unwrap_or(settings.agent.enable_piped_tool_execution),
+            shadow_workers_enabled: optional_env("SHADOW_WORKERS_ENABLED")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "SHADOW_WORKERS_ENABLED".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(settings.agent.shadow_workers_enabled),
+            shadow_max_predictions: optional_env("SHADOW_MAX_PREDICTIONS")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "SHADOW_MAX_PREDICTIONS".to_string(),
+                    message: format!("must be a positive integer: {e}"),
+                })?
+                .unwrap_or(settings.agent.shadow_max_predictions as usize),
+            shadow_cache_ttl: Duration::from_secs(
+                optional_env("SHADOW_CACHE_TTL_SECS")?
+                    .map(|s| s.parse())
+                    .transpose()
+                    .map_err(|e| ConfigError::InvalidValue {
+                        key: "SHADOW_CACHE_TTL_SECS".to_string(),
+                        message: format!("must be a positive integer: {e}"),
+                    })?
+                    .unwrap_or(settings.agent.shadow_cache_ttl_secs),
+            ),
+            shadow_max_parallel: optional_env("SHADOW_MAX_PARALLEL")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "SHADOW_MAX_PARALLEL".to_string(),
+                    message: format!("must be a positive integer: {e}"),
+                })?
+                .unwrap_or(settings.agent.shadow_max_parallel as usize),
+            shadow_min_input_chars: optional_env("SHADOW_MIN_INPUT_CHARS")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "SHADOW_MIN_INPUT_CHARS".to_string(),
+                    message: format!("must be a positive integer: {e}"),
+                })?
+                .unwrap_or(settings.agent.shadow_min_input_chars as usize),
+            kernel_monitor_enabled: optional_env("KERNEL_MONITOR_ENABLED")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "KERNEL_MONITOR_ENABLED".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(settings.agent.kernel_monitor_enabled),
+            kernel_monitor_interval: Duration::from_secs(
+                optional_env("KERNEL_MONITOR_INTERVAL_SECS")?
+                    .map(|s| s.parse())
+                    .transpose()
+                    .map_err(|e| ConfigError::InvalidValue {
+                        key: "KERNEL_MONITOR_INTERVAL_SECS".to_string(),
+                        message: format!("must be a positive integer: {e}"),
+                    })?
+                    .unwrap_or(settings.agent.kernel_monitor_interval_secs),
+            ),
+            kernel_slow_threshold_ms: optional_env("KERNEL_SLOW_THRESHOLD_MS")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "KERNEL_SLOW_THRESHOLD_MS".to_string(),
+                    message: format!("must be a positive number: {e}"),
+                })?
+                .unwrap_or(settings.agent.kernel_slow_threshold_ms),
+            kernel_auto_approve_patches: optional_env("KERNEL_AUTO_APPROVE_PATCHES")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "KERNEL_AUTO_APPROVE_PATCHES".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(settings.agent.kernel_auto_approve_patches),
+            kernel_auto_deploy_patches: optional_env("KERNEL_AUTO_DEPLOY_PATCHES")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "KERNEL_AUTO_DEPLOY_PATCHES".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(settings.agent.kernel_auto_deploy_patches),
         })
     }
 }

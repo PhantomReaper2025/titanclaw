@@ -717,6 +717,22 @@ impl AppBuilder {
                 }
             }
 
+            match ws.sync_core_docs_safe_merge().await {
+                Ok(report) if report.changed() > 0 => {
+                    tracing::info!(
+                        "Workspace core docs refreshed (created: {}, updated: {}, skipped: {}, failed: {})",
+                        report.created,
+                        report.updated,
+                        report.skipped,
+                        report.failed
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("Failed to sync workspace core docs: {}", e);
+                }
+            }
+
             if embeddings.is_some() {
                 match ws.backfill_embeddings().await {
                     Ok(count) if count > 0 => {

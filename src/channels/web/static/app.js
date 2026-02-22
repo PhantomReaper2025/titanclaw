@@ -7,6 +7,10 @@ let chatReconnectTimer = null;
 let logReconnectTimer = null;
 let chatReconnectAttempts = 0;
 let logReconnectAttempts = 0;
+let chatWatchdogTimer = null;
+let logWatchdogTimer = null;
+let chatLastActivityAt = 0;
+let logLastActivityAt = 0;
 let currentTab = 'chat';
 let currentThreadId = null;
 let assistantThreadId = null;
@@ -19,8 +23,8 @@ const JOB_EVENTS_CAP = 500;
 const MEMORY_SEARCH_QUERY_MAX_LENGTH = 100;
 
 function reconnectDelay(attempt) {
-  const base = Math.min(30000, 1000 * Math.pow(2, Math.min(attempt, 5)));
-  const jitter = Math.floor(Math.random() * 500);
+  const base = Math.min(6000, 250 * Math.pow(1.8, Math.min(attempt, 7)));
+  const jitter = Math.floor(Math.random() * 150);
   return base + jitter;
 }
 
@@ -32,6 +36,52 @@ function scheduleChatReconnect() {
     chatReconnectAttempts += 1;
     connectSSE();
   }, delay);
+}
+
+function touchChatActivity() {
+  chatLastActivityAt = Date.now();
+}
+
+function touchLogActivity() {
+  logLastActivityAt = Date.now();
+}
+
+function forceChatReconnectNow() {
+  if (!token) return;
+  if (eventSource) eventSource.close();
+  if (chatReconnectTimer) {
+    clearTimeout(chatReconnectTimer);
+    chatReconnectTimer = null;
+  }
+  connectSSE();
+}
+
+function forceLogReconnectNow() {
+  if (!token) return;
+  if (logEventSource) logEventSource.close();
+  if (logReconnectTimer) {
+    clearTimeout(logReconnectTimer);
+    logReconnectTimer = null;
+  }
+  connectLogSSE();
+}
+
+function startSseWatchdogs() {
+  if (chatWatchdogTimer) clearInterval(chatWatchdogTimer);
+  chatWatchdogTimer = setInterval(() => {
+    if (!token || !eventSource) return;
+    const stalled = Date.now() - chatLastActivityAt > 15000;
+    const closed = eventSource.readyState === EventSource.CLOSED;
+    if (stalled || closed) scheduleChatReconnect();
+  }, 4000);
+
+  if (logWatchdogTimer) clearInterval(logWatchdogTimer);
+  logWatchdogTimer = setInterval(() => {
+    if (!token || !logEventSource) return;
+    const stalled = Date.now() - logLastActivityAt > 15000;
+    const closed = logEventSource.readyState === EventSource.CLOSED;
+    if (stalled || closed) scheduleLogReconnect();
+  }, 4000);
 }
 
 function scheduleLogReconnect() {
@@ -65,6 +115,7 @@ function authenticate() {
       window.history.replaceState({}, '', cleaned.pathname + cleaned.search);
       connectSSE();
       connectLogSSE();
+      startSseWatchdogs();
       startGatewayStatusPolling();
       loadThreads();
       loadMemoryTree();
@@ -102,6 +153,18 @@ document.getElementById('token-input').addEventListener('keydown', (e) => {
   }
 })();
 
+window.addEventListener('online', () => {
+  forceChatReconnectNow();
+  forceLogReconnectNow();
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    forceChatReconnectNow();
+    forceLogReconnectNow();
+  }
+});
+
 // --- API helper ---
 
 function apiFetch(path, options) {
@@ -128,14 +191,17 @@ function connectSSE() {
   }
 
   eventSource = new EventSource('/api/chat/events?token=' + encodeURIComponent(token));
+  touchChatActivity();
 
   eventSource.onopen = () => {
+    touchChatActivity();
     chatReconnectAttempts = 0;
     document.getElementById('sse-dot').classList.remove('disconnected');
     document.getElementById('sse-status').textContent = 'Connected';
   };
 
   eventSource.onerror = () => {
+    touchChatActivity();
     document.getElementById('sse-dot').classList.add('disconnected');
     document.getElementById('sse-status').textContent = 'Reconnecting...';
     // EventSource has native retry, but some startup/network interruption
@@ -144,6 +210,7 @@ function connectSSE() {
   };
 
   eventSource.addEventListener('response', (e) => {
+    touchChatActivity();
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
     addMessage('assistant', data.content);
@@ -154,18 +221,21 @@ function connectSSE() {
   });
 
   eventSource.addEventListener('thinking', (e) => {
+    touchChatActivity();
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
     setStatus(data.message, true);
   });
 
   eventSource.addEventListener('tool_started', (e) => {
+    touchChatActivity();
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
     setStatus('Running tool: ' + data.name, true);
   });
 
   eventSource.addEventListener('tool_completed', (e) => {
+    touchChatActivity();
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
     const icon = data.success ? '\u2713' : '\u2717';
@@ -173,12 +243,14 @@ function connectSSE() {
   });
 
   eventSource.addEventListener('stream_chunk', (e) => {
+    touchChatActivity();
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
     appendToLastAssistant(data.content);
   });
 
   eventSource.addEventListener('status', (e) => {
+    touchChatActivity();
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
     setStatus(data.message);
@@ -191,21 +263,25 @@ function connectSSE() {
   });
 
   eventSource.addEventListener('job_started', (e) => {
+    touchChatActivity();
     const data = JSON.parse(e.data);
     showJobCard(data);
   });
 
   eventSource.addEventListener('approval_needed', (e) => {
+    touchChatActivity();
     const data = JSON.parse(e.data);
     showApproval(data);
   });
 
   eventSource.addEventListener('auth_required', (e) => {
+    touchChatActivity();
     const data = JSON.parse(e.data);
     showAuthCard(data);
   });
 
   eventSource.addEventListener('auth_completed', (e) => {
+    touchChatActivity();
     const data = JSON.parse(e.data);
     removeAuthCard(data.extension_name);
     showToast(data.message, 'success');
@@ -213,6 +289,7 @@ function connectSSE() {
   });
 
   eventSource.addEventListener('error', (e) => {
+    touchChatActivity();
     if (e.data) {
       const data = JSON.parse(e.data);
       if (!isCurrentThread(data.thread_id)) return;
@@ -754,7 +831,19 @@ function loadThreads() {
       const meta = document.createElement('span');
       meta.className = 'thread-meta';
       meta.textContent = (thread.turn_count || 0) + ' turns';
-      item.appendChild(meta);
+      const actions = document.createElement('div');
+      actions.className = 'thread-actions';
+      actions.appendChild(meta);
+      const delBtn = document.createElement('button');
+      delBtn.className = 'thread-delete-btn';
+      delBtn.textContent = 'Delete';
+      delBtn.title = 'Delete this chat thread';
+      delBtn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        deleteThread(thread.id, thread.title || thread.id.substring(0, 8));
+      });
+      actions.appendChild(delBtn);
+      item.appendChild(actions);
       item.addEventListener('click', () => switchThread(thread.id));
       list.appendChild(item);
     }
@@ -792,6 +881,34 @@ function createNewThread() {
   }).catch((err) => {
     showToast('Failed to create thread: ' + err.message, 'error');
   });
+}
+
+function deleteThread(threadId, title) {
+  if (!confirm('Delete chat "' + title + '"? This cannot be undone.')) return;
+  apiFetch('/api/chat/thread/' + encodeURIComponent(threadId), { method: 'DELETE' })
+    .then((data) => {
+      if (currentThreadId === threadId) {
+        currentThreadId = data.active_thread || assistantThreadId || null;
+        loadHistory();
+      }
+      loadThreads();
+      showToast('Thread deleted', 'success');
+    })
+    .catch((err) => showToast('Delete failed: ' + err.message, 'error'));
+}
+
+function clearAllChats() {
+  if (!confirm('Delete ALL chat threads? This cannot be undone.')) return;
+  apiFetch('/api/chat/threads', { method: 'DELETE' })
+    .then((data) => {
+      currentThreadId = data.assistant_thread || null;
+      document.getElementById('chat-messages').innerHTML = '';
+      hasMore = false;
+      oldestTimestamp = null;
+      loadThreads();
+      showToast('All chats cleared', 'success');
+    })
+    .catch((err) => showToast('Clear failed: ' + err.message, 'error'));
 }
 
 function toggleThreadSidebar() {
@@ -1104,12 +1221,15 @@ function connectLogSSE() {
   }
 
   logEventSource = new EventSource('/api/logs/events?token=' + encodeURIComponent(token));
+  touchLogActivity();
 
   logEventSource.onopen = () => {
+    touchLogActivity();
     logReconnectAttempts = 0;
   };
 
   logEventSource.addEventListener('log', (e) => {
+    touchLogActivity();
     const entry = JSON.parse(e.data);
     if (logsPaused) {
       logBuffer.push(entry);
@@ -1119,6 +1239,7 @@ function connectLogSSE() {
   });
 
   logEventSource.onerror = () => {
+    touchLogActivity();
     // EventSource retries automatically, but force recreate on repeated errors.
     scheduleLogReconnect();
   };
@@ -1369,11 +1490,26 @@ function loadJobs() {
   const container = document.querySelector('.jobs-container');
   if (!document.getElementById('jobs-summary')) {
     container.innerHTML =
-      '<div class="jobs-summary" id="jobs-summary"></div>'
+      '<div class="jobs-create" id="jobs-create">'
+      + '<input id="job-create-task" type="text" placeholder="Describe the job to run in sandbox..." />'
+      + '<select id="job-create-mode">'
+      + '<option value="worker">Worker</option>'
+      + '<option value="claude_code">Claude Code</option>'
+      + '<option value="opencode">OpenCode</option>'
+      + '</select>'
+      + '<button id="job-create-btn" class="btn-restart">Create Job</button>'
+      + '</div>'
+      + '<div class="jobs-summary" id="jobs-summary"></div>'
       + '<table class="jobs-table" id="jobs-table"><thead><tr>'
       + '<th>ID</th><th>Title</th><th>Status</th><th>Created</th><th>Actions</th>'
       + '</tr></thead><tbody id="jobs-tbody"></tbody></table>'
       + '<div class="empty-state" id="jobs-empty" style="display:none">No jobs found</div>';
+  }
+
+  const createBtn = document.getElementById('job-create-btn');
+  if (createBtn && !createBtn.dataset.bound) {
+    createBtn.dataset.bound = '1';
+    createBtn.addEventListener('click', createJobFromUI);
   }
 
   Promise.all([
@@ -1457,6 +1593,30 @@ function restartJob(jobId) {
     });
 }
 
+function createJobFromUI() {
+  const taskEl = document.getElementById('job-create-task');
+  const modeEl = document.getElementById('job-create-mode');
+  if (!taskEl || !modeEl) return;
+
+  const task = (taskEl.value || '').trim();
+  const mode = modeEl.value || 'worker';
+  if (!task) {
+    showToast('Task is required', 'error');
+    return;
+  }
+
+  apiFetch('/api/jobs', {
+    method: 'POST',
+    body: JSON.stringify({ task, mode }),
+  }).then((res) => {
+    showToast('Job started: ' + (res.job_id || '').substring(0, 8), 'success');
+    taskEl.value = '';
+    loadJobs();
+  }).catch((err) => {
+    showToast('Failed to create job: ' + err.message, 'error');
+  });
+}
+
 function openJobDetail(jobId) {
   currentJobId = jobId;
   currentJobSubTab = 'activity';
@@ -1494,6 +1654,8 @@ function renderJobDetail(job) {
   if (job.browse_url) {
     headerHtml += '<a class="btn-browse" href="' + escapeHtml(job.browse_url) + '" target="_blank">Browse Files</a>';
   }
+  headerHtml += '<a class="btn-browse" href="/api/jobs/' + encodeURIComponent(job.id)
+    + '/files/download?token=' + encodeURIComponent(token) + '" target="_blank">Download Archive</a>';
 
   header.innerHTML = headerHtml;
   container.appendChild(header);
@@ -2206,6 +2368,8 @@ window.addEventListener('beforeunload', () => {
   if (logEventSource) logEventSource.close();
   if (chatReconnectTimer) clearTimeout(chatReconnectTimer);
   if (logReconnectTimer) clearTimeout(logReconnectTimer);
+  if (chatWatchdogTimer) clearInterval(chatWatchdogTimer);
+  if (logWatchdogTimer) clearInterval(logWatchdogTimer);
 });
 
 // --- Utilities ---

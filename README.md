@@ -49,14 +49,20 @@ Based on `implementation_plan.md`, this is where the upgrade stands today.
 - Secure WASM tool sandbox with capability gates and outbound allowlists
 - Dynamic tool creation pipeline for runtime expansion
 - Web gateway with WebSocket + SSE for real-time interaction
+- Jobs tab now supports direct manual job creation (task + mode) for faster sandbox testing
 - Routines/automation engine for scheduled and event-driven tasks
+- Full-job routines execute through the real scheduler pipeline (multi-step), not lightweight fallback
 - Docker-isolated workers for higher-risk or heavier executions
 - First-run Docker image preflight + auto-pull for container jobs
+- One-click sandbox artifact export as downloadable archive from the Jobs UI
+- Web chat lifecycle controls (delete single thread, clear all chats)
 - OpenAI-compatible API endpoints for external integration
 - LLM-bypassed fast-path for common job ops in natural language
 - Persistent reflex pattern routing from recurring prompts to compiled tools
 - AST graph symbol query via `memory_graph` for indexed Rust code relationships (with bounded multi-hop traversal)
 - Live shell command draft previews from streamed tool-call deltas (`[draft] ...`)
+- Shadow-worker speculative response cache for likely follow-up prompts (bounded + TTL)
+- Kernel monitor runtime loop for slow-tool detection with optional JIT patch deploy pipeline
 
 ### Current TODO
 
@@ -110,6 +116,36 @@ cargo build --release
 ./target/release/titanclaw run
 ```
 
+Onboarding captures default sandbox coding runtime and OpenCode model defaults. OpenCode mode now runs through a dedicated bridge runtime (`opencode-bridge`) in sandbox jobs.
+
+Advanced runtime knobs:
+
+- `SHADOW_WORKERS_ENABLED` (`true`/`false`)
+- `SHADOW_MAX_PREDICTIONS` (default `3`)
+- `SHADOW_CACHE_TTL_SECS` (default `900`)
+- `SHADOW_MAX_PARALLEL` (default `2`)
+- `KERNEL_MONITOR_ENABLED` (`true`/`false`)
+- `KERNEL_MONITOR_INTERVAL_SECS` (default `180`)
+- `KERNEL_SLOW_THRESHOLD_MS` (default `5000`)
+- `KERNEL_AUTO_APPROVE_PATCHES` (`true`/`false`)
+- `KERNEL_AUTO_DEPLOY_PATCHES` (`true`/`false`)
+
+Kernel patch management interfaces:
+
+- Tool: `kernel_patch` (`list|approve|reject|deploy`)
+- Chat command (all channels, including Telegram): `/kernel list`, `/kernel approve <uuid>`, `/kernel reject <uuid>`, `/kernel deploy <uuid>`
+- Gateway API:
+  - `GET /api/kernel/patches`
+  - `POST /api/kernel/patches/{id}/approve`
+  - `POST /api/kernel/patches/{id}/reject`
+  - `POST /api/kernel/patches/{id}/deploy`
+
+### Getting Generated Projects Out Of Sandbox
+
+- Open the Jobs tab in the web UI.
+- Open any job detail and click `Download Archive` to export project output to your machine.
+- You can still use `Browse Files` for direct host-path browsing.
+
 ### Useful Commands
 
 ```bash
@@ -120,10 +156,14 @@ cargo build --release
 # Tool and memory management
 ./target/release/titanclaw tool --help
 ./target/release/titanclaw memory --help
+./target/release/titanclaw memory bootstrap --dry-run
+./target/release/titanclaw memory bootstrap
 
 # Service management
 ./target/release/titanclaw service --help
 ```
+
+On startup, TitanClaw now safely refreshes core workspace docs (`AGENTS.md`, `IDENTITY.md`, `SOUL.md`, `USER.md`, `MEMORY.md`, `HEARTBEAT.md`, `README.md`) when they are missing, legacy, or managed-and-outdated.
 
 ### Swarm Mesh (Experimental)
 
@@ -175,6 +215,8 @@ cargo fmt
 cargo clippy --all --benches --tests --examples --all-features
 cargo test
 ```
+
+`Dockerfile.worker` now installs both Claude Code and OpenCode CLIs for sandbox runtime selection.
 
 If you modify channel source packages, run `./scripts/build-all.sh` before a release build.
 

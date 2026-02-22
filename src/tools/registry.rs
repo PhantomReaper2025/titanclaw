@@ -17,10 +17,11 @@ use crate::skills::registry::SkillRegistry;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
 use crate::tools::builtin::{
     ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, HttpTool, JobEventsTool, JobPromptTool,
-    JobStatusTool, JsonTool, ListDirTool, ListJobsTool, MemoryGraphTool, MemoryReadTool,
-    MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool, ShellTool,
-    SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool, ToolActivateTool,
-    ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool, WriteFileTool,
+    JobStatusTool, JsonTool, KernelPatchTool, ListDirTool, ListJobsTool, MemoryGraphTool,
+    MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool,
+    ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool,
+    ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
+    WriteFileTool,
 };
 use crate::tools::tool::{Tool, ToolDomain};
 use crate::tools::wasm::{
@@ -67,6 +68,7 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "skill_search",
     "skill_install",
     "skill_remove",
+    "kernel_patch",
 ];
 
 /// Registry of available tools.
@@ -234,6 +236,15 @@ impl ToolRegistry {
     pub fn register_jit_tool(&self, runtime: Arc<crate::tools::wasm::WasmToolRuntime>) {
         self.register_sync(Arc::new(crate::tools::builtin::JitWasmTool::new(runtime)));
         tracing::info!("Registered JIT WASM tool");
+    }
+
+    /// Register kernel self-modification management tools.
+    pub fn register_kernel_tools(
+        &self,
+        orchestrator: Arc<crate::agent::kernel_orchestrator::KernelOrchestrator>,
+    ) {
+        self.register_sync(Arc::new(KernelPatchTool::new(orchestrator)));
+        tracing::info!("Registered kernel management tools");
     }
 
     /// Register memory tools with a workspace.

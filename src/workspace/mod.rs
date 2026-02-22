@@ -49,6 +49,7 @@ pub mod hygiene;
 #[cfg(feature = "postgres")]
 mod repository;
 mod search;
+mod templates;
 
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{MemoryChunk, MemoryDocument, WorkspaceEntry, paths};
@@ -66,6 +67,10 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::WorkspaceError;
+use templates::{
+    CORE_DOC_MARKER_PREFIX, CORE_DOC_TEMPLATE_VERSION, HEARTBEAT_SEED_BODY, core_doc_templates,
+    render_template_content,
+};
 
 /// Internal storage abstraction for Workspace.
 ///
@@ -247,22 +252,26 @@ impl WorkspaceStorage {
     }
 }
 
-/// Default template seeded into HEARTBEAT.md on first access.
-///
-/// Intentionally comment-only so the heartbeat runner treats it as
-/// "effectively empty" and skips the LLM call until the user adds
-/// real tasks.
-const HEARTBEAT_SEED: &str = "\
-# Heartbeat Checklist
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CoreDocsSyncOptions {
+    pub dry_run: bool,
+    pub force: bool,
+}
 
-<!-- Keep this file empty to skip heartbeat API calls.
-     Add tasks below when you want the agent to check something periodically.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CoreDocsSyncReport {
+    pub created: usize,
+    pub updated: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub dry_run: bool,
+}
 
-     Example:
-     - [ ] Check for unread emails needing a reply
-     - [ ] Review today's calendar for upcoming meetings
-     - [ ] Check CI build status for main branch
--->";
+impl CoreDocsSyncReport {
+    pub fn changed(&self) -> usize {
+        self.created + self.updated
+    }
+}
 
 /// Workspace provides database-backed memory storage for an agent.
 ///
@@ -481,7 +490,9 @@ impl Workspace {
     pub async fn heartbeat_checklist(&self) -> Result<Option<String>, WorkspaceError> {
         match self.read(paths::HEARTBEAT).await {
             Ok(doc) => Ok(Some(doc.content)),
-            Err(WorkspaceError::DocumentNotFound { .. }) => Ok(Some(HEARTBEAT_SEED.to_string())),
+            Err(WorkspaceError::DocumentNotFound { .. }) => {
+                Ok(Some(render_seed_heartbeat_checklist()))
+            }
             Err(e) => Err(e),
         }
     }
@@ -792,78 +803,21 @@ impl Workspace {
     /// so user edits are never overwritten. Returns the number of files
     /// created (0 if all core files already existed).
     pub async fn seed_if_empty(&self) -> Result<usize, WorkspaceError> {
-        let seed_files: &[(&str, &str)] = &[
-            (
-                paths::README,
-                "# Workspace\n\n\
-                 This is your agent's persistent memory. Files here are indexed for search\n\
-                 and used to build the agent's context.\n\n\
-                 ## Structure\n\n\
-                 - `MEMORY.md` - Long-term notes and facts worth remembering\n\
-                 - `IDENTITY.md` - Agent name, nature, personality\n\
-                 - `SOUL.md` - Core values and principles\n\
-                 - `AGENTS.md` - Behavior instructions for the agent\n\
-                 - `USER.md` - Information about you (the user)\n\
-                 - `HEARTBEAT.md` - Periodic background task checklist\n\
-                 - `daily/` - Automatic daily session logs\n\
-                 - `context/` - Additional context documents\n\n\
-                 Edit these files to shape how your agent thinks and acts.",
-            ),
-            (
-                paths::MEMORY,
-                "# Memory\n\n\
-                 Long-term notes, decisions, and facts worth remembering.\n\
-                 The agent appends here during conversations.",
-            ),
-            (
-                paths::IDENTITY,
-                "# Identity\n\n\
-                 Name: IronClaw\n\
-                 Nature: A secure personal AI assistant\n\n\
-                 Edit this file to give your agent a custom name and personality.",
-            ),
-            (
-                paths::SOUL,
-                "# Core Values\n\n\
-                 - Protect user privacy and data security above all else\n\
-                 - Be honest about limitations and uncertainty\n\
-                 - Prefer action over lengthy deliberation\n\
-                 - Ask for clarification rather than guessing on important decisions\n\
-                 - Learn from mistakes and remember lessons",
-            ),
-            (
-                paths::AGENTS,
-                "# Agent Instructions\n\n\
-                 You are a personal AI assistant with access to tools and persistent memory.\n\n\
-                 ## Guidelines\n\n\
-                 - Always search memory before answering questions about prior conversations\n\
-                 - Write important facts and decisions to memory for future reference\n\
-                 - Use the daily log for session-level notes\n\
-                 - Be concise but thorough",
-            ),
-            (
-                paths::USER,
-                "# User Context\n\n\
-                 The agent will fill this in as it learns about you.\n\
-                 You can also edit this directly to provide context upfront.",
-            ),
-            (paths::HEARTBEAT, HEARTBEAT_SEED),
-        ];
-
         let mut count = 0;
-        for (path, content) in seed_files {
+        for template in core_doc_templates() {
             // Skip files that already exist (never overwrite user edits)
-            match self.read(path).await {
+            match self.read(template.path).await {
                 Ok(_) => continue,
                 Err(WorkspaceError::DocumentNotFound { .. }) => {}
                 Err(e) => {
-                    tracing::warn!("Failed to check {}: {}", path, e);
+                    tracing::warn!("Failed to check {}: {}", template.path, e);
                     continue;
                 }
             }
 
-            if let Err(e) = self.write(path, content).await {
-                tracing::warn!("Failed to seed {}: {}", path, e);
+            let content = render_template_content(template);
+            if let Err(e) = self.write(template.path, &content).await {
+                tracing::warn!("Failed to seed {}: {}", template.path, e);
             } else {
                 count += 1;
             }
@@ -873,6 +827,67 @@ impl Workspace {
             tracing::info!("Seeded {} workspace files", count);
         }
         Ok(count)
+    }
+
+    /// Sync core workspace docs using conservative, non-destructive rules.
+    ///
+    /// Creates missing files and upgrades only files that match known legacy
+    /// templates, are empty, or carry an older managed marker.
+    pub async fn sync_core_docs(
+        &self,
+        options: CoreDocsSyncOptions,
+    ) -> Result<CoreDocsSyncReport, WorkspaceError> {
+        let mut report = CoreDocsSyncReport {
+            dry_run: options.dry_run,
+            ..CoreDocsSyncReport::default()
+        };
+
+        for template in core_doc_templates() {
+            let target = render_template_content(template);
+            match self.read(template.path).await {
+                Ok(existing) => {
+                    let should_update = should_refresh_core_doc(
+                        template.path,
+                        &existing.content,
+                        &target,
+                        template.legacy_exact,
+                        options.force,
+                    );
+                    if should_update {
+                        if options.dry_run {
+                            report.updated += 1;
+                        } else if let Err(e) = self.write(template.path, &target).await {
+                            report.failed += 1;
+                            tracing::warn!("Failed to refresh {}: {}", template.path, e);
+                        } else {
+                            report.updated += 1;
+                        }
+                    } else {
+                        report.skipped += 1;
+                    }
+                }
+                Err(WorkspaceError::DocumentNotFound { .. }) => {
+                    if options.dry_run {
+                        report.created += 1;
+                    } else if let Err(e) = self.write(template.path, &target).await {
+                        report.failed += 1;
+                        tracing::warn!("Failed to create {}: {}", template.path, e);
+                    } else {
+                        report.created += 1;
+                    }
+                }
+                Err(e) => {
+                    report.failed += 1;
+                    tracing::warn!("Failed to read {} during sync: {}", template.path, e);
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    pub async fn sync_core_docs_safe_merge(&self) -> Result<CoreDocsSyncReport, WorkspaceError> {
+        self.sync_core_docs(CoreDocsSyncOptions::default()).await
     }
 
     /// Generate embeddings for chunks that don't have them yet.
@@ -933,6 +948,100 @@ fn normalize_directory(path: &str) -> String {
     path.trim_end_matches('/').to_string()
 }
 
+fn render_seed_heartbeat_checklist() -> String {
+    let heartbeat = core_doc_templates()
+        .iter()
+        .find(|t| t.path == paths::HEARTBEAT)
+        .map(render_template_content);
+    heartbeat.unwrap_or_else(|| {
+        format!(
+            "{} version={} path={} -->\n\n{}",
+            CORE_DOC_MARKER_PREFIX,
+            CORE_DOC_TEMPLATE_VERSION,
+            paths::HEARTBEAT,
+            HEARTBEAT_SEED_BODY
+        )
+    })
+}
+
+fn canonicalize_for_match(content: &str) -> String {
+    content
+        .lines()
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn is_outdated_managed_core_doc(content: &str) -> bool {
+    let Some(first) = content.lines().next() else {
+        return false;
+    };
+    if !first.starts_with(CORE_DOC_MARKER_PREFIX) {
+        return false;
+    }
+    !first.contains(&format!("version={}", CORE_DOC_TEMPLATE_VERSION))
+}
+
+fn should_refresh_core_doc(
+    path: &str,
+    existing: &str,
+    target: &str,
+    legacy_exact: &[&str],
+    force: bool,
+) -> bool {
+    if force {
+        return canonicalize_for_match(existing) != canonicalize_for_match(target);
+    }
+
+    if existing.trim().is_empty() {
+        return true;
+    }
+
+    let existing_canonical = canonicalize_for_match(existing);
+    if existing_canonical == canonicalize_for_match(target) {
+        return false;
+    }
+
+    if is_outdated_managed_core_doc(existing) {
+        return true;
+    }
+
+    if legacy_exact
+        .iter()
+        .any(|legacy| canonicalize_for_match(legacy) == existing_canonical)
+    {
+        return true;
+    }
+
+    if path == paths::HEARTBEAT {
+        let mut in_comment_block = false;
+        let mut has_non_comment_content = false;
+        for raw in existing.lines() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.contains("<!--") {
+                in_comment_block = true;
+            }
+            if !in_comment_block && !line.starts_with('#') {
+                has_non_comment_content = true;
+                break;
+            }
+            if line.contains("-->") {
+                in_comment_block = false;
+            }
+        }
+        if !has_non_comment_content {
+            return true;
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -952,5 +1061,31 @@ mod tests {
         assert_eq!(normalize_directory("foo/bar"), "foo/bar");
         assert_eq!(normalize_directory("/"), "");
         assert_eq!(normalize_directory(""), "");
+    }
+
+    #[test]
+    fn test_should_refresh_core_doc_for_legacy() {
+        let target = "<!-- titanclaw:core-doc version=2 path=README.md -->\n\n# New";
+        let legacy = "# Old";
+        assert!(should_refresh_core_doc(
+            "README.md",
+            legacy,
+            target,
+            &[legacy],
+            false
+        ));
+    }
+
+    #[test]
+    fn test_should_refresh_core_doc_for_outdated_managed_marker() {
+        let existing = "<!-- titanclaw:core-doc version=1 path=README.md -->\n\n# Old";
+        let target = "<!-- titanclaw:core-doc version=2 path=README.md -->\n\n# New";
+        assert!(should_refresh_core_doc(
+            "README.md",
+            existing,
+            target,
+            &[],
+            false
+        ));
     }
 }

@@ -260,6 +260,46 @@ async fn main() -> anyhow::Result<()> {
 
             return Ok(());
         }
+        Some(Command::OpenCodeBridge {
+            job_id,
+            orchestrator_url,
+            max_turns,
+            model,
+        }) => {
+            // OpenCode bridge mode: runs inside a Docker container.
+            // Spawns the `opencode` CLI and streams output to the orchestrator.
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new("ironclaw=info")),
+                )
+                .init();
+
+            tracing::info!(
+                "Starting OpenCode bridge for job {} (orchestrator: {}, model: {})",
+                job_id,
+                orchestrator_url,
+                model
+            );
+
+            let config = ironclaw::worker::opencode_bridge::OpenCodeBridgeConfig {
+                job_id: *job_id,
+                orchestrator_url: orchestrator_url.clone(),
+                max_turns: *max_turns,
+                model: model.clone(),
+                timeout: std::time::Duration::from_secs(1800),
+            };
+
+            let runtime = ironclaw::worker::OpenCodeBridgeRuntime::new(config)
+                .map_err(|e| anyhow::anyhow!("OpenCode bridge init failed: {}", e))?;
+
+            runtime
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!("OpenCode bridge failed: {}", e))?;
+
+            return Ok(());
+        }
         Some(Command::Onboard {
             skip_auth,
             channels_only,
@@ -686,6 +726,24 @@ async fn main() -> anyhow::Result<()> {
     tools.register_builtin_tools();
     tracing::info!("Registered {} built-in tools", tools.count());
 
+    let kernel_monitor = Arc::new(
+        ironclaw::agent::kernel_monitor::KernelMonitor::new()
+            .with_threshold(config.agent.kernel_slow_threshold_ms),
+    );
+    let kernel_orchestrator = Arc::new(
+        ironclaw::agent::kernel_orchestrator::KernelOrchestrator::new(
+            ironclaw::agent::kernel_orchestrator::KernelOrchestratorConfig {
+                enabled: config.agent.kernel_monitor_enabled,
+                interval: config.agent.kernel_monitor_interval,
+                auto_approve: config.agent.kernel_auto_approve_patches,
+                auto_deploy: config.agent.kernel_auto_deploy_patches,
+            },
+            Arc::clone(&kernel_monitor),
+            Arc::clone(&tools),
+        ),
+    );
+    tools.register_kernel_tools(Arc::clone(&kernel_orchestrator));
+
     // Create embeddings provider if configured
     let embeddings: Option<Arc<dyn EmbeddingProvider>> = if config.embeddings.enabled {
         match config.embeddings.provider.as_str() {
@@ -765,6 +823,10 @@ async fn main() -> anyhow::Result<()> {
         } else {
             None
         };
+
+    if let Some(ref runtime) = wasm_tool_runtime {
+        tools.register_jit_tool(Arc::clone(runtime));
+    }
 
     // Load WASM tools and MCP servers concurrently.
     // Both register into the shared ToolRegistry (RwLock-based) so concurrent writes are safe.
@@ -1252,6 +1314,22 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!("Failed to seed workspace: {}", e);
             }
         }
+
+        match ws.sync_core_docs_safe_merge().await {
+            Ok(report) if report.changed() > 0 => {
+                tracing::info!(
+                    "Workspace core docs refreshed (created: {}, updated: {}, skipped: {}, failed: {})",
+                    report.created,
+                    report.updated,
+                    report.skipped,
+                    report.failed
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("Failed to sync workspace core docs: {}", e);
+            }
+        }
     }
 
     // Backfill embeddings if we just enabled the provider
@@ -1319,6 +1397,7 @@ async fn main() -> anyhow::Result<()> {
         gw = gw.with_session_manager(Arc::clone(&session_manager));
         gw = gw.with_log_broadcaster(Arc::clone(&log_broadcaster));
         gw = gw.with_tool_registry(Arc::clone(&tools));
+        gw = gw.with_kernel_orchestrator(Arc::clone(&kernel_orchestrator));
         if let Some(ref ext_mgr) = extension_manager {
             gw = gw.with_extension_manager(Arc::clone(ext_mgr));
         }
@@ -1557,6 +1636,16 @@ async fn main() -> anyhow::Result<()> {
             max_actions_per_hour: config.agent.max_actions_per_hour,
         },
     ));
+    let shadow_llm = cheap_llm.clone().unwrap_or_else(|| llm.clone());
+    let shadow_engine = Arc::new(ironclaw::agent::shadow_engine::ShadowEngine::new(
+        config.agent.shadow_workers_enabled,
+        shadow_llm,
+        config.agent.shadow_cache_ttl,
+        config.agent.shadow_max_predictions,
+        config.agent.shadow_min_input_chars,
+        config.agent.shadow_max_parallel,
+    ));
+
     let deps = AgentDeps {
         store: db,
         llm,
@@ -1571,6 +1660,10 @@ async fn main() -> anyhow::Result<()> {
         cost_guard,
         swarm_handle: swarm_handle.clone(),
         swarm_results: swarm_result_router.clone(),
+        container_job_manager: container_job_manager.clone(),
+        single_message_mode: cli.message.is_some(),
+        kernel_orchestrator: Some(Arc::clone(&kernel_orchestrator)),
+        shadow_engine: Some(shadow_engine),
     };
     let agent = Agent::new(
         config.agent.clone(),

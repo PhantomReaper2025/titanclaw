@@ -87,6 +87,7 @@ impl GatewayChannel {
             llm_provider: None,
             skill_registry: None,
             skill_catalog: None,
+            kernel_orchestrator: None,
             chat_rate_limiter: server::RateLimiter::new(30, 60),
         });
 
@@ -116,6 +117,7 @@ impl GatewayChannel {
             llm_provider: self.state.llm_provider.clone(),
             skill_registry: self.state.skill_registry.clone(),
             skill_catalog: self.state.skill_catalog.clone(),
+            kernel_orchestrator: self.state.kernel_orchestrator.clone(),
             chat_rate_limiter: server::RateLimiter::new(30, 60),
         };
         mutate(&mut new_state);
@@ -195,6 +197,15 @@ impl GatewayChannel {
     /// Inject the LLM provider for OpenAI-compatible API proxy.
     pub fn with_llm_provider(mut self, llm: Arc<dyn crate::llm::LlmProvider>) -> Self {
         self.rebuild_state(|s| s.llm_provider = Some(llm));
+        self
+    }
+
+    /// Inject the kernel orchestrator for patch management API.
+    pub fn with_kernel_orchestrator(
+        mut self,
+        ko: Arc<crate::agent::kernel_orchestrator::KernelOrchestrator>,
+    ) -> Self {
+        self.rebuild_state(|s| s.kernel_orchestrator = Some(ko));
         self
     }
 

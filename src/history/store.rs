@@ -1498,6 +1498,42 @@ impl Store {
         Ok(row.is_some())
     }
 
+    /// Delete one conversation for a specific user.
+    ///
+    /// Returns true when a row was deleted.
+    pub async fn delete_conversation_for_user(
+        &self,
+        conversation_id: Uuid,
+        user_id: &str,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.conn().await?;
+        let affected = conn
+            .execute(
+                "DELETE FROM conversations WHERE id = $1 AND user_id = $2",
+                &[&conversation_id, &user_id],
+            )
+            .await?;
+        Ok(affected > 0)
+    }
+
+    /// Delete all conversations for a given user and channel.
+    ///
+    /// Returns the number of deleted rows.
+    pub async fn delete_all_conversations_for_user_channel(
+        &self,
+        user_id: &str,
+        channel: &str,
+    ) -> Result<u64, DatabaseError> {
+        let conn = self.conn().await?;
+        let affected = conn
+            .execute(
+                "DELETE FROM conversations WHERE user_id = $1 AND channel = $2",
+                &[&user_id, &channel],
+            )
+            .await?;
+        Ok(affected)
+    }
+
     /// Load messages for a conversation with cursor-based pagination.
     ///
     /// Returns `(messages_oldest_first, has_more)`.

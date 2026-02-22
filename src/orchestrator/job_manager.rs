@@ -24,6 +24,8 @@ pub enum JobMode {
     Worker,
     /// Claude Code bridge that spawns the `claude` CLI directly.
     ClaudeCode,
+    /// OpenCode bridge runtime.
+    OpenCode,
 }
 
 impl JobMode {
@@ -31,6 +33,7 @@ impl JobMode {
         match self {
             Self::Worker => "worker",
             Self::ClaudeCode => "claude_code",
+            Self::OpenCode => "opencode",
         }
     }
 }
@@ -226,6 +229,19 @@ impl ContainerJobManager {
         }
     }
 
+    /// Returns true if Claude Code mode has credentials configured.
+    pub fn claude_code_available(&self) -> bool {
+        self.config
+            .claude_code_api_key
+            .as_ref()
+            .is_some_and(|v| !v.trim().is_empty())
+            || self
+                .config
+                .claude_code_oauth_token
+                .as_ref()
+                .is_some_and(|v| !v.trim().is_empty())
+    }
+
     /// Get or create a Docker connection.
     async fn docker(&self) -> Result<bollard::Docker, OrchestratorError> {
         {
@@ -396,11 +412,19 @@ impl ContainerJobManager {
                     self.config.claude_code_allowed_tools.join(",")
                 ));
             }
+        } else if mode == JobMode::OpenCode {
+            env_vec.push("CODING_RUNTIME=opencode".to_string());
+            if let Ok(model) = std::env::var("OPENCODE_MODEL_DEFAULT")
+                && !model.trim().is_empty()
+            {
+                env_vec.push(format!("OPENCODE_MODEL={}", model));
+            }
         }
 
         // Memory limit: Claude Code gets more memory
         let memory_mb = match mode {
             JobMode::ClaudeCode => self.config.claude_code_memory_limit_mb,
+            JobMode::OpenCode => self.config.claude_code_memory_limit_mb,
             JobMode::Worker => self.config.memory_limit_mb,
         };
 
@@ -445,6 +469,20 @@ impl ContainerJobManager {
                 "--model".to_string(),
                 self.config.claude_code_model.clone(),
             ],
+            JobMode::OpenCode => vec![
+                "opencode-bridge".to_string(),
+                "--job-id".to_string(),
+                job_id.to_string(),
+                "--orchestrator-url".to_string(),
+                orchestrator_url,
+                "--max-turns".to_string(),
+                self.config.claude_code_max_turns.to_string(),
+                "--model".to_string(),
+                std::env::var("OPENCODE_MODEL_DEFAULT")
+                    .ok()
+                    .filter(|m| !m.trim().is_empty())
+                    .unwrap_or_else(|| "openai/gpt-4.1-mini".to_string()),
+            ],
         };
 
         let container_config = Config {
@@ -460,6 +498,7 @@ impl ContainerJobManager {
         let container_name = match mode {
             JobMode::Worker => format!("ironclaw-worker-{}", job_id),
             JobMode::ClaudeCode => format!("ironclaw-claude-{}", job_id),
+            JobMode::OpenCode => format!("ironclaw-opencode-{}", job_id),
         };
         let options = CreateContainerOptions {
             name: container_name,

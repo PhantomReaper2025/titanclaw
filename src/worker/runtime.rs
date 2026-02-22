@@ -246,21 +246,11 @@ Work independently to complete this job. Report when done."#,
             reason_ctx.available_tools = self.tools.tool_definitions().await;
 
             // Ask the LLM what to do next
-            let selections = reasoning.select_tools(reason_ctx).await.map_err(|e| {
-                WorkerError::ExecutionFailed {
-                    reason: format!("tool selection failed: {}", e),
-                }
-            })?;
+            let selections = self.select_tools_with_retry(reasoning, reason_ctx).await?;
 
             if selections.is_empty() {
                 // No tools selected, try direct response
-                let respond_result =
-                    reasoning
-                        .respond_with_tools(reason_ctx)
-                        .await
-                        .map_err(|e| WorkerError::ExecutionFailed {
-                            reason: format!("respond_with_tools failed: {}", e),
-                        })?;
+                let respond_result = self.respond_with_tools_retry(reasoning, reason_ctx).await?;
 
                 match respond_result.result {
                     RespondResult::Text(response) => {
@@ -388,7 +378,10 @@ Work independently to complete this job. Report when done."#,
         }
 
         Err(WorkerError::ExecutionFailed {
-            reason: format!("max iterations ({}) exceeded", max_iterations),
+            reason: format!(
+                "max iterations ({}) exceeded; refine the task scope, increase max iterations, or switch runtime mode",
+                max_iterations
+            ),
         })
     }
 
@@ -508,6 +501,82 @@ Work independently to complete this job. Report when done."#,
             }
         }
     }
+
+    async fn select_tools_with_retry(
+        &self,
+        reasoning: &Reasoning,
+        reason_ctx: &ReasoningContext,
+    ) -> Result<Vec<ToolSelection>, WorkerError> {
+        const MAX_ATTEMPTS: usize = 3;
+        let mut attempt = 0usize;
+        loop {
+            match reasoning.select_tools(reason_ctx).await {
+                Ok(selections) => return Ok(selections),
+                Err(e) => {
+                    attempt += 1;
+                    let msg = e.to_string();
+                    if attempt < MAX_ATTEMPTS && is_transient_llm_error(&msg) {
+                        let delay_ms = 350 * attempt as u64;
+                        tracing::warn!(
+                            "Transient LLM error during tool selection (attempt {}/{}): {}. Retrying in {}ms",
+                            attempt,
+                            MAX_ATTEMPTS,
+                            msg,
+                            delay_ms
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    return Err(WorkerError::ExecutionFailed {
+                        reason: format!("tool selection failed: {}", msg),
+                    });
+                }
+            }
+        }
+    }
+
+    async fn respond_with_tools_retry(
+        &self,
+        reasoning: &Reasoning,
+        reason_ctx: &ReasoningContext,
+    ) -> Result<crate::llm::RespondOutput, WorkerError> {
+        const MAX_ATTEMPTS: usize = 3;
+        let mut attempt = 0usize;
+        loop {
+            match reasoning.respond_with_tools(reason_ctx).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    attempt += 1;
+                    let msg = e.to_string();
+                    if attempt < MAX_ATTEMPTS && is_transient_llm_error(&msg) {
+                        let delay_ms = 350 * attempt as u64;
+                        tracing::warn!(
+                            "Transient LLM error during respond_with_tools (attempt {}/{}): {}. Retrying in {}ms",
+                            attempt,
+                            MAX_ATTEMPTS,
+                            msg,
+                            delay_ms
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    return Err(WorkerError::ExecutionFailed {
+                        reason: format!("respond_with_tools failed: {}", msg),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn is_transient_llm_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("502")
+        || lower.contains("503")
+        || lower.contains("504")
+        || lower.contains("bad gateway")
+        || lower.contains("gateway timeout")
+        || lower.contains("temporarily unavailable")
 }
 
 fn truncate(s: &str, max: usize) -> String {

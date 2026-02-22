@@ -1,5 +1,18 @@
 # IronClaw Development Guide
 
+## TitanClaw Delta (Current)
+
+This repo is currently branded and shipped as `TitanClaw`.
+
+Key operational updates that must be treated as current behavior:
+
+- Sandbox coding modes now include `worker`, `claude_code`, and `opencode`.
+- Onboarding persists coding defaults (`CODING_RUNTIME_DEFAULT`, `OPENCODE_MODEL_DEFAULT`).
+- Web gateway includes chat lifecycle controls:
+  - delete single thread
+  - clear all threads (chat scope only)
+- Web gateway supports job artifact archive download (`/api/jobs/{id}/files/download`).
+
 ## Project Overview
 
 **IronClaw** is a secure personal AI assistant that protects your data and expands its capabilities on the fly.

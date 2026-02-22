@@ -296,6 +296,10 @@ impl TestHarnessBuilder {
             cost_guard,
             swarm_handle: None,
             swarm_results: None,
+            container_job_manager: None,
+            single_message_mode: false,
+            kernel_orchestrator: None,
+            shadow_engine: None,
         };
 
         TestHarness {

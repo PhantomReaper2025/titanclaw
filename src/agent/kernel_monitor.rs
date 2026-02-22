@@ -194,6 +194,18 @@ impl KernelMonitor {
             .collect()
     }
 
+    /// Return true when a tool already has a non-terminal patch proposal.
+    pub async fn has_open_proposal_for_tool(&self, tool_name: &str) -> bool {
+        let patches = self.pending_patches.read().await;
+        patches.iter().any(|p| {
+            p.tool_name == tool_name
+                && matches!(
+                    p.status,
+                    PatchStatus::PendingApproval | PatchStatus::Approved
+                )
+        })
+    }
+
     /// Approve a patch proposal by ID.
     pub async fn approve_patch(&self, patch_id: Uuid) -> bool {
         let mut patches = self.pending_patches.write().await;
@@ -246,6 +258,21 @@ impl KernelMonitor {
         } else {
             false
         }
+    }
+
+    /// List all patch proposals.
+    pub async fn all_patches(&self) -> Vec<PatchProposal> {
+        self.pending_patches.read().await.clone()
+    }
+
+    /// Get a specific patch proposal by ID.
+    pub async fn get_patch(&self, patch_id: Uuid) -> Option<PatchProposal> {
+        self.pending_patches
+            .read()
+            .await
+            .iter()
+            .find(|p| p.id == patch_id)
+            .cloned()
     }
 }
 

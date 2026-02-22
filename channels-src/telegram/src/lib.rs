@@ -54,6 +54,9 @@ struct TelegramUpdate {
 
     /// Channel post (we ignore these for now).
     channel_post: Option<TelegramMessage>,
+
+    /// Callback query (inline keyboard button click).
+    callback_query: Option<TelegramCallbackQuery>,
 }
 
 /// Telegram Message object.
@@ -81,6 +84,15 @@ struct TelegramMessage {
 
     /// Bot command entities (for /commands).
     entities: Option<Vec<MessageEntity>>,
+}
+
+/// Telegram CallbackQuery object.
+#[derive(Debug, Deserialize)]
+struct TelegramCallbackQuery {
+    id: String,
+    from: TelegramUser,
+    message: Option<TelegramMessage>,
+    data: Option<String>,
 }
 
 /// Telegram User object.
@@ -427,7 +439,7 @@ impl Guest for TelegramChannel {
         // - timeout: Long polling timeout in seconds (Telegram recommends 30+)
         // - allowed_updates: Only get message updates
         let url = format!(
-            "https://api.telegram.org/bot{{TELEGRAM_BOT_TOKEN}}/getUpdates?offset={}&timeout=30&allowed_updates=[\"message\",\"edited_message\"]",
+            "https://api.telegram.org/bot{{TELEGRAM_BOT_TOKEN}}/getUpdates?offset={}&timeout=30&allowed_updates=[\"message\",\"edited_message\",\"callback_query\"]",
             offset
         );
 
@@ -511,58 +523,17 @@ impl Guest for TelegramChannel {
         let metadata: TelegramMessageMetadata = serde_json::from_str(&response.metadata_json)
             .map_err(|e| format!("Failed to parse metadata: {}", e))?;
 
-        // Try sending with Markdown first; fall back to plain text if Telegram
-        // can't parse the entities (e.g. model leaked <tool_call> with underscores).
-        let result = send_message(
+        // Try sending with Markdown first (chunked for Telegram limits);
+        // fall back to plain text per chunk on parse-entity errors.
+        send_message_split(
             metadata.chat_id,
             &response.content,
             metadata.message_id,
             Some("Markdown"),
-        );
-
-        match result {
-            Ok(msg_id) => {
-                channel_host::log(
-                    channel_host::LogLevel::Debug,
-                    &format!(
-                        "Sent message to chat {}: message_id={}",
-                        metadata.chat_id, msg_id
-                    ),
-                );
-                Ok(())
-            }
-            Err(SendError::ParseEntities(detail)) => {
-                channel_host::log(
-                    channel_host::LogLevel::Warn,
-                    &format!("Markdown parse failed ({}), retrying as plain text", detail),
-                );
-                let msg_id = send_message(
-                    metadata.chat_id,
-                    &response.content,
-                    metadata.message_id,
-                    None,
-                )
-                .map_err(|e| format!("Plain-text retry also failed: {}", e))?;
-
-                channel_host::log(
-                    channel_host::LogLevel::Debug,
-                    &format!(
-                        "Sent plain-text message to chat {}: message_id={}",
-                        metadata.chat_id, msg_id
-                    ),
-                );
-                Ok(())
-            }
-            Err(e) => Err(e.to_string()),
-        }
+        )
     }
 
     fn on_status(update: StatusUpdate) {
-        // Only send typing indicator for Thinking status
-        if !matches!(update.status, StatusType::Thinking) {
-            return;
-        }
-
         // Parse chat_id from metadata
         let metadata: TelegramMessageMetadata = match serde_json::from_str(&update.metadata_json) {
             Ok(m) => m,
@@ -575,34 +546,63 @@ impl Guest for TelegramChannel {
             }
         };
 
-        // POST /sendChatAction with action "typing"
-        let payload = serde_json::json!({
-            "chat_id": metadata.chat_id,
-            "action": "typing"
-        });
+        if matches!(update.status, StatusType::Thinking) {
+            if let Some((request_id, tool_name, description)) =
+                parse_approval_status_message(&update.message)
+            {
+                let _ = send_approval_prompt(
+                    metadata.chat_id,
+                    metadata.message_id,
+                    &request_id,
+                    &tool_name,
+                    &description,
+                );
+                return;
+            }
 
-        let payload_bytes = match serde_json::to_vec(&payload) {
-            Ok(b) => b,
-            Err(_) => return,
-        };
+            // Forward key job progress updates to Telegram.
+            if update.message.starts_with("Job started:")
+                || update.message.starts_with("Job completed:")
+                || update.message.starts_with("Job failed:")
+            {
+                let _ = send_message_split(
+                    metadata.chat_id,
+                    &update.message,
+                    metadata.message_id,
+                    None,
+                );
+                return;
+            }
 
-        let headers = serde_json::json!({
-            "Content-Type": "application/json"
-        });
+            // Default Thinking behavior: typing indicator.
+            let payload = serde_json::json!({
+                "chat_id": metadata.chat_id,
+                "action": "typing"
+            });
 
-        let result = channel_host::http_request(
-            "POST",
-            "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendChatAction",
-            &headers.to_string(),
-            Some(&payload_bytes),
-            None,
-        );
+            let payload_bytes = match serde_json::to_vec(&payload) {
+                Ok(b) => b,
+                Err(_) => return,
+            };
 
-        if let Err(e) = result {
-            channel_host::log(
-                channel_host::LogLevel::Debug,
-                &format!("sendChatAction failed: {}", e),
+            let headers = serde_json::json!({
+                "Content-Type": "application/json"
+            });
+
+            let result = channel_host::http_request(
+                "POST",
+                "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendChatAction",
+                &headers.to_string(),
+                Some(&payload_bytes),
+                None,
             );
+
+            if let Err(e) = result {
+                channel_host::log(
+                    channel_host::LogLevel::Debug,
+                    &format!("sendChatAction failed: {}", e),
+                );
+            }
         }
     }
 
@@ -707,6 +707,132 @@ fn send_message(
         }
         Err(e) => Err(SendError::Other(format!("HTTP request failed: {}", e))),
     }
+}
+
+/// Send a potentially long message by splitting into Telegram-safe chunks.
+fn send_message_split(
+    chat_id: i64,
+    text: &str,
+    reply_to_message_id: i64,
+    parse_mode: Option<&str>,
+) -> Result<(), String> {
+    const TELEGRAM_MAX_CHARS: usize = 3800;
+    for (idx, chunk) in chunk_text(text, TELEGRAM_MAX_CHARS).iter().enumerate() {
+        let reply_to = if idx == 0 { reply_to_message_id } else { 0 };
+        match send_message(chat_id, chunk, reply_to, parse_mode) {
+            Ok(_) => {}
+            Err(SendError::ParseEntities(detail)) if parse_mode.is_some() => {
+                channel_host::log(
+                    channel_host::LogLevel::Warn,
+                    &format!("Chunk markdown parse failed ({}), retrying plain text", detail),
+                );
+                send_message(chat_id, chunk, reply_to, None)
+                    .map_err(|e| format!("Plain-text chunk retry failed: {}", e))?;
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
+fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![];
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if current.chars().count() >= max_chars {
+            chunks.push(current);
+            current = String::new();
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn parse_approval_status_message(msg: &str) -> Option<(String, String, String)> {
+    // Expected format from wasm wrapper:
+    // "Approval needed [<uuid>]: <tool> - <description>"
+    let rest = msg.strip_prefix("Approval needed [")?;
+    let bracket = rest.find("]: ")?;
+    let request_id = rest[..bracket].to_string();
+    let payload = &rest[bracket + 3..];
+    let sep = payload.find(" - ")?;
+    let tool_name = payload[..sep].to_string();
+    let description = payload[sep + 3..].to_string();
+    Some((request_id, tool_name, description))
+}
+
+fn send_approval_prompt(
+    chat_id: i64,
+    reply_to_message_id: i64,
+    request_id: &str,
+    tool_name: &str,
+    description: &str,
+) -> Result<(), String> {
+    let prompt = format!(
+        "Tool approval required\nRequest: {}\nTool: {}\n{}\nChoose below.",
+        request_id, tool_name, description
+    );
+    let keyboard = serde_json::json!({
+        "inline_keyboard": [[
+            {"text":"Approve", "callback_data": format!("approval:{}:approve", request_id)},
+            {"text":"Deny", "callback_data": format!("approval:{}:deny", request_id)}
+        ]]
+    });
+    let payload = serde_json::json!({
+        "chat_id": chat_id,
+        "text": prompt,
+        "reply_to_message_id": reply_to_message_id,
+        "reply_markup": keyboard
+    });
+
+    let payload_bytes =
+        serde_json::to_vec(&payload).map_err(|e| format!("serialize approval payload: {}", e))?;
+    let headers = serde_json::json!({ "Content-Type": "application/json" });
+    let response = channel_host::http_request(
+        "POST",
+        "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        &headers.to_string(),
+        Some(&payload_bytes),
+        None,
+    )
+    .map_err(|e| format!("send approval prompt request failed: {}", e))?;
+    if response.status != 200 {
+        let body = String::from_utf8_lossy(&response.body);
+        return Err(format!("send approval prompt failed {}: {}", response.status, body));
+    }
+    Ok(())
+}
+
+fn answer_callback_query(callback_query_id: &str, text: Option<&str>) -> Result<(), String> {
+    let mut payload = serde_json::json!({
+        "callback_query_id": callback_query_id
+    });
+    if let Some(t) = text {
+        payload["text"] = serde_json::Value::String(t.to_string());
+    }
+
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map_err(|e| format!("serialize answer callback payload: {}", e))?;
+    let headers = serde_json::json!({ "Content-Type": "application/json" });
+    let response = channel_host::http_request(
+        "POST",
+        "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+        &headers.to_string(),
+        Some(&payload_bytes),
+        None,
+    )
+    .map_err(|e| format!("answer callback request failed: {}", e))?;
+    if response.status != 200 {
+        let body = String::from_utf8_lossy(&response.body);
+        return Err(format!("answer callback failed {}: {}", response.status, body));
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -881,6 +1007,10 @@ fn handle_update(update: TelegramUpdate) {
     // Optionally handle edited messages the same way
     if let Some(message) = update.edited_message {
         handle_message(message);
+    }
+
+    if let Some(query) = update.callback_query {
+        handle_callback_query(query);
     }
 }
 
@@ -1071,6 +1201,74 @@ fn handle_message(message: TelegramMessage) {
             "Emitted message from user {} in chat {}",
             from.id, message.chat.id
         ),
+    );
+}
+
+/// Process Telegram inline keyboard callback queries.
+fn handle_callback_query(query: TelegramCallbackQuery) {
+    let data = query.data.unwrap_or_default();
+    if !data.starts_with("approval:") {
+        let _ = answer_callback_query(&query.id, Some("Unsupported action"));
+        return;
+    }
+
+    let parts: Vec<&str> = data.split(':').collect();
+    if parts.len() != 3 {
+        let _ = answer_callback_query(&query.id, Some("Invalid approval payload"));
+        return;
+    }
+
+    let request_id = parts[1];
+    let action = parts[2];
+    let approved = match action {
+        "approve" => true,
+        "deny" => false,
+        _ => {
+            let _ = answer_callback_query(&query.id, Some("Unknown action"));
+            return;
+        }
+    };
+
+    let message = match query.message {
+        Some(m) => m,
+        None => {
+            let _ = answer_callback_query(&query.id, Some("Missing message context"));
+            return;
+        }
+    };
+
+    let metadata = TelegramMessageMetadata {
+        chat_id: message.chat.id,
+        message_id: message.message_id,
+        user_id: query.from.id,
+        is_private: message.chat.chat_type == "private",
+    };
+    let metadata_json = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
+
+    let approval_payload = serde_json::json!({
+        "ExecApproval": {
+            "request_id": request_id,
+            "approved": approved,
+            "always": false
+        }
+    })
+    .to_string();
+
+    channel_host::emit_message(&EmittedMessage {
+        user_id: query.from.id.to_string(),
+        user_name: query
+            .from
+            .username
+            .clone()
+            .or(Some(query.from.first_name.clone())),
+        content: approval_payload,
+        thread_id: None,
+        metadata_json,
+    });
+
+    let _ = answer_callback_query(
+        &query.id,
+        Some(if approved { "Approved" } else { "Denied" }),
     );
 }
 

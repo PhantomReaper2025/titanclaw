@@ -488,6 +488,7 @@ mod tests {
             llm_provider: None,
             skill_registry: None,
             skill_catalog: None,
+            kernel_orchestrator: None,
             chat_rate_limiter: crate::channels::web::server::RateLimiter::new(30, 60),
         }
     }

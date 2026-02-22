@@ -77,6 +77,15 @@ pub struct Settings {
     #[serde(default)]
     pub heartbeat: HeartbeatSettings,
 
+    // === Sandbox coding runtime defaults ===
+    /// Preferred sandbox coding runtime: "worker", "claude_code", or "opencode".
+    #[serde(default)]
+    pub coding_runtime_default: Option<String>,
+
+    /// Default model to use with OpenCode runtime.
+    #[serde(default)]
+    pub opencode_model_default: Option<String>,
+
     // === Advanced Settings (not asked during setup, editable via CLI) ===
     /// Agent behavior configuration.
     #[serde(default)]
@@ -310,6 +319,46 @@ pub struct AgentSettings {
     /// Enable token-to-tool piped execution path.
     #[serde(default = "default_true")]
     pub enable_piped_tool_execution: bool,
+
+    /// Enable background shadow-worker speculative execution.
+    #[serde(default = "default_true")]
+    pub shadow_workers_enabled: bool,
+
+    /// Number of speculative follow-up prompts to precompute.
+    #[serde(default = "default_shadow_max_predictions")]
+    pub shadow_max_predictions: u32,
+
+    /// TTL for speculative cache entries in seconds.
+    #[serde(default = "default_shadow_cache_ttl")]
+    pub shadow_cache_ttl_secs: u64,
+
+    /// Maximum concurrent speculative workers.
+    #[serde(default = "default_shadow_max_parallel")]
+    pub shadow_max_parallel: u32,
+
+    /// Minimum user input length to trigger speculation.
+    #[serde(default = "default_shadow_min_input_chars")]
+    pub shadow_min_input_chars: u32,
+
+    /// Enable kernel monitor/proposal engine.
+    #[serde(default = "default_true")]
+    pub kernel_monitor_enabled: bool,
+
+    /// Kernel monitor analysis interval in seconds.
+    #[serde(default = "default_kernel_monitor_interval")]
+    pub kernel_monitor_interval_secs: u64,
+
+    /// Slow-tool threshold for kernel monitor in milliseconds.
+    #[serde(default = "default_kernel_slow_threshold_ms")]
+    pub kernel_slow_threshold_ms: f64,
+
+    /// Auto-approve generated kernel patch proposals.
+    #[serde(default)]
+    pub kernel_auto_approve_patches: bool,
+
+    /// Auto-deploy approved kernel patch proposals.
+    #[serde(default)]
+    pub kernel_auto_deploy_patches: bool,
 }
 
 fn default_agent_name() -> String {
@@ -344,6 +393,30 @@ fn default_true() -> bool {
     true
 }
 
+fn default_shadow_max_predictions() -> u32 {
+    3
+}
+
+fn default_shadow_cache_ttl() -> u64 {
+    900
+}
+
+fn default_shadow_max_parallel() -> u32 {
+    2
+}
+
+fn default_shadow_min_input_chars() -> u32 {
+    20
+}
+
+fn default_kernel_monitor_interval() -> u64 {
+    180
+}
+
+fn default_kernel_slow_threshold_ms() -> f64 {
+    5000.0
+}
+
 impl Default for AgentSettings {
     fn default() -> Self {
         Self {
@@ -356,6 +429,16 @@ impl Default for AgentSettings {
             max_repair_attempts: default_max_repair_attempts(),
             session_idle_timeout_secs: default_session_idle_timeout(),
             enable_piped_tool_execution: true,
+            shadow_workers_enabled: true,
+            shadow_max_predictions: default_shadow_max_predictions(),
+            shadow_cache_ttl_secs: default_shadow_cache_ttl(),
+            shadow_max_parallel: default_shadow_max_parallel(),
+            shadow_min_input_chars: default_shadow_min_input_chars(),
+            kernel_monitor_enabled: true,
+            kernel_monitor_interval_secs: default_kernel_monitor_interval(),
+            kernel_slow_threshold_ms: default_kernel_slow_threshold_ms(),
+            kernel_auto_approve_patches: false,
+            kernel_auto_deploy_patches: false,
         }
     }
 }

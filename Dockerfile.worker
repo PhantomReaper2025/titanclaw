@@ -52,6 +52,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
 # Install Claude Code CLI (for claude-bridge mode)
 RUN npm install -g @anthropic-ai/claude-code@latest
 
+# Install OpenCode CLI (for sandbox coding runtime choice)
+RUN curl -fsSL https://opencode.ai/install | bash
+RUN if [ -x /root/.local/bin/opencode ]; then ln -sf /root/.local/bin/opencode /usr/local/bin/opencode; fi
+
 # Copy the binary
 COPY --from=builder /build/target/release/titanclaw /usr/local/bin/titanclaw
 
@@ -59,8 +63,8 @@ COPY --from=builder /build/target/release/titanclaw /usr/local/bin/titanclaw
 RUN useradd -m -u 1000 -s /bin/bash sandbox \
     && mkdir -p /workspace \
     && chown sandbox:sandbox /workspace \
-    && mkdir -p /home/sandbox/.claude \
-    && chown sandbox:sandbox /home/sandbox/.claude
+    && mkdir -p /home/sandbox/.claude /home/sandbox/.local/share/opencode/log /home/sandbox/.config /home/sandbox/.cache \
+    && chown -R sandbox:sandbox /home/sandbox/.claude /home/sandbox/.local /home/sandbox/.config /home/sandbox/.cache
 
 USER sandbox
 WORKDIR /workspace

@@ -85,6 +85,17 @@ impl SubmissionParser {
                 args,
             };
         }
+        if lower.starts_with("/kernel") {
+            let args: Vec<String> = trimmed
+                .split_whitespace()
+                .skip(1)
+                .map(|s| s.to_string())
+                .collect();
+            return Submission::SystemCommand {
+                command: "kernel".to_string(),
+                args,
+            };
+        }
 
         if lower == "/quit" || lower == "/exit" || lower == "/shutdown" {
             return Submission::Quit;
@@ -592,6 +603,20 @@ mod tests {
         let submission = SubmissionParser::parse("/MODEL Claude-3.5");
         assert!(
             matches!(submission, Submission::SystemCommand { command, args } if command == "model" && args == vec!["Claude-3.5"])
+        );
+    }
+
+    #[test]
+    fn test_parser_system_command_kernel() {
+        let submission = SubmissionParser::parse("/kernel");
+        assert!(
+            matches!(submission, Submission::SystemCommand { command, args } if command == "kernel" && args.is_empty())
+        );
+
+        let submission =
+            SubmissionParser::parse("/kernel approve 00000000-0000-0000-0000-000000000000");
+        assert!(
+            matches!(submission, Submission::SystemCommand { command, args } if command == "kernel" && args.len() == 2 && args[0] == "approve")
         );
     }
 

@@ -1542,6 +1542,35 @@ impl SetupWizard {
 
         self.settings.channels.wasm_channels = enabled_wasm_channels;
 
+        println!();
+        print_info("Sandbox coding runtime defaults:");
+        let runtime_options = [
+            "Worker     - built-in TitanClaw agent loop",
+            "Claude Code - Anthropic Claude CLI bridge",
+            "OpenCode   - OpenCode CLI bridge",
+        ];
+        let runtime_choice = select_one("Default sandbox coding runtime:", &runtime_options)
+            .map_err(SetupError::Io)?;
+        let runtime = match runtime_choice {
+            1 => "claude_code",
+            2 => "opencode",
+            _ => "worker",
+        };
+        self.settings.coding_runtime_default = Some(runtime.to_string());
+
+        let opencode_default = self
+            .settings
+            .opencode_model_default
+            .as_deref()
+            .unwrap_or("openai/gpt-4.1-mini");
+        let opencode_model = optional_input(
+            "Default OpenCode model",
+            Some(&format!("default: {}", opencode_default)),
+        )
+        .map_err(SetupError::Io)?;
+        self.settings.opencode_model_default =
+            Some(opencode_model.unwrap_or_else(|| opencode_default.to_string()));
+
         Ok(())
     }
 
@@ -1763,6 +1792,12 @@ impl SetupWizard {
                 "SANDBOX_AUTO_PULL",
                 self.settings.sandbox.auto_pull_image.to_string(),
             ));
+            if let Some(ref runtime) = self.settings.coding_runtime_default {
+                env_vars.push(("CODING_RUNTIME_DEFAULT", runtime.clone()));
+            }
+            if let Some(ref model) = self.settings.opencode_model_default {
+                env_vars.push(("OPENCODE_MODEL_DEFAULT", model.clone()));
+            }
 
             if !env_vars.is_empty() {
                 let pairs: Vec<(&str, &str)> =
@@ -1884,6 +1919,12 @@ impl SetupWizard {
                 "  Heartbeat: every {} minutes",
                 self.settings.heartbeat.interval_secs / 60
             );
+        }
+        if let Some(ref runtime) = self.settings.coding_runtime_default {
+            println!("  Coding runtime default: {}", runtime);
+        }
+        if let Some(ref model) = self.settings.opencode_model_default {
+            println!("  OpenCode model default: {}", model);
         }
 
         println!();

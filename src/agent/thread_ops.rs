@@ -169,6 +169,30 @@ impl Agent {
             }
         }
 
+        if let Some(shadow) = self.shadow_engine()
+            && let Some(cached) = shadow.try_get(content).await
+        {
+            tracing::info!("Shadow cache hit");
+            {
+                let mut sess = session.lock().await;
+                if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                    thread.start_turn(content);
+                    thread.complete_turn(&cached);
+                    self.persist_response_chain(thread);
+                }
+            }
+            let _ = self
+                .channels
+                .send_status(
+                    &message.channel,
+                    StatusUpdate::Status("Done (shadow cache)".into()),
+                    &message.metadata,
+                )
+                .await;
+            self.persist_turn(thread_id, &message.user_id, content, Some(&cached));
+            return Ok(SubmissionResult::response(cached));
+        }
+
         // Safety validation for user input
         let validation = self.safety().validate_input(content);
         if !validation.is_valid {
@@ -292,6 +316,9 @@ impl Agent {
                                         content,
                                         Some(&output),
                                     );
+                                    if let Some(shadow) = self.shadow_engine() {
+                                        shadow.spawn_speculation(content, &output);
+                                    }
                                     return Ok(SubmissionResult::response(output));
                                 }
                                 Err(e) => {
@@ -450,6 +477,9 @@ impl Agent {
 
                 // Fire-and-forget: persist turn to DB
                 self.persist_turn(thread_id, &message.user_id, content, Some(&response));
+                if let Some(shadow) = self.shadow_engine() {
+                    shadow.spawn_speculation(content, &response);
+                }
 
                 Ok(SubmissionResult::response(response))
             }
@@ -637,6 +667,7 @@ impl Agent {
 
     pub(super) async fn process_interrupt(
         &self,
+        message: &IncomingMessage,
         session: Arc<Mutex<Session>>,
         thread_id: Uuid,
     ) -> Result<SubmissionResult, Error> {
@@ -649,7 +680,29 @@ impl Agent {
         match thread.state {
             ThreadState::Processing | ThreadState::AwaitingApproval => {
                 thread.interrupt();
-                Ok(SubmissionResult::ok_with_message("Interrupted."))
+                drop(sess);
+
+                let mut canceled = 0usize;
+                let active_jobs = self.context_manager.active_jobs_for(&message.user_id).await;
+                for job_id in active_jobs {
+                    if self.scheduler.stop(job_id).await.is_ok() {
+                        canceled += 1;
+                    }
+                    if let Some(jm) = &self.deps.container_job_manager
+                        && jm.stop_job(job_id).await.is_ok()
+                    {
+                        canceled += 1;
+                    }
+                }
+
+                if canceled > 0 {
+                    Ok(SubmissionResult::ok_with_message(format!(
+                        "Interrupted. Requested cancellation for {} active job(s).",
+                        canceled
+                    )))
+                } else {
+                    Ok(SubmissionResult::ok_with_message("Interrupted."))
+                }
             }
             _ => Ok(SubmissionResult::ok_with_message("Nothing to interrupt.")),
         }

@@ -19,11 +19,13 @@ use regex::Regex;
 use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
+use crate::agent::Scheduler;
 use crate::agent::routine::{
     NotifyConfig, Routine, RoutineAction, RoutineRun, RunStatus, Trigger, next_cron_fire,
 };
 use crate::channels::{IncomingMessage, OutgoingResponse};
 use crate::config::RoutineConfig;
+use crate::context::{ContextManager, JobState};
 use crate::db::Database;
 use crate::llm::{ChatMessage, CompletionRequest, FinishReason, LlmProvider};
 use crate::workspace::Workspace;
@@ -34,6 +36,8 @@ pub struct RoutineEngine {
     store: Arc<dyn Database>,
     llm: Arc<dyn LlmProvider>,
     workspace: Arc<Workspace>,
+    scheduler: Arc<Scheduler>,
+    context_manager: Arc<ContextManager>,
     /// Sender for notifications (routed to channel manager).
     notify_tx: mpsc::Sender<OutgoingResponse>,
     /// Currently running routine count (across all routines).
@@ -48,6 +52,8 @@ impl RoutineEngine {
         store: Arc<dyn Database>,
         llm: Arc<dyn LlmProvider>,
         workspace: Arc<Workspace>,
+        scheduler: Arc<Scheduler>,
+        context_manager: Arc<ContextManager>,
         notify_tx: mpsc::Sender<OutgoingResponse>,
     ) -> Self {
         Self {
@@ -55,6 +61,8 @@ impl RoutineEngine {
             store,
             llm,
             workspace,
+            scheduler,
+            context_manager,
             notify_tx,
             running_count: Arc::new(AtomicUsize::new(0)),
             event_cache: Arc::new(RwLock::new(Vec::new())),
@@ -217,9 +225,10 @@ impl RoutineEngine {
             store: self.store.clone(),
             llm: self.llm.clone(),
             workspace: self.workspace.clone(),
+            scheduler: self.scheduler.clone(),
+            context_manager: self.context_manager.clone(),
             notify_tx: self.notify_tx.clone(),
             running_count: self.running_count.clone(),
-            max_lightweight_tokens: self.config.max_lightweight_tokens,
         };
 
         tokio::spawn(async move {
@@ -249,9 +258,10 @@ impl RoutineEngine {
             store: self.store.clone(),
             llm: self.llm.clone(),
             workspace: self.workspace.clone(),
+            scheduler: self.scheduler.clone(),
+            context_manager: self.context_manager.clone(),
             notify_tx: self.notify_tx.clone(),
             running_count: self.running_count.clone(),
-            max_lightweight_tokens: self.config.max_lightweight_tokens,
         };
 
         // Record the run in DB, then spawn execution
@@ -296,9 +306,10 @@ struct EngineContext {
     store: Arc<dyn Database>,
     llm: Arc<dyn LlmProvider>,
     workspace: Arc<Workspace>,
+    scheduler: Arc<Scheduler>,
+    context_manager: Arc<ContextManager>,
     notify_tx: mpsc::Sender<OutgoingResponse>,
     running_count: Arc<AtomicUsize>,
-    max_lightweight_tokens: u32,
 }
 
 /// Execute a routine run. Handles both lightweight and full_job modes.
@@ -312,15 +323,11 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
             context_paths,
             max_tokens,
         } => execute_lightweight(&ctx, &routine, prompt, context_paths, *max_tokens).await,
-        RoutineAction::FullJob { description, .. } => {
-            // Full job mode: for now, execute as lightweight with the description
-            // as prompt. Full scheduler integration will come as a follow-up.
-            tracing::info!(
-                routine = %routine.name,
-                "FullJob mode executing as lightweight (scheduler integration pending)"
-            );
-            execute_lightweight(&ctx, &routine, description, &[], ctx.max_lightweight_tokens).await
-        }
+        RoutineAction::FullJob {
+            title,
+            description,
+            max_iterations,
+        } => execute_full_job(&ctx, &routine, title, description, *max_iterations).await,
     };
 
     // Decrement running count
@@ -382,6 +389,80 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
         summary.as_deref(),
     )
     .await;
+}
+
+/// Execute a full-job routine through the scheduler (multi-step with tools).
+async fn execute_full_job(
+    ctx: &EngineContext,
+    routine: &Routine,
+    title: &str,
+    description: &str,
+    max_iterations: u32,
+) -> Result<(RunStatus, Option<String>, Option<i32>), String> {
+    let job_id = ctx
+        .context_manager
+        .create_job_for_user(&routine.user_id, title, description)
+        .await
+        .map_err(|e| format!("failed to create full_job context: {e}"))?;
+
+    ctx.scheduler
+        .schedule(job_id)
+        .await
+        .map_err(|e| format!("failed to schedule full_job: {e}"))?;
+
+    let timeout_secs = (max_iterations as u64).saturating_mul(30).clamp(60, 1800);
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+
+    loop {
+        if std::time::Instant::now() >= deadline {
+            let _ = ctx.scheduler.stop(job_id).await;
+            return Err(format!(
+                "full_job timed out after {}s (job_id={})",
+                timeout_secs, job_id
+            ));
+        }
+
+        let job_ctx = ctx
+            .context_manager
+            .get_context(job_id)
+            .await
+            .map_err(|e| format!("failed to read full_job context: {e}"))?;
+
+        match job_ctx.state {
+            JobState::Completed | JobState::Accepted => {
+                return Ok((
+                    RunStatus::Ok,
+                    Some(format!(
+                        "Full job '{}' completed successfully (job_id={})",
+                        title, job_id
+                    )),
+                    None,
+                ));
+            }
+            JobState::Failed => {
+                let reason = job_ctx
+                    .transitions
+                    .last()
+                    .and_then(|t| t.reason.clone())
+                    .unwrap_or_else(|| "Job failed".to_string());
+                return Ok((
+                    RunStatus::Failed,
+                    Some(format!("Full job failed (job_id={}): {}", job_id, reason)),
+                    None,
+                ));
+            }
+            JobState::Cancelled => {
+                return Ok((
+                    RunStatus::Failed,
+                    Some(format!("Full job cancelled (job_id={})", job_id)),
+                    None,
+                ));
+            }
+            JobState::Pending | JobState::InProgress | JobState::Stuck | JobState::Submitted => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
 }
 
 /// Execute a lightweight routine (single LLM call).

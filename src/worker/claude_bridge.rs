@@ -28,6 +28,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use std::{collections::VecDeque, sync::Mutex};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -391,11 +392,19 @@ impl ClaudeBridgeRuntime {
         // Spawn stderr reader that forwards lines as log events
         let client_for_stderr = Arc::clone(&self.client);
         let job_id = self.config.job_id;
+        let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let stderr_tail_for_task = Arc::clone(&stderr_tail);
         let stderr_handle = tokio::spawn(async move {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::debug!(job_id = %job_id, "claude stderr: {}", line);
+                if let Ok(mut guard) = stderr_tail_for_task.lock() {
+                    guard.push_back(line.clone());
+                    while guard.len() > 20 {
+                        let _ = guard.pop_front();
+                    }
+                }
                 let payload = JobEventPayload {
                     event_type: "status".to_string(),
                     data: serde_json::json!({ "message": line }),
@@ -477,9 +486,32 @@ impl ClaudeBridgeRuntime {
             )
             .await;
 
-            return Err(WorkerError::ExecutionFailed {
-                reason: format!("claude exited with code {}", code),
-            });
+            let stderr_excerpt = stderr_tail
+                .lock()
+                .ok()
+                .map(|guard| {
+                    guard
+                        .iter()
+                        .rev()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                })
+                .unwrap_or_default();
+
+            let reason = if stderr_excerpt.is_empty() {
+                format!("claude exited with code {}", code)
+            } else {
+                format!(
+                    "claude exited with code {} (stderr: {})",
+                    code, stderr_excerpt
+                )
+            };
+            return Err(WorkerError::ExecutionFailed { reason });
         }
 
         // Report successful result

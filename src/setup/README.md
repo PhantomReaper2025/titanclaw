@@ -40,12 +40,19 @@ The `--no-onboard` CLI flag suppresses auto-detection.
    c. Config::from_env()     → build config from env vars
    d. Create SessionManager  → load session token
    e. ensure_authenticated() → validate session (NEAR AI only)
-   f. ... rest of agent startup
+   f. Initialize workspace + safe core-doc sync
+   g. ... rest of agent startup
 ```
 
 **Critical ordering:** `.env` files must be loaded (step 3a) before
 `Config::from_env()` (step 3c) because bootstrap vars like
 `DATABASE_BACKEND` live in `~/.ironclaw/.env`.
+
+Workspace startup now also runs a conservative core-doc refresh pass that:
+- creates missing core docs
+- upgrades known legacy templates
+- upgrades managed docs with older template version markers
+- never overwrites custom docs unless explicitly forced via CLI (`memory bootstrap --force`)
 
 ---
 
@@ -247,6 +254,7 @@ key first, then falls back to the standard env var.
 6e. Initialize SecretsContext (for token storage)
 6f. Setup HTTP webhook (if selected)
 6g. Setup each WASM channel (secrets, owner binding)
+6h. Capture sandbox coding defaults (runtime + OpenCode model)
 ```
 
 **Tunnel setup** (`setup_tunnel`):
@@ -263,6 +271,13 @@ key first, then falls back to the standard env var.
 - Validates bot token via Telegram `getMe` API
 - Owner binding: polls `getUpdates` for 120s to capture sender's user ID
 - Optional webhook secret generation
+
+**Sandbox coding defaults:**
+- Prompt for default runtime: `worker`, `claude_code`, or `opencode`
+- Prompt for default OpenCode model ID
+- Persisted as settings + bootstrap env:
+  - `coding_runtime_default` / `CODING_RUNTIME_DEFAULT`
+  - `opencode_model_default` / `OPENCODE_MODEL_DEFAULT`
 
 **SecretsContext creation** (`init_secrets_context`):
 1. Check `self.secrets_crypto` (set in Step 2) → use if available

@@ -946,6 +946,22 @@ body::before {
   margin-bottom: 20px;
 }
 
+.jobs-create {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.jobs-create input,
+.jobs-create select {
+  padding: 9px 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-tertiary);
+  color: var(--text);
+}
+
 .summary-card {
   padding: 16px;
   background: linear-gradient(180deg, #171922, #12141a);
@@ -2344,9 +2360,27 @@ mark {
   padding: 8px 12px 4px;
   font-size: 11px;
   font-weight: 500;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   text-transform: uppercase;
   letter-spacing: 0.5px;
   color: var(--text-secondary);
+}
+
+.thread-clear-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 8px;
+  font-size: 10px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.thread-clear-btn:hover {
+  color: var(--text);
+  border-color: var(--accent);
 }
 
 .thread-toggle-btn {
@@ -2397,6 +2431,27 @@ mark {
 .thread-meta {
   font-size: 11px;
   color: var(--text-secondary);
+}
+
+.thread-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.thread-delete-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 8px;
+  font-size: 10px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.thread-delete-btn:hover {
+  color: #ff8f8f;
+  border-color: #b34646;
 }
 
 /* --- Memory editing --- */

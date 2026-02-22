@@ -249,7 +249,10 @@ pub async fn jobs_restart_handler(
 
     // Look up the original job's mode so the restart uses the same mode.
     let mode = match store.get_sandbox_job_mode(old_job_id).await {
-        Ok(Some(m)) if m == "claude_code" => crate::orchestrator::job_manager::JobMode::ClaudeCode,
+        Ok(Some(m)) if m == "claude_code" => {
+            crate::orchestrator::job_manager::JobMode::ClaudeCode
+        }
+        Ok(Some(m)) if m == "opencode" => crate::orchestrator::job_manager::JobMode::OpenCode,
         _ => crate::orchestrator::job_manager::JobMode::Worker,
     };
 

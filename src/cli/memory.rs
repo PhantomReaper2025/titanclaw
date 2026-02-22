@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use clap::Subcommand;
 
-use crate::workspace::{EmbeddingProvider, SearchConfig, Workspace};
+use crate::workspace::{CoreDocsSyncOptions, EmbeddingProvider, SearchConfig, Workspace};
 
 /// Run a memory command using the Database trait (works with any backend).
 pub async fn run_memory_command_with_db(
@@ -30,6 +30,9 @@ pub async fn run_memory_command_with_db(
         } => write(&workspace, &path, content, append).await,
         MemoryCommand::Tree { path, depth } => tree(&workspace, &path, depth).await,
         MemoryCommand::Status => status(&workspace).await,
+        MemoryCommand::Bootstrap { dry_run, force } => {
+            bootstrap_core_docs(&workspace, dry_run, force).await
+        }
     }
 }
 
@@ -77,6 +80,17 @@ pub enum MemoryCommand {
 
     /// Show workspace status (document count, index health)
     Status,
+
+    /// Seed and refresh core workspace docs (README, AGENTS, IDENTITY, etc.)
+    Bootstrap {
+        /// Show planned changes only
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Force overwrite core docs even when custom content exists
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Run a memory command (PostgreSQL backend).
@@ -101,6 +115,9 @@ pub async fn run_memory_command(
         } => write(&workspace, &path, content, append).await,
         MemoryCommand::Tree { path, depth } => tree(&workspace, &path, depth).await,
         MemoryCommand::Status => status(&workspace).await,
+        MemoryCommand::Bootstrap { dry_run, force } => {
+            bootstrap_core_docs(&workspace, dry_run, force).await
+        }
     }
 }
 
@@ -246,6 +263,26 @@ async fn status(workspace: &Workspace) -> anyhow::Result<()> {
         let marker = if exists { "+" } else { "-" };
         println!("    [{}] {}", marker, path);
     }
+
+    Ok(())
+}
+
+async fn bootstrap_core_docs(
+    workspace: &Workspace,
+    dry_run: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    let report = workspace
+        .sync_core_docs(CoreDocsSyncOptions { dry_run, force })
+        .await?;
+
+    println!("Core docs sync");
+    println!("  dry_run:  {}", report.dry_run);
+    println!("  created:  {}", report.created);
+    println!("  updated:  {}", report.updated);
+    println!("  skipped:  {}", report.skipped);
+    println!("  failed:   {}", report.failed);
+    println!("  changed:  {}", report.changed());
 
     Ok(())
 }

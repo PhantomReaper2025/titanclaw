@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0](https://github.com/PhantomReaper2025/titanclaw/compare/v0.6.3...v1.0.0) - 2026-02-22
+
+### Added
+
+- Web gateway chat lifecycle controls:
+  - `DELETE /api/chat/thread/{id}` for single-thread hard delete
+  - `DELETE /api/chat/threads` for clear-all hard delete (chat scope)
+- Sandbox output archive export endpoint: `GET /api/jobs/{id}/files/download`
+- Jobs UI actions for thread deletion, clear-all chats, and archive download
+- Onboarding prompt for default sandbox coding runtime and OpenCode default model
+- `memory bootstrap` CLI command for seeding and safe-refreshing core workspace docs (`--dry-run`, `--force`)
+- Jobs tab manual creation flow (`POST /api/jobs`) with mode selection (`worker`, `claude_code`, `opencode`)
+
+### Changed
+
+- `create_job` sandbox mode now accepts `opencode` in addition to `worker` and `claude_code`
+- `CODING_RUNTIME_DEFAULT` is now respected as the default sandbox mode when `mode` is omitted
+- Workspace startup now runs conservative core-doc synchronization using managed template markers and legacy detection
+- `JobMode::OpenCode` now launches a dedicated OpenCode bridge command (`opencode-bridge`) instead of silently falling back to the generic worker runtime
+- `RoutineAction::FullJob` now executes via real scheduler job flow (context creation + `Scheduler::schedule`) instead of being downgraded to lightweight single-call execution
+
+### Fixed
+
+- Claude bridge failure reporting now includes recent stderr context to diagnose `claude exited with code 1` failures faster
+- Worker max-iteration failure reason now includes actionable remediation guidance
+- OpenCode model and runtime selection are now effective at execution time (bridge consumes mode/model wiring instead of ignored env-only fallback)
+- Worker image now exposes `opencode` on PATH for sandbox user and pre-creates OpenCode writable directories
+
+### Infrastructure
+
+- `Dockerfile.worker` now installs OpenCode CLI by default (`curl -fsSL https://opencode.ai/install | bash`)
+
 ## [0.6.3](https://github.com/PhantomReaper2025/titanclaw/compare/v0.6.2...v0.6.3) - 2026-02-21
 
 ### Fixed

@@ -16,6 +16,7 @@ use crate::agent::heartbeat::spawn_heartbeat;
 use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
 use crate::agent::self_repair::{DefaultSelfRepair, RepairResult, SelfRepair};
 use crate::agent::session_manager::SessionManager;
+use crate::agent::shadow_engine::ShadowEngine;
 use crate::agent::submission::{Submission, SubmissionParser, SubmissionResult};
 use crate::agent::{HeartbeatConfig as AgentHeartbeatConfig, Router, Scheduler};
 use crate::channels::{ChannelManager, IncomingMessage, OutgoingResponse, StatusUpdate};
@@ -26,6 +27,7 @@ use crate::error::Error;
 use crate::extensions::ExtensionManager;
 use crate::hooks::HookRegistry;
 use crate::llm::LlmProvider;
+use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::safety::SafetyLayer;
 use crate::skills::SkillRegistry;
 use crate::swarm::node::{SwarmHandle, SwarmResultRouter};
@@ -77,6 +79,14 @@ pub struct AgentDeps {
     pub swarm_handle: Option<SwarmHandle>,
     /// Optional swarm result router used to await remote task completions.
     pub swarm_results: Option<SwarmResultRouter>,
+    /// Optional container job manager for sandbox lifecycle control.
+    pub container_job_manager: Option<Arc<ContainerJobManager>>,
+    /// True when launched in one-shot mode (`run -m`).
+    pub single_message_mode: bool,
+    /// Optional kernel monitor/orchestration engine.
+    pub kernel_orchestrator: Option<Arc<crate::agent::kernel_orchestrator::KernelOrchestrator>>,
+    /// Optional speculative shadow-worker engine.
+    pub shadow_engine: Option<Arc<ShadowEngine>>,
 }
 
 /// The main agent that coordinates all components.
@@ -91,6 +101,9 @@ pub struct Agent {
     pub(super) context_monitor: ContextMonitor,
     pub(super) heartbeat_config: Option<HeartbeatConfig>,
     pub(super) routine_config: Option<RoutineConfig>,
+    pub(super) kernel_orchestrator:
+        Option<Arc<crate::agent::kernel_orchestrator::KernelOrchestrator>>,
+    pub(super) shadow_engine: Option<Arc<ShadowEngine>>,
 }
 
 impl Agent {
@@ -107,6 +120,8 @@ impl Agent {
         context_manager: Option<Arc<ContextManager>>,
         session_manager: Option<Arc<SessionManager>>,
     ) -> Self {
+        let kernel_orchestrator = deps.kernel_orchestrator.clone();
+        let shadow_engine = deps.shadow_engine.clone();
         let context_manager = context_manager
             .unwrap_or_else(|| Arc::new(ContextManager::new(config.max_parallel_jobs)));
 
@@ -135,6 +150,8 @@ impl Agent {
             context_monitor: ContextMonitor::new(),
             heartbeat_config,
             routine_config,
+            kernel_orchestrator,
+            shadow_engine,
         }
     }
 
@@ -175,6 +192,16 @@ impl Agent {
 
     pub(super) fn skill_registry(&self) -> Option<&Arc<std::sync::RwLock<SkillRegistry>>> {
         self.deps.skill_registry.as_ref()
+    }
+
+    pub(super) fn kernel_orchestrator(
+        &self,
+    ) -> Option<&Arc<crate::agent::kernel_orchestrator::KernelOrchestrator>> {
+        self.kernel_orchestrator.as_ref()
+    }
+
+    pub(super) fn shadow_engine(&self) -> Option<&Arc<ShadowEngine>> {
+        self.shadow_engine.as_ref()
     }
 
     /// Select active skills for a message using deterministic prefiltering.
@@ -304,6 +331,37 @@ impl Agent {
             }
         });
 
+        let kernel_handle = if let Some(orchestrator) = self.kernel_orchestrator.clone() {
+            if orchestrator.enabled() {
+                let interval = orchestrator.interval();
+                Some(tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(interval).await;
+                        orchestrator.tick().await;
+                    }
+                }))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let shadow_prune_handle = if let Some(shadow) = self.shadow_engine.clone() {
+            if shadow.enabled() {
+                Some(tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        shadow.prune_expired().await;
+                    }
+                }))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Spawn session pruning task
         let session_mgr = self.session_manager.clone();
         let session_idle_timeout = self.config.session_idle_timeout;
@@ -395,6 +453,8 @@ impl Agent {
                         Arc::clone(store),
                         self.llm().clone(),
                         Arc::clone(workspace),
+                        Arc::clone(&self.scheduler),
+                        Arc::clone(&self.context_manager),
                         notify_tx,
                     ));
 
@@ -551,6 +611,103 @@ impl Agent {
             }
         }
 
+        if self.deps.single_message_mode {
+            let timeout = std::time::Duration::from_secs(300);
+            let started = std::time::Instant::now();
+            let mut last_report_at = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(10))
+                .unwrap_or_else(std::time::Instant::now);
+            let mut last_snapshot: Option<(usize, usize)> = None;
+
+            let _ = self
+                .channels
+                .send_status(
+                    "repl",
+                    StatusUpdate::Status(
+                        "Single-message mode: waiting for spawned jobs...".to_string(),
+                    ),
+                    &serde_json::json!({}),
+                )
+                .await;
+
+            loop {
+                let active_context = self.context_manager.active_count().await;
+                let active_containers = if let Some(jm) = &self.deps.container_job_manager {
+                    let containers = jm.containers.read().await;
+                    containers
+                        .values()
+                        .filter(|h| {
+                            h.state == crate::orchestrator::job_manager::ContainerState::Creating
+                                || h.state
+                                    == crate::orchestrator::job_manager::ContainerState::Running
+                        })
+                        .count()
+                } else {
+                    0
+                };
+
+                if active_context == 0 && active_containers == 0 {
+                    tracing::info!("Single-message mode: all spawned jobs have finished");
+                    let _ = self
+                        .channels
+                        .send_status(
+                            "repl",
+                            StatusUpdate::Status(
+                                "Single-message mode: all spawned jobs finished.".to_string(),
+                            ),
+                            &serde_json::json!({}),
+                        )
+                        .await;
+                    break;
+                }
+
+                if started.elapsed() >= timeout {
+                    tracing::warn!(
+                        active_context,
+                        active_containers,
+                        "Single-message mode timeout while waiting for spawned jobs"
+                    );
+                    let _ = self
+                        .channels
+                        .send_status(
+                            "repl",
+                            StatusUpdate::Status(format!(
+                                "Single-message mode timeout: {} context job(s), {} container job(s) still active.",
+                                active_context, active_containers
+                            )),
+                            &serde_json::json!({}),
+                        )
+                        .await;
+                    break;
+                }
+
+                tracing::info!(
+                    active_context,
+                    active_containers,
+                    "Single-message mode waiting for spawned jobs"
+                );
+                let snapshot = (active_context, active_containers);
+                if Some(snapshot) != last_snapshot
+                    || last_report_at.elapsed() >= std::time::Duration::from_secs(10)
+                {
+                    last_snapshot = Some(snapshot);
+                    last_report_at = std::time::Instant::now();
+                    let _ = self
+                        .channels
+                        .send_status(
+                            "repl",
+                            StatusUpdate::Status(format!(
+                                "Waiting: {} context job(s), {} container job(s) active...",
+                                active_context, active_containers
+                            )),
+                            &serde_json::json!({}),
+                        )
+                        .await;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+
         // Cleanup
         tracing::info!("Agent shutting down...");
         repair_handle.abort();
@@ -562,6 +719,12 @@ impl Agent {
             cron_handle.abort();
         }
         if let Some(handle) = reflex_handle {
+            handle.abort();
+        }
+        if let Some(handle) = kernel_handle {
+            handle.abort();
+        }
+        if let Some(handle) = shadow_prune_handle {
             handle.abort();
         }
         self.scheduler.stop_all().await;
@@ -661,7 +824,7 @@ impl Agent {
             }
             Submission::Undo => self.process_undo(session, thread_id).await,
             Submission::Redo => self.process_redo(session, thread_id).await,
-            Submission::Interrupt => self.process_interrupt(session, thread_id).await,
+            Submission::Interrupt => self.process_interrupt(message, session, thread_id).await,
             Submission::Compact => self.process_compact(session, thread_id).await,
             Submission::Clear => self.process_clear(session, thread_id).await,
             Submission::NewThread => self.process_new_thread(message).await,

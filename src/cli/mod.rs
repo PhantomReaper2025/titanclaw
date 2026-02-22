@@ -147,6 +147,26 @@ pub enum Command {
         #[arg(long, default_value = "sonnet")]
         model: String,
     },
+
+    /// Run as an OpenCode bridge inside a Docker container (internal use).
+    /// Spawns the `opencode` CLI and streams output back to the orchestrator.
+    OpenCodeBridge {
+        /// Job ID to execute.
+        #[arg(long)]
+        job_id: uuid::Uuid,
+
+        /// URL of the orchestrator's internal API.
+        #[arg(long, default_value = "http://host.docker.internal:50051")]
+        orchestrator_url: String,
+
+        /// Maximum agentic turns for OpenCode follow-ups.
+        #[arg(long, default_value = "50")]
+        max_turns: u32,
+
+        /// OpenCode model to use (e.g. "openai/gpt-4.1-mini").
+        #[arg(long, default_value = "openai/gpt-4.1-mini")]
+        model: String,
+    },
 }
 
 impl Cli {

@@ -54,6 +54,7 @@ async fn start_test_server() -> (
         llm_provider: None,
         skill_registry: None,
         skill_catalog: None,
+        kernel_orchestrator: None,
         chat_rate_limiter: ironclaw::channels::web::server::RateLimiter::new(30, 60),
     });
 

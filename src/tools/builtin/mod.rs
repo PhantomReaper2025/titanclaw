@@ -7,6 +7,7 @@ mod http;
 pub mod jit_tool;
 mod job;
 mod json;
+mod kernel;
 mod memory;
 pub mod routine;
 pub(crate) mod shell;
@@ -25,6 +26,7 @@ pub use job::{
     PromptQueue,
 };
 pub use json::JsonTool;
+pub use kernel::KernelPatchTool;
 pub use memory::{
     MemoryGraphTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool,
 };

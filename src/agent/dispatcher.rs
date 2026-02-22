@@ -1055,6 +1055,13 @@ impl Agent {
             }
         }
 
+        if let Some(orchestrator) = self.kernel_orchestrator() {
+            let success = matches!(result, Ok(Ok(_)));
+            orchestrator
+                .record_tool_execution(tool_name, elapsed, success)
+                .await;
+        }
+
         let result = result
             .map_err(|_| crate::error::ToolError::Timeout {
                 name: tool_name.to_string(),

@@ -16,7 +16,7 @@ use axum::{
         Html, IntoResponse,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
@@ -143,6 +143,8 @@ pub struct GatewayState {
     pub skill_registry: Option<Arc<std::sync::RwLock<crate::skills::SkillRegistry>>>,
     /// Skill catalog for searching the ClawHub registry.
     pub skill_catalog: Option<Arc<crate::skills::catalog::SkillCatalog>>,
+    /// Kernel patch orchestrator for review/approval APIs.
+    pub kernel_orchestrator: Option<Arc<crate::agent::kernel_orchestrator::KernelOrchestrator>>,
     /// Rate limiter for chat endpoints (30 messages per 60 seconds).
     pub chat_rate_limiter: RateLimiter,
 }
@@ -185,6 +187,8 @@ pub async fn start_server(
         .route("/api/chat/history", get(chat_history_handler))
         .route("/api/chat/threads", get(chat_threads_handler))
         .route("/api/chat/thread/new", post(chat_new_thread_handler))
+        .route("/api/chat/thread/{id}", delete(chat_delete_thread_handler))
+        .route("/api/chat/threads", delete(chat_clear_threads_handler))
         // Memory
         .route("/api/memory/tree", get(memory_tree_handler))
         .route("/api/memory/list", get(memory_list_handler))
@@ -192,7 +196,10 @@ pub async fn start_server(
         .route("/api/memory/write", post(memory_write_handler))
         .route("/api/memory/search", post(memory_search_handler))
         // Jobs
-        .route("/api/jobs", get(jobs_list_handler))
+        .route(
+            "/api/jobs",
+            get(jobs_list_handler).post(jobs_create_handler),
+        )
         .route("/api/jobs/summary", get(jobs_summary_handler))
         .route("/api/jobs/{id}", get(jobs_detail_handler))
         .route("/api/jobs/{id}/cancel", post(jobs_cancel_handler))
@@ -201,6 +208,10 @@ pub async fn start_server(
         .route("/api/jobs/{id}/events", get(jobs_events_handler))
         .route("/api/jobs/{id}/files/list", get(job_files_list_handler))
         .route("/api/jobs/{id}/files/read", get(job_files_read_handler))
+        .route(
+            "/api/jobs/{id}/files/download",
+            get(job_files_download_handler),
+        )
         // Logs
         .route("/api/logs/events", get(logs_events_handler))
         // Extensions
@@ -246,6 +257,20 @@ pub async fn start_server(
         .route(
             "/api/settings/{key}",
             axum::routing::delete(settings_delete_handler),
+        )
+        // Kernel patch proposals
+        .route("/api/kernel/patches", get(kernel_patches_handler))
+        .route(
+            "/api/kernel/patches/{id}/approve",
+            post(kernel_patch_approve_handler),
+        )
+        .route(
+            "/api/kernel/patches/{id}/reject",
+            post(kernel_patch_reject_handler),
+        )
+        .route(
+            "/api/kernel/patches/{id}/deploy",
+            post(kernel_patch_deploy_handler),
         )
         // Gateway control plane
         .route("/api/gateway/status", get(gateway_status_handler))
@@ -353,6 +378,145 @@ async fn health_handler() -> Json<HealthResponse> {
         status: "healthy",
         channel: "gateway",
     })
+}
+
+// --- Kernel patch management handlers ---
+
+async fn kernel_patches_handler(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
+    let Some(orchestrator) = &state.kernel_orchestrator else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "kernel orchestrator not enabled"
+            })),
+        )
+            .into_response();
+    };
+
+    let patches = orchestrator.list_patches().await;
+    let items: Vec<serde_json::Value> = patches
+        .into_iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id.to_string(),
+                "tool_name": p.tool_name,
+                "reason": p.reason,
+                "expected_speedup": p.expected_speedup,
+                "status": format!("{:?}", p.status),
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "count": items.len(),
+            "patches": items
+        })),
+    )
+        .into_response()
+}
+
+async fn kernel_patch_approve_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    kernel_patch_action(&state, &id, "approve").await
+}
+
+async fn kernel_patch_reject_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    kernel_patch_action(&state, &id, "reject").await
+}
+
+async fn kernel_patch_deploy_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    kernel_patch_action(&state, &id, "deploy").await
+}
+
+async fn kernel_patch_action(
+    state: &Arc<GatewayState>,
+    id: &str,
+    action: &str,
+) -> axum::response::Response {
+    let Some(orchestrator) = &state.kernel_orchestrator else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "kernel orchestrator not enabled"
+            })),
+        )
+            .into_response();
+    };
+
+    let patch_id = match Uuid::parse_str(id) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("invalid patch id: {}", e)
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match action {
+        "approve" => {
+            let ok = orchestrator.approve_patch(patch_id).await;
+            if ok {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"patch_id": patch_id, "approved": true})),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "patch not found"})),
+                )
+                    .into_response()
+            }
+        }
+        "reject" => {
+            let ok = orchestrator.reject_patch(patch_id).await;
+            if ok {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"patch_id": patch_id, "rejected": true})),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "patch not found"})),
+                )
+                    .into_response()
+            }
+        }
+        "deploy" => match orchestrator.deploy_patch_by_id(patch_id).await {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(serde_json::json!({"patch_id": patch_id, "deployed": true})),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"patch_id": patch_id, "deployed": false, "error": e})),
+            )
+                .into_response(),
+        },
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "unknown action"})),
+        )
+            .into_response(),
+    }
 }
 
 // --- Chat handlers ---
@@ -904,6 +1068,98 @@ async fn chat_new_thread_handler(
     Ok(Json(info))
 }
 
+async fn chat_delete_thread_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let thread_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid thread ID".to_string()))?;
+
+    let session_manager = state.session_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Session manager not available".to_string(),
+    ))?;
+
+    let session = session_manager.get_or_create_session(&state.user_id).await;
+    let mut sess = session.lock().await;
+
+    let owned = if let Some(ref store) = state.store {
+        store
+            .conversation_belongs_to_user(thread_id, &state.user_id)
+            .await
+            .unwrap_or(false)
+            || sess.threads.contains_key(&thread_id)
+    } else {
+        sess.threads.contains_key(&thread_id)
+    };
+
+    if !owned {
+        return Err((StatusCode::NOT_FOUND, "Thread not found".to_string()));
+    }
+
+    let mut deleted = false;
+    if let Some(ref store) = state.store {
+        deleted = store
+            .delete_conversation_for_user(thread_id, &state.user_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    sess.threads.remove(&thread_id);
+    if sess.active_thread == Some(thread_id) {
+        sess.active_thread = if let Some(ref store) = state.store {
+            store
+                .get_or_create_assistant_conversation(&state.user_id, "gateway")
+                .await
+                .ok()
+        } else {
+            sess.threads.keys().copied().next()
+        };
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "deleted",
+        "thread_id": thread_id,
+        "deleted": deleted || owned,
+        "active_thread": sess.active_thread,
+    })))
+}
+
+async fn chat_clear_threads_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let session_manager = state.session_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Session manager not available".to_string(),
+    ))?;
+    let session = session_manager.get_or_create_session(&state.user_id).await;
+    let mut sess = session.lock().await;
+
+    let in_memory_count = sess.threads.len() as u64;
+    sess.threads.clear();
+    sess.active_thread = None;
+
+    let mut deleted_count = 0u64;
+    let mut assistant_thread: Option<Uuid> = None;
+    if let Some(ref store) = state.store {
+        deleted_count = store
+            .delete_all_conversations_for_user_channel(&state.user_id, "gateway")
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        assistant_thread = store
+            .get_or_create_assistant_conversation(&state.user_id, "gateway")
+            .await
+            .ok();
+        sess.active_thread = assistant_thread;
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "cleared",
+        "deleted_threads": deleted_count.max(in_memory_count),
+        "assistant_thread": assistant_thread,
+    })))
+}
+
 // --- Memory handlers ---
 
 #[derive(Deserialize)]
@@ -1107,6 +1363,99 @@ async fn jobs_list_handler(
     Ok(Json(JobListResponse { jobs }))
 }
 
+#[derive(Debug, Deserialize)]
+struct JobCreateRequest {
+    task: String,
+    mode: Option<String>,
+}
+
+async fn jobs_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<JobCreateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let task = body.task.trim();
+    if task.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "task is required".to_string()));
+    }
+
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let jm = state.job_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Sandbox not enabled".to_string(),
+    ))?;
+
+    let mode = match body.mode.as_deref().unwrap_or("worker") {
+        "worker" => crate::orchestrator::job_manager::JobMode::Worker,
+        "claude_code" => crate::orchestrator::job_manager::JobMode::ClaudeCode,
+        "opencode" => crate::orchestrator::job_manager::JobMode::OpenCode,
+        other => {
+            return Err((StatusCode::BAD_REQUEST, format!("invalid mode '{}'", other)));
+        }
+    };
+
+    let job_id = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let project_dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".ironclaw")
+        .join("projects")
+        .join(job_id.to_string());
+    tokio::fs::create_dir_all(&project_dir).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to create project dir: {}", e),
+        )
+    })?;
+
+    let record = crate::history::SandboxJobRecord {
+        id: job_id,
+        task: task.to_string(),
+        status: "creating".to_string(),
+        user_id: state.user_id.clone(),
+        project_dir: project_dir.display().to_string(),
+        success: None,
+        failure_reason: None,
+        created_at: now,
+        started_at: None,
+        completed_at: None,
+        credential_grants_json: "[]".to_string(),
+    };
+    store
+        .save_sandbox_job(&record)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if mode != crate::orchestrator::job_manager::JobMode::Worker {
+        let _ = store
+            .update_sandbox_job_mode(job_id, mode.as_str())
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    jm.create_job(job_id, task, Some(project_dir), mode, vec![])
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create container: {}", e),
+            )
+        })?;
+
+    store
+        .update_sandbox_job_status(job_id, "running", None, None, Some(now), None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "started",
+        "job_id": job_id,
+        "mode": mode.as_str(),
+    })))
+}
+
 async fn jobs_summary_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<JobSummaryResponse>, (StatusCode, String)> {
@@ -1303,6 +1652,7 @@ async fn jobs_restart_handler(
     // Look up the original job's mode so the restart uses the same mode.
     let mode = match store.get_sandbox_job_mode(old_job_id).await {
         Ok(Some(m)) if m == "claude_code" => crate::orchestrator::job_manager::JobMode::ClaudeCode,
+        Ok(Some(m)) if m == "opencode" => crate::orchestrator::job_manager::JobMode::OpenCode,
         _ => crate::orchestrator::job_manager::JobMode::Worker,
     };
 
@@ -1570,6 +1920,134 @@ async fn job_files_read_handler(
         path: path.to_string(),
         content,
     }))
+}
+
+async fn job_files_download_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Query(query): Query<FilePathQuery>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let job_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
+
+    let job = store
+        .get_sandbox_job(job_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Job not found".to_string()))?;
+
+    if job.user_id != state.user_id {
+        return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
+    }
+
+    let base = std::path::PathBuf::from(&job.project_dir);
+    let rel_path = query.path.as_deref().unwrap_or("");
+    let target = base.join(rel_path);
+
+    let canonical = target
+        .canonicalize()
+        .map_err(|_| (StatusCode::NOT_FOUND, "Path not found".to_string()))?;
+    let base_canonical = base
+        .canonicalize()
+        .map_err(|_| (StatusCode::NOT_FOUND, "Project dir not found".to_string()))?;
+    if !canonical.starts_with(&base_canonical) {
+        return Err((StatusCode::FORBIDDEN, "Forbidden".to_string()));
+    }
+
+    let archive_bytes = build_tar_gz_archive(&canonical).await?;
+
+    let name_part = if rel_path.is_empty() {
+        format!("job-{}", job_id)
+    } else {
+        rel_path.replace(['/', '\\'], "_")
+    };
+    let filename = format!("{}.tar.gz", sanitize_download_name(&name_part));
+    let disposition = format!("attachment; filename=\"{}\"", filename);
+
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/gzip")
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .body(axum::body::Body::from(archive_bytes))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build response: {}", e),
+            )
+        })
+}
+
+fn sanitize_download_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "download".to_string()
+    } else {
+        cleaned
+    }
+}
+
+async fn build_tar_gz_archive(path: &std::path::Path) -> Result<Vec<u8>, (StatusCode, String)> {
+    let (cwd, target_name) = if path.is_file() {
+        let parent = path.parent().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Cannot resolve file parent path".to_string(),
+        ))?;
+        let name = path.file_name().and_then(|n| n.to_str()).ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Cannot resolve file name".to_string(),
+        ))?;
+        (parent.to_path_buf(), name.to_string())
+    } else {
+        let parent = path.parent().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Cannot resolve directory parent path".to_string(),
+        ))?;
+        let name = path.file_name().and_then(|n| n.to_str()).ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Cannot resolve directory name".to_string(),
+        ))?;
+        (parent.to_path_buf(), name.to_string())
+    };
+
+    let output = tokio::process::Command::new("tar")
+        .arg("-czf")
+        .arg("-")
+        .arg(&target_name)
+        .current_dir(cwd)
+        .output()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to execute tar: {}", e),
+            )
+        })?;
+
+    if !output.status.success() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Archive command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+
+    Ok(output.stdout)
 }
 
 // --- Logs handlers ---

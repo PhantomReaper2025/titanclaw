@@ -182,6 +182,26 @@ impl ConversationStore for PgBackend {
             .conversation_belongs_to_user(conversation_id, user_id)
             .await
     }
+
+    async fn delete_conversation_for_user(
+        &self,
+        conversation_id: Uuid,
+        user_id: &str,
+    ) -> Result<bool, DatabaseError> {
+        self.store
+            .delete_conversation_for_user(conversation_id, user_id)
+            .await
+    }
+
+    async fn delete_all_conversations_for_user_channel(
+        &self,
+        user_id: &str,
+        channel: &str,
+    ) -> Result<u64, DatabaseError> {
+        self.store
+            .delete_all_conversations_for_user_channel(user_id, channel)
+            .await
+    }
 }
 
 // ==================== JobStore ====================
