@@ -80,6 +80,13 @@ impl OpenCodeBridgeRuntime {
                 iteration: 0,
             })
             .await?;
+        self.report_event(
+            "status",
+            &serde_json::json!({
+                "message": format!("Starting OpenCode bridge (model: {})", model),
+            }),
+        )
+        .await;
 
         // Initial session run.
         if let Err(e) = self
@@ -158,6 +165,13 @@ impl OpenCodeBridgeRuntime {
                 iterations: iteration,
             })
             .await?;
+        self.report_event(
+            "status",
+            &serde_json::json!({
+                "message": "OpenCode bridge completed",
+            }),
+        )
+        .await;
 
         Ok(())
     }
@@ -169,6 +183,16 @@ impl OpenCodeBridgeRuntime {
         model: &str,
         extra_env: &HashMap<String, String>,
     ) -> Result<(), WorkerError> {
+        self.report_event(
+            "status",
+            &serde_json::json!({
+                "message": if resume { "Continuing OpenCode session..." } else { "Launching OpenCode session..." },
+                "resume": resume,
+                "model": model,
+            }),
+        )
+        .await;
+
         let mut cmd = Command::new("opencode");
         cmd.arg("run")
             .arg("--format")
@@ -266,6 +290,14 @@ impl OpenCodeBridgeRuntime {
             }
         }
 
+        self.report_event(
+            "status",
+            &serde_json::json!({
+                "message": "OpenCode process finished emitting stdout; waiting for exit status...",
+            }),
+        )
+        .await;
+
         let status = child
             .wait()
             .await
@@ -302,6 +334,14 @@ impl OpenCodeBridgeRuntime {
                     code, stderr_excerpt
                 )
             };
+            self.report_event(
+                "status",
+                &serde_json::json!({
+                    "message": reason.clone(),
+                    "exit_code": code,
+                }),
+            )
+            .await;
             return Err(WorkerError::ExecutionFailed { reason });
         }
 
@@ -331,9 +371,19 @@ impl OpenCodeBridgeRuntime {
 
 fn opencode_json_to_payloads(v: &serde_json::Value) -> Option<Vec<JobEventPayload>> {
     let mut payloads = Vec::new();
-    let event_type = v.get("type").and_then(|x| x.as_str());
-    let role = v.get("role").and_then(|x| x.as_str());
-    let content = v.get("content");
+    let event_type = v
+        .get("type")
+        .or_else(|| v.get("event"))
+        .and_then(|x| x.as_str());
+    let role = v
+        .get("role")
+        .or_else(|| v.get("author").and_then(|a| a.get("role")))
+        .and_then(|x| x.as_str());
+    let content = v
+        .get("content")
+        .or_else(|| v.get("message").and_then(|m| m.get("content")))
+        .or_else(|| v.get("delta"))
+        .or_else(|| v.get("text"));
 
     match (event_type, role) {
         (Some("message"), Some("assistant")) => {
@@ -347,20 +397,47 @@ fn opencode_json_to_payloads(v: &serde_json::Value) -> Option<Vec<JobEventPayloa
                 });
             }
         }
+        (Some("assistant"), _) | (Some("assistant_message"), _) | (Some("output_text"), _) => {
+            if let Some(text) = extract_text(content) {
+                payloads.push(JobEventPayload {
+                    event_type: "message".to_string(),
+                    data: serde_json::json!({
+                        "role": "assistant",
+                        "content": text,
+                    }),
+                });
+            }
+        }
+        (Some("delta"), _) | (Some("content_delta"), _) => {
+            if let Some(text) = extract_text(content) {
+                payloads.push(JobEventPayload {
+                    event_type: "status".to_string(),
+                    data: serde_json::json!({
+                        "message": format!("stream: {}", text),
+                    }),
+                });
+            }
+        }
         (Some("tool_use"), _) => {
             payloads.push(JobEventPayload {
                 event_type: "tool_use".to_string(),
                 data: serde_json::json!({
-                    "tool_name": v.get("name"),
-                    "input": v.get("input"),
+                    "tool_name": v.get("name").or_else(|| v.get("tool_name")),
+                    "input": v.get("input").or_else(|| v.get("arguments")),
                 }),
             });
         }
         (Some("tool_result"), _) => {
+            let tool_name = v
+                .get("tool_name")
+                .or_else(|| v.get("name"))
+                .cloned()
+                .unwrap_or(serde_json::Value::String("unknown".to_string()));
             payloads.push(JobEventPayload {
                 event_type: "tool_result".to_string(),
                 data: serde_json::json!({
-                    "output": v.get("output").or_else(|| v.get("content")),
+                    "tool_name": tool_name,
+                    "output": stringify_json(v.get("output").or_else(|| v.get("content"))),
                 }),
             });
         }
@@ -369,7 +446,7 @@ fn opencode_json_to_payloads(v: &serde_json::Value) -> Option<Vec<JobEventPayloa
                 event_type: "result".to_string(),
                 data: serde_json::json!({
                     "status": "completed",
-                    "output": v.get("output").or_else(|| v.get("content")),
+                    "output": stringify_json(v.get("output").or_else(|| v.get("content"))),
                 }),
             });
         }
@@ -392,6 +469,14 @@ fn opencode_json_to_payloads(v: &serde_json::Value) -> Option<Vec<JobEventPayloa
         None
     } else {
         Some(payloads)
+    }
+}
+
+fn stringify_json(v: Option<&serde_json::Value>) -> Option<String> {
+    match v {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(other) => Some(other.to_string()),
+        None => None,
     }
 }
 

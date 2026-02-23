@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use crate::extensions::discovery::OnlineDiscovery;
 use crate::extensions::registry::ExtensionRegistry;
@@ -29,8 +30,8 @@ use crate::tools::wasm::{WasmToolLoader, WasmToolRuntime, discover_tools};
 
 /// Pending OAuth authorization state.
 struct PendingAuth {
-    _name: String,
-    _kind: ExtensionKind,
+    name: String,
+    kind: ExtensionKind,
     created_at: std::time::Instant,
 }
 
@@ -61,6 +62,10 @@ pub struct ExtensionManager {
 }
 
 impl ExtensionManager {
+    fn generate_oauth_state() -> String {
+        Uuid::new_v4().to_string()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         mcp_session_manager: Arc<McpSessionManager>,
@@ -689,21 +694,24 @@ impl ExtensionManager {
         };
 
         let pkce = PkceChallenge::generate();
+        let oauth_state = Self::generate_oauth_state();
+        let mut extra_params = std::collections::HashMap::new();
+        extra_params.insert("state".to_string(), oauth_state.clone());
         let auth_url = build_authorization_url(
             &metadata.authorization_endpoint,
             &client_id,
             &redirect_uri,
             &metadata.scopes_supported,
             Some(&pkce),
-            &std::collections::HashMap::new(),
+            &extra_params,
         );
 
-        // Store pending auth for later callback handling
+        // Store pending auth keyed by OAuth state for callback verification.
         self.pending_auth.write().await.insert(
-            name.to_string(),
+            oauth_state,
             PendingAuth {
-                _name: name.to_string(),
-                _kind: ExtensionKind::McpServer,
+                name: name.to_string(),
+                kind: ExtensionKind::McpServer,
                 created_at: std::time::Instant::now(),
             },
         );
@@ -1007,6 +1015,28 @@ impl ExtensionManager {
     async fn cleanup_expired_auths(&self) {
         let mut pending = self.pending_auth.write().await;
         pending.retain(|_, auth| auth.created_at.elapsed() < std::time::Duration::from_secs(300));
+    }
+
+    /// Validate and consume an OAuth state nonce created for a remote callback.
+    pub async fn validate_and_consume_oauth_state(
+        &self,
+        state: &str,
+    ) -> Result<(), ExtensionError> {
+        self.cleanup_expired_auths().await;
+        let pending = self.pending_auth.write().await.remove(state);
+        match pending {
+            Some(auth) => {
+                tracing::info!(
+                    extension = %auth.name,
+                    kind = ?auth.kind,
+                    "Validated OAuth callback state"
+                );
+                Ok(())
+            }
+            None => Err(ExtensionError::AuthFailed(
+                "Invalid or expired OAuth state".to_string(),
+            )),
+        }
     }
 }
 

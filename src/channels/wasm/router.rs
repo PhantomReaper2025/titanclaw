@@ -402,11 +402,11 @@ async fn webhook_handler(
 /// via a tunnel URL (remote callback).
 #[allow(dead_code)]
 async fn oauth_callback_handler(
-    State(_state): State<RouterState>,
+    State(router_state): State<RouterState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let code = params.get("code").cloned().unwrap_or_default();
-    let _state = params.get("state").cloned().unwrap_or_default();
+    let state_nonce = params.get("state").cloned().unwrap_or_default();
 
     if code.is_empty() {
         let error = params
@@ -428,9 +428,63 @@ async fn oauth_callback_handler(
         );
     }
 
-    // TODO: In a future iteration, use the state nonce to look up the pending auth
-    // and complete the token exchange. For now, the OAuth flow uses local callbacks
-    // via authorize_mcp_server() which handles the full flow synchronously.
+    if state_nonce.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::response::Html(
+                "<!DOCTYPE html><html><body style=\"font-family: sans-serif; \
+                 display: flex; justify-content: center; align-items: center; \
+                 height: 100vh; margin: 0; background: #191919; color: white;\">\
+                 <div style=\"text-align: center;\">\
+                 <h1>Authorization Failed</h1>\
+                 <p>Missing OAuth state parameter.</p>\
+                 </div></body></html>"
+                    .to_string(),
+            ),
+        );
+    }
+
+    let manager = match &router_state.extension_manager {
+        Some(manager) => manager,
+        None => {
+            tracing::warn!("OAuth callback received but extension manager is not configured");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::response::Html(
+                    "<!DOCTYPE html><html><body style=\"font-family: sans-serif; \
+                     display: flex; justify-content: center; align-items: center; \
+                     height: 100vh; margin: 0; background: #191919; color: white;\">\
+                     <div style=\"text-align: center;\">\
+                     <h1>Authorization Failed</h1>\
+                     <p>Extension authentication is not available on this instance.</p>\
+                     </div></body></html>"
+                        .to_string(),
+                ),
+            );
+        }
+    };
+
+    if let Err(e) = manager.validate_and_consume_oauth_state(&state_nonce).await {
+        tracing::warn!(error = %e, "Rejected OAuth callback with invalid state");
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::response::Html(
+                "<!DOCTYPE html><html><body style=\"font-family: sans-serif; \
+                 display: flex; justify-content: center; align-items: center; \
+                 height: 100vh; margin: 0; background: #191919; color: white;\">\
+                 <div style=\"text-align: center;\">\
+                 <h1>Authorization Failed</h1>\
+                 <p>Invalid or expired authorization state.</p>\
+                 </div></body></html>"
+                    .to_string(),
+            ),
+        );
+    }
+
+    tracing::info!(
+        code_len = code.len(),
+        "OAuth callback state validated (token exchange completion is handled elsewhere)"
+    );
 
     (
         StatusCode::OK,
@@ -440,7 +494,7 @@ async fn oauth_callback_handler(
              height: 100vh; margin: 0; background: #191919; color: white;\">\
              <div style=\"text-align: center;\">\
              <h1>Connected!</h1>\
-             <p>You can close this window and return to IronClaw.</p>\
+             <p>Authorization state verified. You can close this window and return to TitanClaw.</p>\
              </div></body></html>"
                 .to_string(),
         ),
@@ -471,6 +525,10 @@ pub fn create_wasm_channel_router(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
 
     use crate::channels::wasm::capabilities::ChannelCapabilities;
     use crate::channels::wasm::router::{RegisteredEndpoint, WasmChannelRouter};
@@ -628,5 +686,33 @@ mod tests {
             .register(channel2, vec![], Some("secret456".to_string()), None)
             .await;
         assert_eq!(router.get_secret_header("slack").await, "X-Webhook-Secret");
+    }
+
+    #[tokio::test]
+    async fn test_oauth_callback_rejects_missing_state() {
+        let router = Arc::new(WasmChannelRouter::new());
+        let app = super::create_wasm_channel_router(router, None);
+
+        let req = Request::builder()
+            .uri("/oauth/callback?code=test-code")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_oauth_callback_rejects_without_extension_manager() {
+        let router = Arc::new(WasmChannelRouter::new());
+        let app = super::create_wasm_channel_router(router, None);
+
+        let req = Request::builder()
+            .uri("/oauth/callback?code=test-code&state=test-state")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

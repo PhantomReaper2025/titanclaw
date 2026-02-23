@@ -292,7 +292,7 @@ impl WorkerHttpClient {
 
         match resp {
             Ok(r) if !r.status().is_success() => {
-                tracing::debug!(
+                tracing::warn!(
                     job_id = %self.job_id,
                     event_type = %payload.event_type,
                     status = %r.status(),
@@ -300,7 +300,7 @@ impl WorkerHttpClient {
                 );
             }
             Err(e) => {
-                tracing::debug!(
+                tracing::warn!(
                     job_id = %self.job_id,
                     event_type = %payload.event_type,
                     "Job event POST failed: {}", e

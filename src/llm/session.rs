@@ -244,11 +244,10 @@ impl SessionManager {
         println!("║                                                                ║");
         println!("║    [1] GitHub                                                  ║");
         println!("║    [2] Google                                                  ║");
-        println!("║    [3] NEAR Wallet (coming soon)                               ║");
         println!("║                                                                ║");
         println!("╚════════════════════════════════════════════════════════════════╝");
         println!();
-        print!("Enter choice [1-3]: ");
+        print!("Enter choice [1-2] (default 1): ");
 
         // Flush stdout to ensure prompt is displayed
         use std::io::Write;
@@ -280,19 +279,10 @@ impl SessionManager {
                 );
                 ("google", url)
             }
-            "3" => {
-                println!();
-                println!("NEAR Wallet authentication is not yet implemented.");
-                println!("Please use GitHub or Google for now.");
-                return Err(LlmError::SessionRenewalFailed {
-                    provider: "nearai".to_string(),
-                    reason: "NEAR Wallet auth not yet implemented".to_string(),
-                });
-            }
             _ => {
                 return Err(LlmError::SessionRenewalFailed {
                     provider: "nearai".to_string(),
-                    reason: format!("Invalid choice: {}", choice.trim()),
+                    reason: format!("Invalid choice: {} (use 1 or 2)", choice.trim()),
                 });
             }
         };

@@ -585,12 +585,34 @@ fn handle_message(
     phone_number_id: &str,
     contact_names: &std::collections::HashMap<String, String>,
 ) {
-    // Only handle text messages for now
-    // TODO: Add support for image, audio, video, document, etc.
+    // Only handle text messages for now. Non-text messages are converted into
+    // an explicit placeholder so the agent/user can see why nothing happened.
     if message.message_type != "text" {
+        let user_name = contact_names.get(&message.from).cloned();
+        let metadata = WhatsAppMessageMetadata {
+            phone_number_id: phone_number_id.to_string(),
+            sender_phone: message.from.clone(),
+            message_id: message.id.clone(),
+            timestamp: message.timestamp.clone(),
+        };
+        let metadata_json = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
+
+        channel_host::emit_message(&EmittedMessage {
+            user_id: message.from.clone(),
+            user_name,
+            content: format!(
+                "[Unsupported WhatsApp message type received: {}. Ask the user to resend as text.]",
+                message.message_type
+            ),
+            thread_id: None,
+            metadata_json,
+        });
         channel_host::log(
-            channel_host::LogLevel::Debug,
-            &format!("Skipping non-text message type: {}", message.message_type),
+            channel_host::LogLevel::Warn,
+            &format!(
+                "Non-text WhatsApp message emitted as placeholder (type={})",
+                message.message_type
+            ),
         );
         return;
     }

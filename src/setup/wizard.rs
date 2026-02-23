@@ -1083,15 +1083,28 @@ impl SetupWizard {
     ///
     /// Each entry is `(model_id, display_label)`.
     fn select_from_model_list(&mut self, models: &[(String, String)]) -> Result<(), SetupError> {
+        let selected =
+            self.select_model_value_from_list(models, "Select a model:", "Custom model ID")?;
+        self.settings.selected_model = Some(selected.clone());
+        print_success(&format!("Selected {}", selected));
+        Ok(())
+    }
+
+    fn select_model_value_from_list(
+        &self,
+        models: &[(String, String)],
+        prompt: &str,
+        custom_label: &str,
+    ) -> Result<String, SetupError> {
         println!("Available models:");
         println!();
 
         let mut options: Vec<&str> = models.iter().map(|(_, desc)| desc.as_str()).collect();
-        options.push("Custom model ID");
+        options.push(custom_label);
 
-        let choice = select_one("Select a model:", &options).map_err(SetupError::Io)?;
+        let choice = select_one(prompt, &options).map_err(SetupError::Io)?;
 
-        let selected = if choice == options.len() - 1 {
+        if choice == options.len() - 1 {
             loop {
                 let raw = input("Enter model ID").map_err(SetupError::Io)?;
                 let trimmed = raw.trim().to_string();
@@ -1099,15 +1112,11 @@ impl SetupWizard {
                     println!("Model ID cannot be empty.");
                     continue;
                 }
-                break trimmed;
+                return Ok(trimmed);
             }
-        } else {
-            models[choice].0.clone()
-        };
+        }
 
-        self.settings.selected_model = Some(selected.clone());
-        print_success(&format!("Selected {}", selected));
-        Ok(())
+        Ok(models[choice].0.clone())
     }
 
     /// Fetch available models from the NEAR AI API.
@@ -1562,14 +1571,22 @@ impl SetupWizard {
             .settings
             .opencode_model_default
             .as_deref()
-            .unwrap_or("openai/gpt-4.1-mini");
-        let opencode_model = optional_input(
-            "Default OpenCode model",
-            Some(&format!("default: {}", opencode_default)),
-        )
-        .map_err(SetupError::Io)?;
-        self.settings.opencode_model_default =
-            Some(opencode_model.unwrap_or_else(|| opencode_default.to_string()));
+            .unwrap_or("gpt-5");
+        print_info("Fetching OpenCode model list (opencode.ai)...");
+        let mut opencode_models = fetch_opencode_models().await;
+        if let Some(pos) = opencode_models
+            .iter()
+            .position(|(id, _)| id == opencode_default)
+        {
+            let current = opencode_models.remove(pos);
+            opencode_models.insert(0, current);
+        }
+        let selected = self.select_model_value_from_list(
+            &opencode_models,
+            "Select a default OpenCode model:",
+            "Custom OpenCode model ID",
+        )?;
+        self.settings.opencode_model_default = Some(selected);
 
         Ok(())
     }
@@ -2217,6 +2234,60 @@ async fn fetch_ollama_models(base_url: &str) -> Vec<(String, String)> {
                 return static_defaults;
             }
             models
+        }
+        Err(_) => static_defaults,
+    }
+}
+
+/// Fetch model IDs exposed by OpenCode's Zen models endpoint.
+///
+/// Returns `(model_id, display_label)` pairs. Falls back to static defaults on error.
+async fn fetch_opencode_models() -> Vec<(String, String)> {
+    let static_defaults = vec![
+        ("gpt-5".into(), "gpt-5".into()),
+        ("gpt-5-codex".into(), "gpt-5-codex".into()),
+        ("claude-sonnet-4-5".into(), "claude-sonnet-4-5".into()),
+        ("claude-opus-4-1".into(), "claude-opus-4-1".into()),
+        ("gemini-3-flash".into(), "gemini-3-flash".into()),
+    ];
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .get("https://opencode.ai/zen/v1/models")
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return static_defaults,
+    };
+
+    #[derive(serde::Deserialize)]
+    struct ModelEntry {
+        id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct ModelsResponse {
+        data: Vec<ModelEntry>,
+    }
+
+    match resp.json::<ModelsResponse>().await {
+        Ok(body) => {
+            let mut seen = std::collections::HashSet::new();
+            let mut models = Vec::new();
+            for entry in body.data {
+                let id = entry.id.trim().to_string();
+                if id.is_empty() || !seen.insert(id.clone()) {
+                    continue;
+                }
+                models.push((id.clone(), id));
+            }
+
+            if models.is_empty() {
+                static_defaults
+            } else {
+                models
+            }
         }
         Err(_) => static_defaults,
     }

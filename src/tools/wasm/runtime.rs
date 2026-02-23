@@ -12,6 +12,7 @@ use tokio::sync::RwLock;
 use wasmtime::{Config, Engine, OptLevel};
 
 use crate::tools::wasm::error::WasmError;
+use crate::tools::wasm::introspection::{MetadataSource, probe_tool_metadata};
 use crate::tools::wasm::limits::{FuelConfig, ResourceLimits};
 
 /// Default epoch tick interval. Each tick increments the engine's epoch counter,
@@ -182,6 +183,7 @@ impl WasmToolRuntime {
         let wasm_bytes = wasm_bytes.to_vec();
         let engine = self.engine.clone();
         let default_limits = self.config.default_limits.clone();
+        let fuel_enabled = self.config.fuel_config.enabled;
 
         // Compile in blocking task (Wasmtime compilation is synchronous)
         let prepared = tokio::task::spawn_blocking(move || {
@@ -192,8 +194,43 @@ impl WasmToolRuntime {
             // We need to instantiate briefly to extract metadata.
             // In a full implementation, we'd use WIT bindgen to get typed access.
             // For now, we extract what we can from the component.
-            let description = extract_tool_description(&engine, &component)?;
-            let schema = extract_tool_schema(&engine, &component)?;
+            let (description, schema) = match probe_tool_metadata(
+                &engine,
+                &component,
+                &name,
+                fuel_enabled,
+            ) {
+                Ok(probed) => {
+                    let description = probed
+                        .description
+                        .unwrap_or_else(|| extract_tool_description_fallback(&name));
+                    let schema = probed
+                        .schema
+                        .unwrap_or_else(|| extract_tool_schema_fallback(&name));
+                    match probed.source {
+                        MetadataSource::WitExport => tracing::info!(
+                            tool = %name,
+                            "Prepared WASM tool metadata from WIT exports"
+                        ),
+                        MetadataSource::Fallback => tracing::warn!(
+                            tool = %name,
+                            "WASM tool metadata probe returned no usable metadata; using fallback"
+                        ),
+                    }
+                    (description, schema)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        tool = %name,
+                        error = %e,
+                        "WASM metadata probe failed; using fallback metadata"
+                    );
+                    (
+                        extract_tool_description_fallback(&name),
+                        extract_tool_schema_fallback(&name),
+                    )
+                }
+            };
 
             Ok::<_, WasmError>(PreparedModule {
                 name: name.clone(),
@@ -249,30 +286,27 @@ impl WasmToolRuntime {
 ///
 /// In a full implementation, this would use WIT bindgen to call the description() export.
 /// For now, we return a placeholder since we can't easily introspect without more setup.
-fn extract_tool_description(
-    _engine: &Engine,
-    _component: &wasmtime::component::Component,
-) -> Result<String, WasmError> {
-    // TODO: Use WIT bindgen to properly extract description
-    // This requires instantiating with a linker, which needs host functions.
-    // For now, tools should have their description set externally.
-    Ok("WASM sandboxed tool".to_string())
+fn extract_tool_description_fallback(tool_name: &str) -> String {
+    tracing::warn!(
+        tool = %tool_name,
+        "WASM tool description introspection is not implemented; using fallback description"
+    );
+    format!("WASM tool '{}'", tool_name)
 }
 
 /// Extract tool schema from a compiled component.
 ///
 /// In a full implementation, this would use WIT bindgen to call the schema() export.
-fn extract_tool_schema(
-    _engine: &Engine,
-    _component: &wasmtime::component::Component,
-) -> Result<serde_json::Value, WasmError> {
-    // TODO: Use WIT bindgen to properly extract schema
-    // For now, return a minimal schema that accepts any object.
-    Ok(serde_json::json!({
+fn extract_tool_schema_fallback(tool_name: &str) -> serde_json::Value {
+    tracing::warn!(
+        tool = %tool_name,
+        "WASM tool schema introspection is not implemented; using permissive fallback schema"
+    );
+    serde_json::json!({
         "type": "object",
         "properties": {},
         "additionalProperties": true
-    }))
+    })
 }
 
 impl std::fmt::Debug for WasmToolRuntime {

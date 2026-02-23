@@ -81,6 +81,37 @@ pub struct WasmToolLoader {
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
 }
 
+fn extract_tool_metadata_overrides(
+    raw_capabilities: &serde_json::Value,
+    tool_name: &str,
+) -> (Option<String>, Option<serde_json::Value>) {
+    let tool_meta = raw_capabilities.get("tool");
+    let description = tool_meta
+        .and_then(|m| m.get("description"))
+        .or_else(|| raw_capabilities.get("description"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let schema = tool_meta
+        .and_then(|m| m.get("schema"))
+        .or_else(|| raw_capabilities.get("schema"))
+        .or_else(|| raw_capabilities.get("parameters_schema"))
+        .filter(|v| v.is_object())
+        .cloned();
+
+    if description.is_some() || schema.is_some() {
+        tracing::info!(
+            tool = %tool_name,
+            has_description = description.is_some(),
+            has_schema = schema.is_some(),
+            "Loaded WASM tool metadata overrides from capabilities sidecar"
+        );
+    }
+
+    (description, schema)
+}
+
 impl WasmToolLoader {
     /// Create a new loader with the given runtime and registry.
     pub fn new(runtime: Arc<WasmToolRuntime>, registry: Arc<ToolRegistry>) -> Self {
@@ -121,24 +152,28 @@ impl WasmToolLoader {
         let wasm_bytes = fs::read(wasm_path).await?;
 
         // Read capabilities (optional) and extract OAuth refresh config
-        let (capabilities, oauth_refresh) = if let Some(cap_path) = capabilities_path {
-            if cap_path.exists() {
-                let cap_bytes = fs::read(cap_path).await?;
-                let cap_file = CapabilitiesFile::from_bytes(&cap_bytes)
-                    .map_err(|e| WasmLoadError::InvalidCapabilities(e.to_string()))?;
-                let caps = cap_file.to_capabilities();
-                let oauth = resolve_oauth_refresh_config(&cap_file);
-                (caps, oauth)
+        let (capabilities, oauth_refresh, description_override, schema_override) =
+            if let Some(cap_path) = capabilities_path {
+                if cap_path.exists() {
+                    let cap_bytes = fs::read(cap_path).await?;
+                    let raw_caps: serde_json::Value = serde_json::from_slice(&cap_bytes)
+                        .map_err(|e| WasmLoadError::InvalidCapabilities(e.to_string()))?;
+                    let cap_file = CapabilitiesFile::from_bytes(&cap_bytes)
+                        .map_err(|e| WasmLoadError::InvalidCapabilities(e.to_string()))?;
+                    let caps = cap_file.to_capabilities();
+                    let oauth = resolve_oauth_refresh_config(&cap_file);
+                    let (desc, schema) = extract_tool_metadata_overrides(&raw_caps, name);
+                    (caps, oauth, desc, schema)
+                } else {
+                    tracing::warn!(
+                        path = %cap_path.display(),
+                        "Capabilities file not found, using default (no permissions)"
+                    );
+                    (Capabilities::default(), None, None, None)
+                }
             } else {
-                tracing::warn!(
-                    path = %cap_path.display(),
-                    "Capabilities file not found, using default (no permissions)"
-                );
-                (Capabilities::default(), None)
-            }
-        } else {
-            (Capabilities::default(), None)
-        };
+                (Capabilities::default(), None, None, None)
+            };
 
         // Register the tool
         self.registry
@@ -148,8 +183,8 @@ impl WasmToolLoader {
                 runtime: &self.runtime,
                 capabilities,
                 limits: None,
-                description: None,
-                schema: None,
+                description: description_override.as_deref(),
+                schema: schema_override,
                 secrets_store: self.secrets_store.clone(),
                 oauth_refresh,
             })
@@ -589,6 +624,7 @@ pub struct DiscoveredTool {
 mod tests {
     use std::io::Write;
 
+    use serde_json::json;
     use tempfile::TempDir;
 
     use crate::tools::wasm::loader::{WasmLoadError, discover_tools};
@@ -789,5 +825,35 @@ mod tests {
         let config = config.unwrap();
         assert!(!config.client_id.is_empty());
         assert!(config.client_secret.is_some());
+    }
+
+    #[test]
+    fn test_extract_tool_metadata_overrides_from_tool_block() {
+        let raw = json!({
+            "tool": {
+                "description": "Search GitHub issues",
+                "schema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            }
+        });
+
+        let (description, schema) = super::extract_tool_metadata_overrides(&raw, "github-tool");
+        assert_eq!(description.as_deref(), Some("Search GitHub issues"));
+        assert!(schema.is_some());
+    }
+
+    #[test]
+    fn test_extract_tool_metadata_overrides_ignores_non_object_schema() {
+        let raw = json!({
+            "description": "Example tool",
+            "schema": "not an object"
+        });
+
+        let (description, schema) = super::extract_tool_metadata_overrides(&raw, "example");
+        assert_eq!(description.as_deref(), Some("Example tool"));
+        assert!(schema.is_none());
     }
 }

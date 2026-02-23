@@ -658,6 +658,11 @@ pub async fn setup_wasm_channel(
     channel_name: &str,
     setup: &crate::channels::wasm::SetupSchema,
 ) -> Result<WasmChannelSetupResult, ChannelSetupError> {
+    let http_client = Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| ChannelSetupError::Network(format!("Failed to create HTTP client: {}", e)))?;
+
     println!("{} Setup:", channel_name);
     println!();
 
@@ -729,12 +734,34 @@ pub async fn setup_wasm_channel(
         print_success(&format!("{} saved to database", secret_config.name));
     }
 
-    // TODO: Substitute secrets into the validation URL and make a
-    // GET request to verify the configured credentials actually work.
-    if let Some(ref validation_endpoint) = setup.validation_endpoint {
-        print_info(&format!(
-            "Validation endpoint configured: {} (validation not yet implemented)",
-            validation_endpoint
+    if let Some(template) = &setup.validation_endpoint {
+        print_info("Validating channel configuration...");
+        let mut validation_url = template.clone();
+        for secret_config in &setup.required_secrets {
+            let placeholder = format!("{{{}}}", secret_config.name);
+            if validation_url.contains(&placeholder) {
+                let secret_value = secrets.get_secret(&secret_config.name).await?;
+                validation_url = validation_url.replace(&placeholder, secret_value.expose_secret());
+            }
+        }
+
+        let resp =
+            http_client.get(&validation_url).send().await.map_err(|e| {
+                ChannelSetupError::Network(format!("Validation request failed: {}", e))
+            })?;
+
+        if !resp.status().is_success() {
+            return Err(ChannelSetupError::Validation(format!(
+                "Validation endpoint for '{}' returned HTTP {}",
+                channel_name,
+                resp.status()
+            )));
+        }
+
+        print_success(&format!(
+            "{} validation succeeded (HTTP {})",
+            channel_name,
+            resp.status()
         ));
     }
 

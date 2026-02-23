@@ -561,9 +561,14 @@ impl Workspace {
 
         // Add today's memory context (last 2 days of daily logs)
         let today = Utc::now().date_naive();
-        let yesterday = today.pred_opt().unwrap_or(today);
+        let mut dates = vec![today];
+        if let Some(yesterday) = today.pred_opt()
+            && yesterday != today
+        {
+            dates.push(yesterday);
+        }
 
-        for date in [today, yesterday] {
+        for date in dates {
             if let Ok(doc) = self.daily_log(date).await
                 && !doc.content.is_empty()
             {
@@ -640,7 +645,7 @@ impl Workspace {
             #[cfg(feature = "postgres")]
             WorkspaceStorage::Repo(_) => {
                 return Err(WorkspaceError::SearchFailed {
-                    reason: "AST graph query requires Database-backed workspace".to_string(),
+                    reason: "AST graph query is not yet supported for PostgreSQL-backed workspaces; use the Database/libSQL workspace backend".to_string(),
                 });
             }
         };

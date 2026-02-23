@@ -96,6 +96,17 @@ impl SubmissionParser {
                 args,
             };
         }
+        if lower.starts_with("/onboard") {
+            let args: Vec<String> = trimmed
+                .split_whitespace()
+                .skip(1)
+                .map(|s| s.to_string())
+                .collect();
+            return Submission::SystemCommand {
+                command: "onboard".to_string(),
+                args,
+            };
+        }
 
         if lower == "/quit" || lower == "/exit" || lower == "/shutdown" {
             return Submission::Quit;

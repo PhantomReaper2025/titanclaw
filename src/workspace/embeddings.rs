@@ -33,6 +33,10 @@ impl From<reqwest::Error> for EmbeddingError {
     }
 }
 
+fn input_length_chars(text: &str) -> usize {
+    text.chars().count()
+}
+
 /// Trait for embedding providers.
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
@@ -42,7 +46,7 @@ pub trait EmbeddingProvider: Send + Sync {
     /// Get the model name.
     fn model_name(&self) -> &str;
 
-    /// Maximum input length in characters.
+    /// Maximum input length in approximate characters (not exact model tokens).
     fn max_input_length(&self) -> usize;
 
     /// Generate an embedding for a single text.
@@ -149,9 +153,10 @@ impl EmbeddingProvider for OpenAiEmbeddings {
     }
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
-        if text.len() > self.max_input_length() {
+        let length = input_length_chars(text);
+        if length > self.max_input_length() {
             return Err(EmbeddingError::TextTooLong {
-                length: text.len(),
+                length,
                 max: self.max_input_length(),
             });
         }
@@ -166,6 +171,15 @@ impl EmbeddingProvider for OpenAiEmbeddings {
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         if texts.is_empty() {
             return Ok(Vec::new());
+        }
+        for text in texts {
+            let length = input_length_chars(text);
+            if length > self.max_input_length() {
+                return Err(EmbeddingError::TextTooLong {
+                    length,
+                    max: self.max_input_length(),
+                });
+            }
         }
 
         let request = OpenAiEmbeddingRequest {
@@ -280,9 +294,10 @@ impl EmbeddingProvider for NearAiEmbeddings {
     }
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
-        if text.len() > self.max_input_length() {
+        let length = input_length_chars(text);
+        if length > self.max_input_length() {
             return Err(EmbeddingError::TextTooLong {
-                length: text.len(),
+                length,
                 max: self.max_input_length(),
             });
         }
@@ -299,6 +314,15 @@ impl EmbeddingProvider for NearAiEmbeddings {
 
         if texts.is_empty() {
             return Ok(Vec::new());
+        }
+        for text in texts {
+            let length = input_length_chars(text);
+            if length > self.max_input_length() {
+                return Err(EmbeddingError::TextTooLong {
+                    length,
+                    max: self.max_input_length(),
+                });
+            }
         }
 
         let request = NearAiEmbeddingRequest {

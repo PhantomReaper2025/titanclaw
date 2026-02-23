@@ -556,6 +556,7 @@ impl ContainerJobManager {
         }
 
         let docker = self.docker().await?;
+        let mut cleanup_errors = Vec::new();
 
         // Stop the container (10 second grace period)
         if let Err(e) = docker
@@ -566,6 +567,10 @@ impl ContainerJobManager {
             .await
         {
             tracing::warn!(job_id = %job_id, error = %e, "Failed to stop container (may already be stopped)");
+            let msg = e.to_string();
+            if !msg.contains("No such container") {
+                cleanup_errors.push(format!("stop failed: {}", msg));
+            }
         }
 
         // Remove the container
@@ -580,6 +585,10 @@ impl ContainerJobManager {
             .await
         {
             tracing::warn!(job_id = %job_id, error = %e, "Failed to remove container (may require manual cleanup)");
+            let msg = e.to_string();
+            if !msg.contains("No such container") {
+                cleanup_errors.push(format!("remove failed: {}", msg));
+            }
         }
 
         // Update state
@@ -591,6 +600,16 @@ impl ContainerJobManager {
         self.token_store.revoke(job_id).await;
 
         tracing::info!(job_id = %job_id, "Stopped worker container");
+
+        if !cleanup_errors.is_empty() {
+            return Err(OrchestratorError::Docker {
+                reason: format!(
+                    "Container cleanup for job {} incomplete: {}",
+                    job_id,
+                    cleanup_errors.join("; ")
+                ),
+            });
+        }
 
         Ok(())
     }

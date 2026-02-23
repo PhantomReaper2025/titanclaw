@@ -79,6 +79,7 @@ mod capabilities_schema;
 mod credential_injector;
 mod error;
 mod host;
+mod introspection;
 mod limits;
 mod loader;
 mod rate_limiter;
