@@ -4,7 +4,18 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>TitanClaw</title>
-  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/css/base.css">
+  <link rel="stylesheet" href="/css/activity.css">
+  <link rel="stylesheet" href="/css/copy_button.css">
+  <link rel="stylesheet" href="/css/toasts.css">
+  <link rel="stylesheet" href="/css/memory_search.css">
+  <link rel="stylesheet" href="/css/thread_sidebar.css">
+  <link rel="stylesheet" href="/css/memory_editing.css">
+  <link rel="stylesheet" href="/css/gateway_status.css">
+  <link rel="stylesheet" href="/css/extension_install.css">
+  <link rel="stylesheet" href="/css/activity_toolbar.css">
+  <link rel="stylesheet" href="/css/premium_theme.css">
+  <link rel="stylesheet" href="/css/mobile.css">
   <script
     src="https://cdn.jsdelivr.net/npm/marked@17.0.2/lib/marked.umd.min.js"
     integrity="sha384-pN9zSKOnTZwXRtYZAu0PBPEgR2B7DOC1aeLxQ33oJ0oy5iN1we6gm57xldM2irDG"
@@ -25,7 +36,7 @@
         <button onclick="authenticate()">Connect</button>
       </div>
       <div id="auth-error"></div>
-      <p class="auth-hint">Enter the GATEWAY_AUTH_TOKEN from your .env configuration.</p>
+      <p class="auth-hint">Enter the `GATEWAY_AUTH_TOKEN` from your `.env` configuration. Press Enter to connect.</p>
     </div>
   </div>
 
@@ -225,6 +236,24 @@
   </div>
 
   <div id="toasts"></div>
-  <script src="/app.js"></script>
+    <script src="/js/main.js"></script>
+  <script src="/js/auth.js"></script>
+  <script src="/js/api_helper.js"></script>
+  <script src="/js/sse.js"></script>
+  <script src="/js/chat.js"></script>
+  <script src="/js/auth_card.js"></script>
+  <script src="/js/threads.js"></script>
+  <script src="/js/tabs.js"></script>
+  <script src="/js/memory.js"></script>
+  <script src="/js/logs.js"></script>
+  <script src="/js/extensions.js"></script>
+  <script src="/js/jobs.js"></script>
+  <script src="/js/activity.js"></script>
+  <script src="/js/routines.js"></script>
+  <script src="/js/gateway_status_widget.js"></script>
+  <script src="/js/extension_install.js"></script>
+  <script src="/js/keyboard_shortcuts.js"></script>
+  <script src="/js/toasts.js"></script>
+  <script src="/js/utilities.js"></script>
 </body>
 </html>

@@ -27,15 +27,26 @@ pub fn llm_signals_completion(response: &str) -> bool {
     // Superset of phrases from agent/worker.rs and worker/runtime.rs.
     let positive_phrases = [
         "job is complete",
+        "job complete",
+        "job completed",
         "job is done",
         "job is finished",
         "task is complete",
+        "task complete",
+        "task completed",
         "task is done",
         "task is finished",
         "work is complete",
+        "work complete",
+        "work completed",
         "work is done",
         "work is finished",
+        "job complete -",
+        "job complete:",
+        "job completed successfully",
+        "task completed successfully",
         "successfully completed",
+        "completed successfully",
         "have completed the job",
         "have completed the task",
         "have finished the job",
@@ -130,6 +141,11 @@ mod tests {
         assert!(llm_signals_completion("All steps are done now."));
         assert!(llm_signals_completion("I've completed everything."));
         assert!(llm_signals_completion("All tasks complete."));
+        assert!(llm_signals_completion(
+            "✅ Job Complete - Portfolio Website Ready!"
+        ));
+        assert!(llm_signals_completion("Job complete."));
+        assert!(llm_signals_completion("Task completed successfully."));
     }
 
     #[test]

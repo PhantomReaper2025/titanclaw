@@ -17,6 +17,8 @@ pub struct AgentConfig {
     pub use_planning: bool,
     /// Session idle timeout. Sessions inactive longer than this are pruned.
     pub session_idle_timeout: Duration,
+    /// Remote swarm wait timeout before local fallback.
+    pub swarm_remote_wait_timeout: Duration,
     /// Allow chat to use filesystem/shell tools directly (bypass sandbox).
     pub allow_local_tools: bool,
     /// Maximum daily LLM spend in cents (e.g. 10000 = $100). None = unlimited.
@@ -45,6 +47,16 @@ pub struct AgentConfig {
     pub kernel_auto_approve_patches: bool,
     /// Auto-deploy approved kernel patch proposals.
     pub kernel_auto_deploy_patches: bool,
+    /// Enable background profile/identity synthesis into workspace managed sections.
+    pub profile_synthesis_enabled: bool,
+    /// Debounce interval for profile synthesis flushes.
+    pub profile_synthesis_debounce: Duration,
+    /// Max successful turns batched per synthesis run.
+    pub profile_synthesis_max_batch_turns: usize,
+    /// Minimum input length before synthesis is considered.
+    pub profile_synthesis_min_chars: usize,
+    /// Enable LLM-assisted merge of synthesized profile sections.
+    pub profile_synthesis_llm_enabled: bool,
 }
 
 impl AgentConfig {
@@ -114,6 +126,17 @@ impl AgentConfig {
                         message: format!("must be a positive integer: {e}"),
                     })?
                     .unwrap_or(settings.agent.session_idle_timeout_secs),
+            ),
+            swarm_remote_wait_timeout: Duration::from_millis(
+                optional_env("SWARM_REMOTE_WAIT_TIMEOUT_MS")?
+                    .map(|s| s.parse::<u64>())
+                    .transpose()
+                    .map_err(|e| ConfigError::InvalidValue {
+                        key: "SWARM_REMOTE_WAIT_TIMEOUT_MS".to_string(),
+                        message: format!("must be a positive integer milliseconds value: {e}"),
+                    })?
+                    .unwrap_or(settings.agent.swarm_remote_wait_timeout_ms)
+                    .clamp(200, 15_000),
             ),
             allow_local_tools: optional_env("ALLOW_LOCAL_TOOLS")?
                 .map(|s| s.parse())
@@ -229,6 +252,48 @@ impl AgentConfig {
                     message: format!("must be 'true' or 'false': {e}"),
                 })?
                 .unwrap_or(settings.agent.kernel_auto_deploy_patches),
+            profile_synthesis_enabled: optional_env("PROFILE_SYNTHESIS_ENABLED")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "PROFILE_SYNTHESIS_ENABLED".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(settings.agent.profile_synthesis_enabled),
+            profile_synthesis_debounce: Duration::from_secs(
+                optional_env("PROFILE_SYNTHESIS_DEBOUNCE_SECS")?
+                    .map(|s| s.parse())
+                    .transpose()
+                    .map_err(|e| ConfigError::InvalidValue {
+                        key: "PROFILE_SYNTHESIS_DEBOUNCE_SECS".to_string(),
+                        message: format!("must be a positive integer: {e}"),
+                    })?
+                    .unwrap_or(settings.agent.profile_synthesis_debounce_secs),
+            ),
+            profile_synthesis_max_batch_turns: optional_env("PROFILE_SYNTHESIS_MAX_BATCH_TURNS")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "PROFILE_SYNTHESIS_MAX_BATCH_TURNS".to_string(),
+                    message: format!("must be a positive integer: {e}"),
+                })?
+                .unwrap_or(settings.agent.profile_synthesis_max_batch_turns as usize),
+            profile_synthesis_min_chars: optional_env("PROFILE_SYNTHESIS_MIN_CHARS")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "PROFILE_SYNTHESIS_MIN_CHARS".to_string(),
+                    message: format!("must be a positive integer: {e}"),
+                })?
+                .unwrap_or(settings.agent.profile_synthesis_min_chars as usize),
+            profile_synthesis_llm_enabled: optional_env("PROFILE_SYNTHESIS_LLM_ENABLED")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "PROFILE_SYNTHESIS_LLM_ENABLED".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(settings.agent.profile_synthesis_llm_enabled),
         })
     }
 }

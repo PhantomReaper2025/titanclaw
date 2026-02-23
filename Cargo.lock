@@ -6234,7 +6234,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "titanclaw"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "aes-gcm",
  "aho-corasick",
@@ -6291,6 +6291,7 @@ dependencies = [
  "tokio-stream",
  "tokio-test",
  "tokio-tungstenite 0.26.2",
+ "tokio-util",
  "toml",
  "tower 0.5.3",
  "tower-http 0.6.8",

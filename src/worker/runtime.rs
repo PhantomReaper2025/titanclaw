@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::config::SafetyConfig;
@@ -145,7 +146,13 @@ Job: {}
 Description: {}
 
 You have tools for shell commands, file operations, and code editing.
-Work independently to complete this job. Report when done."#,
+Work independently to complete this job.
+
+When the job is complete and no more tool calls are needed, prefer returning a
+single JSON object (no markdown fences):
+{{"job_complete": true, "message": "short completion summary"}}
+
+If the job is not complete, continue with tools or explain what remains."#,
             job.title, job.description
         )));
 
@@ -222,6 +229,8 @@ Work independently to complete this job. Report when done."#,
     ) -> Result<String, WorkerError> {
         let max_iterations = self.config.max_iterations;
         let mut last_output = String::new();
+        let mut completion_like_streak: u8 = 0;
+        let mut completion_like_fingerprint = String::new();
 
         // Load tool definitions
         reason_ctx.available_tools = self.tools.tool_definitions().await;
@@ -229,14 +238,21 @@ Work independently to complete this job. Report when done."#,
         for iteration in 1..=max_iterations {
             // Report progress
             if iteration % 5 == 1 {
-                let _ = self
+                if let Err(e) = self
                     .client
                     .report_status(&StatusUpdate {
                         state: "in_progress".to_string(),
                         message: Some(format!("Iteration {}", iteration)),
                         iteration,
                     })
-                    .await;
+                    .await
+                {
+                    tracing::debug!(
+                        iteration,
+                        error = %e,
+                        "Failed to report worker progress status"
+                    );
+                }
             }
 
             // Poll for follow-up prompts from the user
@@ -263,18 +279,57 @@ Work independently to complete this job. Report when done."#,
                         )
                         .await;
 
+                        if let Some(message) = parse_completion_signal(&response) {
+                            if last_output.is_empty() {
+                                last_output = if message.is_empty() {
+                                    response.clone()
+                                } else {
+                                    message.clone()
+                                };
+                            }
+                            return Ok(last_output.clone());
+                        }
+
                         if crate::util::llm_signals_completion(&response) {
                             if last_output.is_empty() {
                                 last_output = response.clone();
                             }
                             return Ok(last_output);
                         }
+
+                        if is_completion_like_text(&response) {
+                            let fp = normalize_completion_like(&response);
+                            if completion_like_fingerprint == fp {
+                                completion_like_streak = completion_like_streak.saturating_add(1);
+                            } else {
+                                completion_like_fingerprint = fp;
+                                completion_like_streak = 1;
+                            }
+
+                            if completion_like_streak >= 2 {
+                                tracing::warn!(
+                                    job_id = %self.config.job_id,
+                                    streak = completion_like_streak,
+                                    "Worker received repeated completion-like responses without structured completion signal; stopping job"
+                                );
+                                if last_output.is_empty() {
+                                    last_output = response.clone();
+                                }
+                                return Ok(last_output.clone());
+                            }
+                        } else {
+                            completion_like_streak = 0;
+                            completion_like_fingerprint.clear();
+                        }
+
                         reason_ctx.messages.push(ChatMessage::assistant(&response));
                     }
                     RespondResult::ToolCalls {
                         tool_calls,
                         content,
                     } => {
+                        completion_like_streak = 0;
+                        completion_like_fingerprint.clear();
                         if let Some(ref text) = content {
                             self.post_event(
                                 "message",
@@ -336,6 +391,8 @@ Work independently to complete this job. Report when done."#,
             } else {
                 // Execute selected tools
                 for selection in &selections {
+                    completion_like_streak = 0;
+                    completion_like_fingerprint.clear();
                     self.post_event(
                         "tool_use",
                         serde_json::json!({
@@ -569,6 +626,83 @@ Work independently to complete this job. Report when done."#,
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct CompletionSignal {
+    #[serde(default)]
+    job_complete: bool,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+fn parse_completion_signal(response: &str) -> Option<String> {
+    let trimmed = response.trim();
+    let json_candidate = if let Some(inner) = trimmed.strip_prefix("```json") {
+        inner.strip_suffix("```")?.trim()
+    } else if let Some(inner) = trimmed.strip_prefix("```") {
+        inner.strip_suffix("```")?.trim()
+    } else {
+        trimmed
+    };
+
+    let signal = serde_json::from_str::<CompletionSignal>(json_candidate).ok()?;
+    if !signal.job_complete {
+        return None;
+    }
+    Some(
+        signal
+            .message
+            .unwrap_or_else(|| "Job complete.".to_string()),
+    )
+}
+
+fn is_completion_like_text(response: &str) -> bool {
+    let lower = response.to_ascii_lowercase();
+    let has_negative = [
+        "not complete",
+        "not done",
+        "not finished",
+        "incomplete",
+        "unfinished",
+        "isn't done",
+        "isn't complete",
+        "isn't finished",
+        "still working",
+        "remaining",
+    ]
+    .iter()
+    .any(|p| lower.contains(p));
+    if has_negative {
+        return false;
+    }
+
+    lower.contains("job complete")
+        || lower.contains("job completed")
+        || lower.contains("task complete")
+        || lower.contains("task completed")
+        || lower.contains("website complete")
+        || lower.contains("portfolio website complete")
+        || lower.contains("all done")
+        || lower.contains("completed successfully")
+        || lower.contains("finished successfully")
+}
+
+fn normalize_completion_like(response: &str) -> String {
+    response
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c.is_whitespace() {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn is_transient_llm_error(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     lower.contains("502")
@@ -590,7 +724,9 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::worker::runtime::truncate;
+    use crate::worker::runtime::{
+        is_completion_like_text, normalize_completion_like, parse_completion_signal, truncate,
+    };
 
     #[test]
     fn test_truncate_within_limit() {
@@ -614,5 +750,40 @@ mod tests {
         let result = truncate("é is fancy", 1);
         // Should truncate to 0 chars (can't fit "é" in 1 byte)
         assert_eq!(result, "...");
+    }
+
+    #[test]
+    fn test_parse_completion_signal_plain_json() {
+        let msg = parse_completion_signal(r#"{"job_complete": true, "message": "Built site"}"#);
+        assert_eq!(msg.as_deref(), Some("Built site"));
+    }
+
+    #[test]
+    fn test_parse_completion_signal_fenced_json() {
+        let msg = parse_completion_signal("```json\n{\"job_complete\":true}\n```");
+        assert_eq!(msg.as_deref(), Some("Job complete."));
+    }
+
+    #[test]
+    fn test_parse_completion_signal_ignores_non_terminal_json() {
+        assert!(parse_completion_signal(r#"{"job_complete": false}"#).is_none());
+        assert!(parse_completion_signal(r#"{"foo": "bar"}"#).is_none());
+    }
+
+    #[test]
+    fn test_completion_like_text_examples() {
+        assert!(is_completion_like_text(
+            "## ✅ Job Complete - Portfolio Website Ready!"
+        ));
+        assert!(is_completion_like_text("Portfolio Website Complete!"));
+        assert!(!is_completion_like_text("The job is not complete yet."));
+    }
+
+    #[test]
+    fn test_normalize_completion_like_strips_markup() {
+        assert_eq!(
+            normalize_completion_like("## ✅ Job Complete - Portfolio Website Ready!"),
+            "job complete portfolio website ready"
+        );
     }
 }

@@ -10,13 +10,17 @@ use uuid::Uuid;
 
 use crate::agent::Agent;
 use crate::agent::compaction::ContextCompactor;
+use crate::agent::context_monitor::CompactionStrategy;
 use crate::agent::dispatcher::{AgenticLoopResult, detect_auth_awaiting, parse_auth_result};
-use crate::agent::session::{Session, ThreadState};
+use crate::agent::session::{Session, Thread, ThreadState};
 use crate::agent::submission::SubmissionResult;
 use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
 use crate::llm::ChatMessage;
+use crate::workspace::Workspace;
+
+const APPROVAL_TIMEOUT_SECS: i64 = 3600;
 
 fn normalize_reflex_pattern(input: &str) -> String {
     input
@@ -109,9 +113,18 @@ impl Agent {
         // Insert into session and register with session manager
         {
             let mut sess = session.lock().await;
-            sess.threads.insert(thread_uuid, thread);
-            sess.active_thread = Some(thread_uuid);
-            sess.last_active_at = chrono::Utc::now();
+            if sess.threads.contains_key(&thread_uuid) {
+                tracing::debug!(
+                    "Skipped hydration insert for thread {} because it was created concurrently",
+                    thread_uuid
+                );
+                sess.active_thread = Some(thread_uuid);
+                sess.last_active_at = chrono::Utc::now();
+            } else {
+                sess.threads.insert(thread_uuid, thread);
+                sess.active_thread = Some(thread_uuid);
+                sess.last_active_at = chrono::Utc::now();
+            }
         }
 
         self.session_manager
@@ -137,13 +150,34 @@ impl Agent {
         thread_id: Uuid,
         content: &str,
     ) -> Result<SubmissionResult, Error> {
+        struct AutoCompactionPlan {
+            thread: Thread,
+            strategy: CompactionStrategy,
+            workspace: Option<Arc<Workspace>>,
+            snapshot_updated_at: chrono::DateTime<chrono::Utc>,
+            pct: f64,
+        }
+
         // First check thread state without holding lock during I/O
         let thread_state = {
-            let sess = session.lock().await;
+            let mut sess = session.lock().await;
             let thread = sess
                 .threads
                 .get(&thread_id)
                 .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+            if thread.state == ThreadState::AwaitingApproval
+                && is_approval_expired(thread.updated_at)
+            {
+                // Re-borrow mutably to clear pending approval and return to idle.
+                let thread = sess.threads.get_mut(&thread_id).expect("checked above");
+                thread.clear_pending_approval();
+                if let Some(turn) = thread.last_turn_mut() {
+                    turn.record_tool_error("approval timeout");
+                }
+                return Ok(SubmissionResult::error(
+                    "Approval request expired. The pending tool execution was canceled.",
+                ));
+            }
             thread.state
         };
 
@@ -176,7 +210,10 @@ impl Agent {
             {
                 let mut sess = session.lock().await;
                 if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                    thread.start_turn(content);
+                    if let Err(e) = thread.try_start_turn(content) {
+                        tracing::warn!(thread_id = %thread_id, "Shadow cache start_turn rejected: {}", e);
+                        return Ok(SubmissionResult::error(e));
+                    }
                     thread.complete_turn(&cached);
                     self.persist_response_chain(thread);
                 }
@@ -189,7 +226,14 @@ impl Agent {
                     &message.metadata,
                 )
                 .await;
-            self.persist_turn(thread_id, &message.user_id, content, Some(&cached));
+            self.persist_turn(
+                thread_id,
+                &message.user_id,
+                content,
+                Some(&cached),
+                &message.channel,
+                &message.metadata,
+            );
             return Ok(SubmissionResult::response(cached));
         }
 
@@ -297,7 +341,10 @@ impl Agent {
                                     {
                                         let mut sess = session.lock().await;
                                         if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                                            thread.start_turn(content);
+                                            if let Err(e) = thread.try_start_turn(content) {
+                                                tracing::warn!(thread_id = %thread_id, "Reflex start_turn rejected: {}", e);
+                                                return Ok(SubmissionResult::error(e));
+                                            }
                                             thread.complete_turn(&output);
                                             self.persist_response_chain(thread);
                                         }
@@ -315,6 +362,8 @@ impl Agent {
                                         &message.user_id,
                                         content,
                                         Some(&output),
+                                        &message.channel,
+                                        &message.metadata,
                                     );
                                     if let Some(shadow) = self.shadow_engine() {
                                         shadow.spawn_speculation(content, &output);
@@ -343,37 +392,63 @@ impl Agent {
         // Job tools (create_job, list_jobs, etc.) are in the tool registry
 
         // Auto-compact if needed BEFORE adding new turn
-        {
-            let mut sess = session.lock().await;
-            let thread = sess
-                .threads
-                .get_mut(&thread_id)
-                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+        let compaction_plan = {
+            let sess = session.lock().await;
+            if let Some(thread) = sess.threads.get(&thread_id) {
+                let messages = thread.messages();
+                if let Some(strategy) = self.context_monitor.suggest_compaction(&messages) {
+                    let pct = self.context_monitor.usage_percent(&messages);
+                    tracing::info!("Context at {:.1}% capacity, auto-compacting", pct);
 
-            let messages = thread.messages();
-            if let Some(strategy) = self.context_monitor.suggest_compaction(&messages) {
-                let pct = self.context_monitor.usage_percent(&messages);
-                tracing::info!("Context at {:.1}% capacity, auto-compacting", pct);
+                    Some(AutoCompactionPlan {
+                        thread: thread.clone(),
+                        strategy,
+                        workspace: self.workspace().map(Arc::clone),
+                        snapshot_updated_at: thread.updated_at,
+                        pct,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
 
-                // Notify the user that compaction is happening
-                let _ = self
-                    .channels
-                    .send_status(
-                        &message.channel,
-                        StatusUpdate::Status(format!(
-                            "Context at {:.0}% capacity, compacting...",
-                            pct
-                        )),
-                        &message.metadata,
-                    )
-                    .await;
+        if let Some(plan) = compaction_plan {
+            let AutoCompactionPlan {
+                thread: mut compacted_thread,
+                strategy,
+                workspace,
+                snapshot_updated_at,
+                pct,
+            } = plan;
 
-                let compactor = ContextCompactor::new(self.llm().clone());
-                if let Err(e) = compactor
-                    .compact(thread, strategy, self.workspace().map(|w| w.as_ref()))
-                    .await
+            // Notify the user that compaction is happening
+            let _ = self
+                .channels
+                .send_status(
+                    &message.channel,
+                    StatusUpdate::Status(format!("Context at {:.0}% capacity, compacting...", pct)),
+                    &message.metadata,
+                )
+                .await;
+
+            let compactor = ContextCompactor::new(self.llm().clone());
+            if let Err(e) = compactor
+                .compact(&mut compacted_thread, strategy, workspace.as_deref())
+                .await
+            {
+                tracing::warn!("Auto-compaction failed: {}", e);
+            } else {
+                let mut sess = session.lock().await;
+                if let Some(thread) = sess.threads.get_mut(&thread_id)
+                    && thread.updated_at == snapshot_updated_at
                 {
-                    tracing::warn!("Auto-compaction failed: {}", e);
+                    *thread = compacted_thread;
+                    sess.last_active_at = chrono::Utc::now();
+                } else {
+                    tracing::debug!("Skipped auto-compaction because thread changed");
                 }
             }
         }
@@ -402,7 +477,12 @@ impl Agent {
                 .threads
                 .get_mut(&thread_id)
                 .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-            thread.start_turn(content);
+            thread.try_start_turn(content).map_err(|e| {
+                Error::from(crate::error::JobError::ContextError {
+                    id: thread_id,
+                    reason: e,
+                })
+            })?;
             thread.messages()
         };
 
@@ -476,7 +556,14 @@ impl Agent {
                     .await;
 
                 // Fire-and-forget: persist turn to DB
-                self.persist_turn(thread_id, &message.user_id, content, Some(&response));
+                self.persist_turn(
+                    thread_id,
+                    &message.user_id,
+                    content,
+                    Some(&response),
+                    &message.channel,
+                    &message.metadata,
+                );
                 if let Some(shadow) = self.shadow_engine() {
                     shadow.spawn_speculation(content, &response);
                 }
@@ -509,7 +596,14 @@ impl Agent {
                 thread.fail_turn(e.to_string());
 
                 // Persist the user message even on failure
-                self.persist_turn(thread_id, &message.user_id, content, None);
+                self.persist_turn(
+                    thread_id,
+                    &message.user_id,
+                    content,
+                    None,
+                    &message.channel,
+                    &message.metadata,
+                );
 
                 Ok(SubmissionResult::error(e.to_string()))
             }
@@ -523,7 +617,15 @@ impl Agent {
         user_id: &str,
         user_input: &str,
         response: Option<&str>,
+        channel: &str,
+        metadata: &serde_json::Value,
     ) {
+        if let Some(resp) = response
+            && let Some(synth) = self.profile_synthesizer()
+        {
+            synth.enqueue_turn(user_id, &thread_id.to_string(), user_input, resp);
+        }
+
         let store = match self.store() {
             Some(s) => Arc::clone(s),
             None => return,
@@ -532,31 +634,57 @@ impl Agent {
         let user_id = user_id.to_string();
         let user_input = user_input.to_string();
         let response = response.map(String::from);
+        let channels = self.channels.clone();
+        let channel = channel.to_string();
+        let metadata = metadata.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = store
-                .ensure_conversation(thread_id, "gateway", &user_id, None)
-                .await
-            {
-                tracing::warn!("Failed to ensure conversation {}: {}", thread_id, e);
-                return;
+            let mut last_err: Option<String> = None;
+            for attempt in 1..=3 {
+                let result = async {
+                    store
+                        .ensure_conversation(thread_id, "gateway", &user_id, None)
+                        .await?;
+                    store
+                        .add_conversation_message(thread_id, "user", &user_input)
+                        .await?;
+                    if let Some(ref resp) = response {
+                        store
+                            .add_conversation_message(thread_id, "assistant", resp)
+                            .await?;
+                    }
+                    Ok::<(), crate::error::DatabaseError>(())
+                }
+                .await;
+
+                match result {
+                    Ok(()) => return,
+                    Err(e) => {
+                        last_err = Some(e.to_string());
+                        tracing::warn!(
+                            thread_id = %thread_id,
+                            attempt,
+                            "Failed to persist turn: {}",
+                            e
+                        );
+                        if attempt < 3 {
+                            tokio::time::sleep(std::time::Duration::from_millis(150 * attempt))
+                                .await;
+                        }
+                    }
+                }
             }
 
-            if let Err(e) = store
-                .add_conversation_message(thread_id, "user", &user_input)
-                .await
-            {
-                tracing::warn!("Failed to persist user message: {}", e);
-                return;
-            }
-
-            if let Some(ref resp) = response
-                && let Err(e) = store
-                    .add_conversation_message(thread_id, "assistant", resp)
-                    .await
-            {
-                tracing::warn!("Failed to persist assistant message: {}", e);
-            }
+            let warn_msg = format!(
+                "Warning: response completed, but chat history could not be saved after retries{}",
+                last_err
+                    .as_deref()
+                    .map(|e| format!(" ({})", e))
+                    .unwrap_or_default()
+            );
+            let _ = channels
+                .send_status(&channel, StatusUpdate::Status(warn_msg), &metadata)
+                .await;
         });
     }
 
@@ -713,27 +841,46 @@ impl Agent {
         session: Arc<Mutex<Session>>,
         thread_id: Uuid,
     ) -> Result<SubmissionResult, Error> {
-        let mut sess = session.lock().await;
-        let thread = sess
-            .threads
-            .get_mut(&thread_id)
-            .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+        let (mut compacted_thread, snapshot_updated_at, usage, strategy) = {
+            let sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get(&thread_id)
+                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
 
-        let messages = thread.messages();
-        let usage = self.context_monitor.usage_percent(&messages);
-        let strategy = self
-            .context_monitor
-            .suggest_compaction(&messages)
-            .unwrap_or(
-                crate::agent::context_monitor::CompactionStrategy::Summarize { keep_recent: 5 },
-            );
+            let messages = thread.messages();
+            let usage = self.context_monitor.usage_percent(&messages);
+            let strategy = self
+                .context_monitor
+                .suggest_compaction(&messages)
+                .unwrap_or(crate::agent::context_monitor::CompactionStrategy::Summarize {
+                    keep_recent: 5,
+                });
+            (thread.clone(), thread.updated_at, usage, strategy)
+        };
 
         let compactor = ContextCompactor::new(self.llm().clone());
         match compactor
-            .compact(thread, strategy, self.workspace().map(|w| w.as_ref()))
+            .compact(
+                &mut compacted_thread,
+                strategy,
+                self.workspace().map(|w| w.as_ref()),
+            )
             .await
         {
             Ok(result) => {
+                let mut sess = session.lock().await;
+                if let Some(thread) = sess.threads.get_mut(&thread_id)
+                    && thread.updated_at == snapshot_updated_at
+                {
+                    *thread = compacted_thread;
+                    sess.last_active_at = chrono::Utc::now();
+                } else {
+                    return Ok(SubmissionResult::ok_with_message(
+                        "Compaction skipped because the thread changed during compaction.",
+                    ));
+                }
+
                 let mut msg = format!(
                     "Compacted: {} turns removed, {} → {} tokens (was {:.1}% full)",
                     result.turns_removed, result.tokens_before, result.tokens_after, usage
@@ -787,6 +934,15 @@ impl Agent {
 
             if thread.state != ThreadState::AwaitingApproval {
                 return Ok(SubmissionResult::error("No pending approval request."));
+            }
+            if is_approval_expired(thread.updated_at) {
+                thread.clear_pending_approval();
+                if let Some(turn) = thread.last_turn_mut() {
+                    turn.record_tool_error("approval timeout");
+                }
+                return Ok(SubmissionResult::error(
+                    "Approval request expired. Ask again to retry the operation.",
+                ));
             }
 
             let pending = thread.take_pending_approval();
@@ -890,6 +1046,20 @@ impl Agent {
             // Build context including the tool result
             let mut context_messages = pending.context_messages;
 
+            let result_content = match &tool_result {
+                Ok(output) => {
+                    let sanitized = self
+                        .safety()
+                        .sanitize_tool_output(&pending.tool_name, &output);
+                    self.safety().wrap_for_llm(
+                        &pending.tool_name,
+                        &sanitized.content,
+                        sanitized.was_modified,
+                    )
+                }
+                Err(e) => format!("Error: {}", e),
+            };
+
             // Record result in thread
             {
                 let mut sess = session.lock().await;
@@ -898,7 +1068,10 @@ impl Agent {
                 {
                     match &tool_result {
                         Ok(output) => {
-                            turn.record_tool_result(serde_json::json!(output));
+                            turn.record_tool_result(
+                                serde_json::json!(output),
+                                Some(result_content.clone()),
+                            );
                         }
                         Err(e) => {
                             turn.record_tool_error(e.to_string());
@@ -937,20 +1110,6 @@ impl Agent {
             }
 
             // Add tool result to context
-            let result_content = match tool_result {
-                Ok(output) => {
-                    let sanitized = self
-                        .safety()
-                        .sanitize_tool_output(&pending.tool_name, &output);
-                    self.safety().wrap_for_llm(
-                        &pending.tool_name,
-                        &sanitized.content,
-                        sanitized.was_modified,
-                    )
-                }
-                Err(e) => format!("Error: {}", e),
-            };
-
             context_messages.push(ChatMessage::tool_result(
                 &pending.tool_call_id,
                 &pending.tool_name,
@@ -973,6 +1132,7 @@ impl Agent {
                 Ok(AgenticLoopResult::Response(response)) => {
                     thread.complete_turn(&response);
                     self.persist_response_chain(thread);
+                    let persist_user_input = thread.last_turn().map(|t| t.user_input.clone());
                     let _ = self
                         .channels
                         .send_status(
@@ -981,6 +1141,16 @@ impl Agent {
                             &message.metadata,
                         )
                         .await;
+                    if let Some(user_input) = persist_user_input {
+                        self.persist_turn(
+                            thread_id,
+                            &message.user_id,
+                            &user_input,
+                            Some(&response),
+                            &message.channel,
+                            &message.metadata,
+                        );
+                    }
                     Ok(SubmissionResult::response(response))
                 }
                 Ok(AgenticLoopResult::NeedApproval {
@@ -1008,17 +1178,41 @@ impl Agent {
                 }
                 Err(e) => {
                     thread.fail_turn(e.to_string());
+                    let persist_user_input = thread.last_turn().map(|t| t.user_input.clone());
+                    if let Some(user_input) = persist_user_input {
+                        self.persist_turn(
+                            thread_id,
+                            &message.user_id,
+                            &user_input,
+                            None,
+                            &message.channel,
+                            &message.metadata,
+                        );
+                    }
                     Ok(SubmissionResult::error(e.to_string()))
                 }
             }
         } else {
             // Rejected - clear approval and return to idle
-            {
+            let rejection_msg = format!(
+                "Tool '{}' was rejected. The agent will not execute this tool.\n\n\
+                 You can continue the conversation or try a different approach.",
+                pending.tool_name
+            );
+            let persist_user_input = {
                 let mut sess = session.lock().await;
                 if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                    if let Some(turn) = thread.last_turn_mut() {
+                        turn.record_tool_error("rejected by user");
+                    }
+                    let user_input = thread.last_turn().map(|t| t.user_input.clone());
                     thread.clear_pending_approval();
+                    thread.complete_turn(&rejection_msg);
+                    user_input
+                } else {
+                    None
                 }
-            }
+            };
 
             let _ = self
                 .channels
@@ -1028,12 +1222,18 @@ impl Agent {
                     &message.metadata,
                 )
                 .await;
+            if let Some(user_input) = persist_user_input {
+                self.persist_turn(
+                    thread_id,
+                    &message.user_id,
+                    &user_input,
+                    Some(&rejection_msg),
+                    &message.channel,
+                    &message.metadata,
+                );
+            }
 
-            Ok(SubmissionResult::response(format!(
-                "Tool '{}' was rejected. The agent will not execute this tool.\n\n\
-                 You can continue the conversation or try a different approach.",
-                pending.tool_name
-            )))
+            Ok(SubmissionResult::response(rejection_msg))
         }
     }
 
@@ -1237,4 +1437,8 @@ impl Agent {
             Ok(SubmissionResult::error("Checkpoint not found."))
         }
     }
+}
+
+fn is_approval_expired(updated_at: chrono::DateTime<chrono::Utc>) -> bool {
+    updated_at < chrono::Utc::now() - chrono::TimeDelta::seconds(APPROVAL_TIMEOUT_SECS)
 }

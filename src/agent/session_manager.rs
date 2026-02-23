@@ -117,23 +117,35 @@ impl SessionManager {
             }
         }
 
-        // Create new thread (always create a new one for a new key)
+        // Slow path: serialize creation/mapping under thread_map write lock.
+        // This prevents duplicate thread creation for the same external key.
         let thread_id = {
-            let mut sess = session.lock().await;
-            let thread = sess.create_thread();
-            thread.id
-        };
-
-        // Store mapping
-        {
             let mut thread_map = self.thread_map.write().await;
-            thread_map.insert(key, thread_id);
-        }
+
+            // Double-check after acquiring write lock.
+            if let Some(&existing_id) = thread_map.get(&key) {
+                let mut sess = session.lock().await;
+                if sess.threads.contains_key(&existing_id) {
+                    sess.active_thread = Some(existing_id);
+                    sess.last_active_at = chrono::Utc::now();
+                    existing_id
+                } else {
+                    // Stale mapping: remove and continue to create/recreate below.
+                    thread_map.remove(&key);
+                    create_and_map_thread(&mut sess, &mut thread_map, key, external_thread_id)
+                }
+            } else {
+                let mut sess = session.lock().await;
+                create_and_map_thread(&mut sess, &mut thread_map, key, external_thread_id)
+            }
+        };
 
         // Create undo manager for thread
         {
             let mut undo_managers = self.undo_managers.write().await;
-            undo_managers.insert(thread_id, Arc::new(Mutex::new(UndoManager::new())));
+            undo_managers
+                .entry(thread_id)
+                .or_insert_with(|| Arc::new(Mutex::new(UndoManager::new())));
         }
 
         (session, thread_id)
@@ -157,7 +169,34 @@ impl SessionManager {
 
         {
             let mut thread_map = self.thread_map.write().await;
-            thread_map.insert(key, thread_id);
+            if let Some(existing) = thread_map.get(&key).copied() {
+                if existing != thread_id {
+                    let keep_existing = {
+                        let sess = session.lock().await;
+                        sess.threads.contains_key(&existing)
+                    };
+                    if keep_existing {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            channel = %channel,
+                            %existing,
+                            %thread_id,
+                            "register_thread collision: keeping existing thread mapping"
+                        );
+                    } else {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            channel = %channel,
+                            %existing,
+                            %thread_id,
+                            "register_thread collision: replacing stale thread mapping"
+                        );
+                        thread_map.insert(key, thread_id);
+                    }
+                }
+            } else {
+                thread_map.insert(key, thread_id);
+            }
         }
 
         {
@@ -194,6 +233,26 @@ impl SessionManager {
         let mgr = Arc::new(Mutex::new(UndoManager::new()));
         managers.insert(thread_id, Arc::clone(&mgr));
         mgr
+    }
+
+    /// Remove in-memory thread references for a specific user/channel/thread.
+    ///
+    /// This cleans:
+    /// - external thread mappings for the given user+channel that point to `thread_id`
+    /// - the thread's undo manager if no other mappings still reference it
+    pub async fn remove_thread_references(&self, user_id: &str, channel: &str, thread_id: Uuid) {
+        let still_referenced = {
+            let mut thread_map = self.thread_map.write().await;
+            thread_map.retain(|key, mapped_id| {
+                !(key.user_id == user_id && key.channel == channel && *mapped_id == thread_id)
+            });
+            thread_map.values().any(|mapped_id| *mapped_id == thread_id)
+        };
+
+        if !still_referenced {
+            let mut undo_managers = self.undo_managers.write().await;
+            undo_managers.remove(&thread_id);
+        }
     }
 
     /// Remove sessions that have been idle for longer than the given duration.
@@ -294,6 +353,28 @@ impl SessionManager {
 
         count
     }
+}
+
+fn create_and_map_thread(
+    sess: &mut Session,
+    thread_map: &mut HashMap<ThreadKey, Uuid>,
+    key: ThreadKey,
+    external_thread_id: Option<&str>,
+) -> Uuid {
+    // Only the web gateway uses UUID-backed external thread IDs that must be
+    // preserved to avoid hydrate/resolve races. Other channels stay
+    // channel-scoped and always receive a fresh internal thread ID.
+    let preserve_gateway_uuid = key.channel == "gateway";
+    let thread_id = if preserve_gateway_uuid {
+        external_thread_id
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .map(|uuid| sess.create_thread_with_id(uuid).id)
+            .unwrap_or_else(|| sess.create_thread().id)
+    } else {
+        sess.create_thread().id
+    };
+    thread_map.insert(key, thread_id);
+    thread_id
 }
 
 impl Default for SessionManager {
@@ -418,6 +499,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_resolve_thread_preserves_uuid_external_thread_id() {
+        let manager = SessionManager::new();
+        let ext_id = Uuid::new_v4();
+
+        let (_session, thread_id) = manager
+            .resolve_thread("user-uuid", "gateway", Some(&ext_id.to_string()))
+            .await;
+
+        assert_eq!(thread_id, ext_id);
+    }
+
+    #[tokio::test]
     async fn test_resolve_thread_with_explicit_external_id() {
         let manager = SessionManager::new();
 
@@ -446,6 +539,58 @@ mod tests {
         let (_, t_none) = manager.resolve_thread("user-1", "cli", None).await;
         let (_, t_some) = manager.resolve_thread("user-1", "cli", Some("ext-1")).await;
         assert_ne!(t_none, t_some);
+    }
+
+    #[tokio::test]
+    async fn test_remove_thread_references_cleans_mapping_and_undo_manager() {
+        let manager = SessionManager::new();
+        let (_, thread_id) = manager
+            .resolve_thread("user-clean", "gateway", Some("ext-clean"))
+            .await;
+
+        // Ensure undo manager exists
+        let _ = manager.get_undo_manager(thread_id).await;
+
+        manager
+            .remove_thread_references("user-clean", "gateway", thread_id)
+            .await;
+
+        {
+            let tm = manager.thread_map.read().await;
+            assert!(!tm.values().any(|id| *id == thread_id));
+        }
+        {
+            let um = manager.undo_managers.read().await;
+            assert!(!um.contains_key(&thread_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_thread_references_keeps_other_channel_mappings() {
+        let manager = SessionManager::new();
+        let (_, gateway_tid) = manager
+            .resolve_thread("user-same", "gateway", Some("ext-a"))
+            .await;
+        let (_, telegram_tid) = manager
+            .resolve_thread("user-same", "telegram", Some("ext-a"))
+            .await;
+
+        let _ = manager.get_undo_manager(gateway_tid).await;
+        let _ = manager.get_undo_manager(telegram_tid).await;
+
+        manager
+            .remove_thread_references("user-same", "gateway", gateway_tid)
+            .await;
+
+        {
+            let tm = manager.thread_map.read().await;
+            assert!(tm.values().any(|id| *id == telegram_tid));
+            assert!(!tm.values().any(|id| *id == gateway_tid));
+        }
+        {
+            let um = manager.undo_managers.read().await;
+            assert!(um.contains_key(&telegram_tid));
+        }
     }
 
     #[tokio::test]

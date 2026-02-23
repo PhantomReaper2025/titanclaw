@@ -1,0 +1,146 @@
+
+#memory-breadcrumb-path {
+  flex: 1;
+}
+
+.memory-edit-btn {
+  padding: 3px 10px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.memory-edit-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.memory-editor {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  overflow: hidden;
+}
+
+.memory-editor textarea {
+  flex: 1;
+  padding: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  resize: none;
+}
+
+.memory-editor textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.memory-editor-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.btn-save {
+  padding: 6px 16px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.btn-save:hover {
+  background: var(--accent-hover);
+}
+
+.btn-cancel-edit {
+  padding: 6px 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.btn-cancel-edit:hover {
+  background: var(--bg-tertiary);
+}
+
+/* Memory rendered markdown */
+.memory-viewer.rendered {
+  white-space: normal;
+  font-family: inherit;
+}
+
+.memory-rendered {
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.memory-rendered h1,
+.memory-rendered h2,
+.memory-rendered h3 {
+  margin: 12px 0 6px 0;
+}
+
+.memory-rendered p {
+  margin: 0 0 8px 0;
+}
+
+.memory-rendered p:last-child {
+  margin-bottom: 0;
+}
+
+.memory-rendered ul,
+.memory-rendered ol {
+  margin: 4px 0;
+  padding-left: 20px;
+}
+
+.memory-rendered li {
+  margin: 2px 0;
+}
+
+.memory-rendered code {
+  background: var(--code-bg);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 13px;
+}
+
+.memory-rendered pre {
+  background: var(--code-bg);
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  overflow-x: auto;
+  margin: 6px 0;
+}
+
+.memory-rendered pre code {
+  background: none;
+  padding: 0;
+}
+
+.memory-rendered a {
+  color: var(--accent);
+}
+
+.memory-rendered blockquote {
+  margin: 6px 0;
+  padding: 4px 12px;
+  border-left: 3px solid var(--border);
+  color: var(--text-secondary);
+}

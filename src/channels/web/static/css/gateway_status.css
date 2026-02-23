@@ -1,0 +1,32 @@
+
+.gateway-popover {
+  display: none;
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  min-width: 180px;
+  box-shadow: var(--shadow);
+  z-index: 100;
+}
+
+.gateway-popover.visible {
+  display: block;
+}
+
+.gw-stat {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  padding: 3px 0;
+  color: var(--text-secondary);
+}
+
+.gw-stat span:last-child {
+  color: var(--text);
+  font-weight: 500;
+}

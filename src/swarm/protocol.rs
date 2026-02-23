@@ -27,6 +27,9 @@ pub struct SwarmTask {
     /// Origin node id for tracing/correlation.
     #[serde(default)]
     pub origin_node: Option<String>,
+    /// Optional assigned peer/node id (stringified PeerId) for single-node execution.
+    #[serde(default)]
+    pub assignee_node: Option<String>,
 }
 
 /// Messages exchanged between swarm peers.

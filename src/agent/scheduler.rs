@@ -21,7 +21,8 @@ use crate::safety::SafetyLayer;
 use crate::swarm::node::{SwarmHandle, SwarmRemoteResult, SwarmResultRouter};
 use crate::tools::ToolRegistry;
 
-const REMOTE_WAIT_TIMEOUT: Duration = Duration::from_millis(300);
+// Default remote wait budget for swarm offload before local fallback.
+// 300ms is too aggressive for real network + tool execution latency.
 const REMOTE_DISTRIBUTE_RETRIES: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +61,7 @@ pub struct ScheduledJob {
 
 /// Status of a scheduled sub-task.
 struct ScheduledSubtask {
-    handle: JoinHandle<Result<TaskOutput, Error>>,
+    handle: JoinHandle<()>,
 }
 
 /// Schedules and manages parallel job execution.
@@ -165,7 +166,13 @@ impl Scheduler {
             });
 
             // Start the worker
-            let _ = tx.send(WorkerMessage::Start).await;
+            if let Err(e) = tx.send(WorkerMessage::Start).await {
+                tracing::warn!(
+                    "Failed to send WorkerMessage::Start for job {}: {}",
+                    job_id,
+                    e
+                );
+            }
 
             // Insert while still holding the write lock
             jobs.insert(job_id, ScheduledJob { handle, tx });
@@ -233,6 +240,7 @@ impl Scheduler {
                 let tool_name_for_remote = tool_name.clone();
                 let params_for_remote = params.clone();
                 let metrics = Arc::clone(&self.metrics);
+                let remote_wait_timeout = self.config.swarm_remote_wait_timeout;
 
                 tokio::spawn(async move {
                     let mut used_local_fallback = false;
@@ -261,8 +269,46 @@ impl Scheduler {
                             }
                             OffloadDecision::RemotePreferred => {
                                 metrics.remote_attempts.fetch_add(1, Ordering::Relaxed);
+                                let capability =
+                                    required_swarm_capability(&tool_name_for_remote).to_string();
+                                let assignee_node = match handle.select_peer(&capability).await {
+                                    Ok(Some(peer)) => Some(peer),
+                                    Ok(None) => {
+                                        metrics.remote_ineligible.fetch_add(1, Ordering::Relaxed);
+                                        used_local_fallback = true;
+                                        tracing::debug!(
+                                            tool = %tool_name_for_remote,
+                                            capability = %capability,
+                                            "No eligible swarm peer selected, falling back to local"
+                                        );
+                                        None
+                                    }
+                                    Err(e) => {
+                                        metrics.remote_failures.fetch_add(1, Ordering::Relaxed);
+                                        used_local_fallback = true;
+                                        tracing::warn!(
+                                            tool = %tool_name_for_remote,
+                                            capability = %capability,
+                                            "Swarm peer selection failed, falling back to local: {}",
+                                            e
+                                        );
+                                        None
+                                    }
+                                };
+
+                                if assignee_node.is_none() {
+                                    Self::execute_tool_task(
+                                        tools,
+                                        context_manager,
+                                        safety,
+                                        tool_parent_id,
+                                        &tool_name,
+                                        params,
+                                    )
+                                    .await
+                                } else {
                                 match router
-                                    .register(task_id_for_remote, REMOTE_WAIT_TIMEOUT)
+                                    .register(task_id_for_remote, remote_wait_timeout)
                                     .await
                                 {
                                     Ok(remote_waiter) => {
@@ -279,6 +325,7 @@ impl Scheduler {
                                                         attempt: attempt as u8,
                                                         deadline_ms: None,
                                                         origin_node: None,
+                                                        assignee_node: assignee_node.clone(),
                                                     },
                                                 )
                                                 .await;
@@ -290,7 +337,7 @@ impl Scheduler {
 
                                         if dispatched {
                                             match tokio::time::timeout(
-                                                REMOTE_WAIT_TIMEOUT,
+                                                remote_wait_timeout,
                                                 remote_waiter,
                                             )
                                             .await
@@ -384,6 +431,7 @@ impl Scheduler {
                                         .await
                                     }
                                 }
+                                }
                             }
                         }
                     } else {
@@ -418,24 +466,10 @@ impl Scheduler {
         };
 
         // Track the subtask
-        self.subtasks.write().await.insert(
-            task_id,
-            ScheduledSubtask {
-                handle: tokio::spawn(async move {
-                    // Wrap the handle to get its result
-                    match handle.await {
-                        Ok(()) => Err(Error::Job(JobError::ContextError {
-                            id: task_id,
-                            reason: "Subtask completed but result not captured".to_string(),
-                        })),
-                        Err(e) => Err(Error::Job(JobError::ContextError {
-                            id: task_id,
-                            reason: format!("Subtask panicked: {}", e),
-                        })),
-                    }
-                }),
-            },
-        );
+        self.subtasks
+            .write()
+            .await
+            .insert(task_id, ScheduledSubtask { handle });
 
         // Cleanup task for subtask tracking
         let subtasks = Arc::clone(&self.subtasks);

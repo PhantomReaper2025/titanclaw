@@ -4,6 +4,7 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,10 +19,14 @@ use axum::{
     },
     routing::{delete, get, post},
 };
+use bytes::Bytes;
 use serde::Deserialize;
+use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::StreamExt;
+use tokio_util::io::ReaderStream;
 use tower_http::cors::{AllowHeaders, CorsLayer};
+use url::Url;
 use uuid::Uuid;
 
 use crate::agent::SessionManager;
@@ -45,6 +50,8 @@ pub type PromptQueue = Arc<
         >,
     >,
 >;
+
+const ARCHIVE_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Simple sliding-window rate limiter.
 ///
@@ -288,8 +295,53 @@ pub async fn start_server(
     // Static file routes (no auth, served from embedded strings)
     let statics = Router::new()
         .route("/", get(index_handler))
-        .route("/style.css", get(css_handler))
-        .route("/app.js", get(js_handler));
+        .route("/css/base.css", get(css_base_handler))
+        .route("/css/activity.css", get(css_activity_handler))
+        .route("/css/copy_button.css", get(css_copy_button_handler))
+        .route("/css/toasts.css", get(css_toasts_handler))
+        .route("/css/memory_search.css", get(css_memory_search_handler))
+        .route("/css/thread_sidebar.css", get(css_thread_sidebar_handler))
+        .route("/css/memory_editing.css", get(css_memory_editing_handler))
+        .route("/css/gateway_status.css", get(css_gateway_status_handler))
+        .route(
+            "/css/extension_install.css",
+            get(css_extension_install_handler),
+        )
+        .route(
+            "/css/activity_toolbar.css",
+            get(css_activity_toolbar_handler),
+        )
+        .route("/css/premium_theme.css", get(css_premium_theme_handler))
+        .route("/css/mobile.css", get(css_mobile_handler))
+        .route("/favicon.ico", get(favicon_handler))
+        .route("/js/main.js", get(js_main_handler))
+        .route("/js/auth.js", get(js_auth_handler))
+        .route("/js/api_helper.js", get(js_api_helper_handler))
+        .route("/js/sse.js", get(js_sse_handler))
+        .route("/js/chat.js", get(js_chat_handler))
+        .route("/js/auth_card.js", get(js_auth_card_handler))
+        .route("/js/threads.js", get(js_threads_handler))
+        .route("/js/tabs.js", get(js_tabs_handler))
+        .route("/js/memory.js", get(js_memory_handler))
+        .route("/js/logs.js", get(js_logs_handler))
+        .route("/js/extensions.js", get(js_extensions_handler))
+        .route("/js/jobs.js", get(js_jobs_handler))
+        .route("/js/activity.js", get(js_activity_handler))
+        .route("/js/routines.js", get(js_routines_handler))
+        .route(
+            "/js/gateway_status_widget.js",
+            get(js_gateway_status_widget_handler),
+        )
+        .route(
+            "/js/extension_install.js",
+            get(js_extension_install_handler),
+        )
+        .route(
+            "/js/keyboard_shortcuts.js",
+            get(js_keyboard_shortcuts_handler),
+        )
+        .route("/js/toasts.js", get(js_toasts_handler))
+        .route("/js/utilities.js", get(js_utilities_handler));
 
     // Project file serving (behind auth to prevent unauthorized file access).
     let projects = Router::new()
@@ -357,17 +409,228 @@ async fn index_handler() -> Html<&'static str> {
     Html(include_str!("static/index.html"))
 }
 
-async fn css_handler() -> impl IntoResponse {
+async fn css_base_handler() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/css")],
-        include_str!("static/style.css"),
+        include_str!("static/css/base.css"),
     )
 }
 
-async fn js_handler() -> impl IntoResponse {
+async fn css_activity_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css")],
+        include_str!("static/css/activity.css"),
+    )
+}
+
+async fn css_copy_button_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css")],
+        include_str!("static/css/copy_button.css"),
+    )
+}
+
+async fn css_toasts_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css")],
+        include_str!("static/css/toasts.css"),
+    )
+}
+
+async fn css_memory_search_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css")],
+        include_str!("static/css/memory_search.css"),
+    )
+}
+
+async fn css_thread_sidebar_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css")],
+        include_str!("static/css/thread_sidebar.css"),
+    )
+}
+
+async fn css_memory_editing_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css")],
+        include_str!("static/css/memory_editing.css"),
+    )
+}
+
+async fn css_gateway_status_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css")],
+        include_str!("static/css/gateway_status.css"),
+    )
+}
+
+async fn css_extension_install_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css")],
+        include_str!("static/css/extension_install.css"),
+    )
+}
+
+async fn css_activity_toolbar_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css")],
+        include_str!("static/css/activity_toolbar.css"),
+    )
+}
+
+async fn css_premium_theme_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css")],
+        include_str!("static/css/premium_theme.css"),
+    )
+}
+
+async fn css_mobile_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css")],
+        include_str!("static/css/mobile.css"),
+    )
+}
+
+async fn favicon_handler() -> impl IntoResponse {
+    // Intentionally empty favicon to avoid noisy 404s in browser console.
+    (
+        [(header::CONTENT_TYPE, "image/x-icon")],
+        axum::body::Body::empty(),
+    )
+}
+
+async fn js_main_handler() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("static/app.js"),
+        include_str!("static/js/main.js"),
+    )
+}
+
+async fn js_auth_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/auth.js"),
+    )
+}
+
+async fn js_api_helper_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/api_helper.js"),
+    )
+}
+
+async fn js_sse_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/sse.js"),
+    )
+}
+
+async fn js_chat_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/chat.js"),
+    )
+}
+
+async fn js_auth_card_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/auth_card.js"),
+    )
+}
+
+async fn js_threads_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/threads.js"),
+    )
+}
+
+async fn js_tabs_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/tabs.js"),
+    )
+}
+
+async fn js_memory_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/memory.js"),
+    )
+}
+
+async fn js_logs_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/logs.js"),
+    )
+}
+
+async fn js_extensions_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/extensions.js"),
+    )
+}
+
+async fn js_jobs_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/jobs.js"),
+    )
+}
+
+async fn js_activity_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/activity.js"),
+    )
+}
+
+async fn js_routines_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/routines.js"),
+    )
+}
+
+async fn js_gateway_status_widget_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/gateway_status_widget.js"),
+    )
+}
+
+async fn js_extension_install_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/extension_install.js"),
+    )
+}
+
+async fn js_keyboard_shortcuts_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/keyboard_shortcuts.js"),
+    )
+}
+
+async fn js_toasts_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/toasts.js"),
+    )
+}
+
+async fn js_utilities_handler() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("static/js/utilities.js"),
     )
 }
 
@@ -736,17 +999,7 @@ async fn chat_ws_handler(
             )
         })?;
 
-    // Extract the host from the origin and compare exactly, so that
-    // crafted origins like "http://localhost.evil.com" are rejected.
-    // Origin format is "scheme://host[:port]".
-    let host = origin
-        .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"))
-        .and_then(|rest| rest.split(':').next()?.split('/').next())
-        .unwrap_or("");
-
-    let is_local = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
-    if !is_local {
+    if !is_allowed_local_ws_origin(origin) {
         return Err((
             StatusCode::FORBIDDEN,
             "WebSocket origin not allowed".to_string(),
@@ -762,6 +1015,42 @@ struct HistoryQuery {
     before: Option<String>,
 }
 
+fn is_allowed_local_ws_origin(origin: &str) -> bool {
+    let Ok(url) = Url::parse(origin) else {
+        return false;
+    };
+    match url.host() {
+        Some(url::Host::Domain(host)) => host == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+fn turn_infos_from_thread(thread: &crate::agent::session::Thread) -> Vec<TurnInfo> {
+    thread
+        .turns
+        .iter()
+        .map(|t| TurnInfo {
+            turn_number: t.turn_number,
+            user_input: t.user_input.clone(),
+            response: t.response.clone(),
+            state: format!("{:?}", t.state),
+            started_at: t.started_at.to_rfc3339(),
+            completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
+            tool_calls: t
+                .tool_calls
+                .iter()
+                .map(|tc| ToolCallInfo {
+                    name: tc.name.clone(),
+                    has_result: tc.result.is_some(),
+                    has_error: tc.error.is_some(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 async fn chat_history_handler(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<HistoryQuery>,
@@ -770,9 +1059,6 @@ async fn chat_history_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Session manager not available".to_string(),
     ))?;
-
-    let session = session_manager.get_or_create_session(&state.user_id).await;
-    let sess = session.lock().await;
 
     let limit = query.limit.unwrap_or(50);
     let before_cursor = query
@@ -790,13 +1076,34 @@ async fn chat_history_handler(
         })
         .transpose()?;
 
-    // Find the thread
-    let thread_id = if let Some(ref tid) = query.thread_id {
+    let session = session_manager.get_or_create_session(&state.user_id).await;
+    let explicit_thread_id = if let Some(ref tid) = query.thread_id {
         Uuid::parse_str(tid)
             .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid thread_id".to_string()))?
     } else {
-        sess.active_thread
-            .ok_or((StatusCode::NOT_FOUND, "No active thread".to_string()))?
+        Uuid::nil()
+    };
+
+    let (thread_id, in_memory_has_thread, in_memory_turns) = {
+        let sess = session.lock().await;
+        let resolved_thread_id = if query.thread_id.is_some() {
+            explicit_thread_id
+        } else {
+            sess.active_thread
+                .ok_or((StatusCode::NOT_FOUND, "No active thread".to_string()))?
+        };
+
+        let in_memory_has_thread = sess.threads.contains_key(&resolved_thread_id);
+        let in_memory_turns = if before_cursor.is_none() {
+            sess.threads
+                .get(&resolved_thread_id)
+                .filter(|thread| !thread.turns.is_empty())
+                .map(turn_infos_from_thread)
+        } else {
+            None
+        };
+
+        (resolved_thread_id, in_memory_has_thread, in_memory_turns)
     };
 
     // Verify the thread belongs to the authenticated user before returning any data.
@@ -809,7 +1116,7 @@ async fn chat_history_handler(
             .conversation_belongs_to_user(thread_id, &state.user_id)
             .await
             .unwrap_or(false);
-        if !owned && !sess.threads.contains_key(&thread_id) {
+        if !owned && !in_memory_has_thread {
             return Err((StatusCode::NOT_FOUND, "Thread not found".to_string()));
         }
     }
@@ -834,31 +1141,7 @@ async fn chat_history_handler(
     }
 
     // Try in-memory first (freshest data for active threads)
-    if let Some(thread) = sess.threads.get(&thread_id)
-        && !thread.turns.is_empty()
-    {
-        let turns: Vec<TurnInfo> = thread
-            .turns
-            .iter()
-            .map(|t| TurnInfo {
-                turn_number: t.turn_number,
-                user_input: t.user_input.clone(),
-                response: t.response.clone(),
-                state: format!("{:?}", t.state),
-                started_at: t.started_at.to_rfc3339(),
-                completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
-                tool_calls: t
-                    .tool_calls
-                    .iter()
-                    .map(|tc| ToolCallInfo {
-                        name: tc.name.clone(),
-                        has_result: tc.result.is_some(),
-                        has_error: tc.error.is_some(),
-                    })
-                    .collect(),
-            })
-            .collect();
-
+    if let Some(turns) = in_memory_turns {
         return Ok(Json(HistoryResponse {
             thread_id,
             turns,
@@ -1081,18 +1364,23 @@ async fn chat_delete_thread_handler(
     ))?;
 
     let session = session_manager.get_or_create_session(&state.user_id).await;
-    let mut sess = session.lock().await;
+    let (in_memory_owned, was_active) = {
+        let sess = session.lock().await;
+        (
+            sess.threads.contains_key(&thread_id),
+            sess.active_thread == Some(thread_id),
+        )
+    };
 
-    let owned = if let Some(ref store) = state.store {
+    let db_owned = if let Some(ref store) = state.store {
         store
             .conversation_belongs_to_user(thread_id, &state.user_id)
             .await
             .unwrap_or(false)
-            || sess.threads.contains_key(&thread_id)
     } else {
-        sess.threads.contains_key(&thread_id)
+        false
     };
-
+    let owned = db_owned || in_memory_owned;
     if !owned {
         return Err((StatusCode::NOT_FOUND, "Thread not found".to_string()));
     }
@@ -1105,23 +1393,37 @@ async fn chat_delete_thread_handler(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
 
-    sess.threads.remove(&thread_id);
-    if sess.active_thread == Some(thread_id) {
-        sess.active_thread = if let Some(ref store) = state.store {
+    let next_active = if was_active {
+        if let Some(ref store) = state.store {
             store
                 .get_or_create_assistant_conversation(&state.user_id, "gateway")
                 .await
                 .ok()
         } else {
-            sess.threads.keys().copied().next()
-        };
-    }
+            None
+        }
+    } else {
+        None
+    };
+
+    let active_thread = {
+        let mut sess = session.lock().await;
+        sess.threads.remove(&thread_id);
+        if was_active {
+            sess.active_thread = next_active.or_else(|| sess.threads.keys().copied().next());
+        }
+        sess.active_thread
+    };
+
+    session_manager
+        .remove_thread_references(&state.user_id, "gateway", thread_id)
+        .await;
 
     Ok(Json(serde_json::json!({
         "status": "deleted",
         "thread_id": thread_id,
         "deleted": deleted || owned,
-        "active_thread": sess.active_thread,
+        "active_thread": active_thread,
     })))
 }
 
@@ -1133,11 +1435,14 @@ async fn chat_clear_threads_handler(
         "Session manager not available".to_string(),
     ))?;
     let session = session_manager.get_or_create_session(&state.user_id).await;
-    let mut sess = session.lock().await;
-
-    let in_memory_count = sess.threads.len() as u64;
-    sess.threads.clear();
-    sess.active_thread = None;
+    let (cleared_thread_ids, in_memory_count) = {
+        let mut sess = session.lock().await;
+        let ids = sess.threads.keys().copied().collect::<Vec<_>>();
+        let count = ids.len() as u64;
+        sess.threads.clear();
+        sess.active_thread = None;
+        (ids, count)
+    };
 
     let mut deleted_count = 0u64;
     let mut assistant_thread: Option<Uuid> = None;
@@ -1150,7 +1455,17 @@ async fn chat_clear_threads_handler(
             .get_or_create_assistant_conversation(&state.user_id, "gateway")
             .await
             .ok();
+    }
+
+    {
+        let mut sess = session.lock().await;
         sess.active_thread = assistant_thread;
+    }
+
+    for thread_id in &cleared_thread_ids {
+        session_manager
+            .remove_thread_references(&state.user_id, "gateway", *thread_id)
+            .await;
     }
 
     Ok(Json(serde_json::json!({
@@ -1959,7 +2274,7 @@ async fn job_files_download_handler(
         return Err((StatusCode::FORBIDDEN, "Forbidden".to_string()));
     }
 
-    let archive_bytes = build_tar_gz_archive(&canonical).await?;
+    let archive_body = build_tar_gz_archive_body(&canonical).await?;
 
     let name_part = if rel_path.is_empty() {
         format!("job-{}", job_id)
@@ -1973,7 +2288,7 @@ async fn job_files_download_handler(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/gzip")
         .header(header::CONTENT_DISPOSITION, disposition)
-        .body(axum::body::Body::from(archive_bytes))
+        .body(archive_body)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2000,7 +2315,9 @@ fn sanitize_download_name(raw: &str) -> String {
     }
 }
 
-async fn build_tar_gz_archive(path: &std::path::Path) -> Result<Vec<u8>, (StatusCode, String)> {
+async fn build_tar_gz_archive_body(
+    path: &std::path::Path,
+) -> Result<axum::body::Body, (StatusCode, String)> {
     let (cwd, target_name) = if path.is_file() {
         let parent = path.parent().ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2023,31 +2340,64 @@ async fn build_tar_gz_archive(path: &std::path::Path) -> Result<Vec<u8>, (Status
         (parent.to_path_buf(), name.to_string())
     };
 
-    let output = tokio::process::Command::new("tar")
+    let mut child = tokio::process::Command::new("tar")
         .arg("-czf")
         .arg("-")
         .arg(&target_name)
         .current_dir(cwd)
-        .output()
-        .await
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to execute tar: {}", e),
+                format!("Failed to execute tar (is it installed?): {}", e),
             )
         })?;
 
-    if !output.status.success() {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!(
-                "Archive command failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        ));
-    }
+    let stdout = child.stdout.take().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Archive command did not expose stdout".to_string(),
+    ))?;
+    let stderr = child.stderr.take();
 
-    Ok(output.stdout)
+    tokio::spawn(async move {
+        let stderr_handle = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut stderr) = stderr {
+                let _ = stderr.read_to_end(&mut buf).await;
+            }
+            buf
+        });
+
+        let wait_result = tokio::time::timeout(ARCHIVE_STREAM_TIMEOUT, child.wait()).await;
+        let stderr_bytes = stderr_handle.await.unwrap_or_default();
+        match wait_result {
+            Ok(Ok(status)) if status.success() => {}
+            Ok(Ok(status)) => {
+                tracing::warn!(
+                    status = %status,
+                    stderr = %String::from_utf8_lossy(&stderr_bytes),
+                    "Archive stream tar process exited with non-zero status"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "Archive stream tar process wait failed");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = ARCHIVE_STREAM_TIMEOUT.as_secs(),
+                    "Archive stream tar process timed out"
+                );
+                if let Err(e) = child.kill().await {
+                    tracing::warn!(error = %e, "Failed to kill timed-out archive tar process");
+                }
+            }
+        }
+    });
+
+    let stream = ReaderStream::new(stdout).map(|result| result.map(Bytes::from));
+    Ok(axum::body::Body::from_stream(stream))
 }
 
 // --- Logs handlers ---
@@ -3087,5 +3437,16 @@ mod tests {
     fn test_build_turns_from_db_messages_empty() {
         let turns = build_turns_from_db_messages(&[]);
         assert!(turns.is_empty());
+    }
+
+    #[test]
+    fn test_is_allowed_local_ws_origin() {
+        assert!(is_allowed_local_ws_origin("http://localhost:3000"));
+        assert!(is_allowed_local_ws_origin("https://127.0.0.1:8443"));
+        assert!(is_allowed_local_ws_origin("http://[::1]:3000"));
+
+        assert!(!is_allowed_local_ws_origin("http://localhost.evil.com"));
+        assert!(!is_allowed_local_ws_origin("not-a-url"));
+        assert!(!is_allowed_local_ws_origin("https://example.com"));
     }
 }

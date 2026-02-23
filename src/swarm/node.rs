@@ -22,6 +22,9 @@ use uuid::Uuid;
 
 use super::protocol::{SwarmMessage, SwarmTask, TOPIC_HEARTBEAT, TOPIC_RESULTS, TOPIC_TASKS};
 
+const SEEN_TASK_TTL: Duration = Duration::from_secs(300);
+const SEEN_TASK_MAX: usize = 4096;
+
 /// Combined libp2p behaviour for the Hive mesh.
 #[derive(NetworkBehaviour)]
 pub struct HiveBehaviour {
@@ -130,6 +133,11 @@ pub enum SwarmCommand {
     HasCapability {
         capability: String,
         respond_to: oneshot::Sender<bool>,
+    },
+    /// Select a specific peer advertising a capability (best-effort).
+    SelectPeer {
+        capability: String,
+        respond_to: oneshot::Sender<Option<String>>,
     },
     /// Shut down the swarm.
     Shutdown,
@@ -280,6 +288,7 @@ impl SwarmNode {
         tokio::spawn(async move {
             let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
             let mut peers: HashMap<PeerId, PeerState> = HashMap::new();
+            let mut seen_tasks: HashMap<Uuid, Instant> = HashMap::new();
             let advertised_capabilities = vec![
                 "tool_exec".to_string(),
                 "shell".to_string(),
@@ -298,7 +307,14 @@ impl SwarmNode {
                                 if let Ok(msg) = serde_json::from_slice::<SwarmMessage>(&message.data) {
                                     match msg {
                                         SwarmMessage::TaskAssignment(task) => {
-                                            let _ = event_tx.send(SwarmEvent2::IncomingTask(task)).await;
+                                            if should_accept_incoming_task(
+                                                &node_id,
+                                                &task,
+                                                &mut seen_tasks,
+                                                Instant::now(),
+                                            ) {
+                                                let _ = event_tx.send(SwarmEvent2::IncomingTask(task)).await;
+                                            }
                                         }
                                         SwarmMessage::TaskResult { task_id, success, output, duration_ms } => {
                                             let _ = event_tx.send(SwarmEvent2::TaskCompleted {
@@ -379,6 +395,22 @@ impl SwarmNode {
                                 });
                                 let _ = respond_to.send(has_peer);
                             }
+                            Some(SwarmCommand::SelectPeer { capability, respond_to }) => {
+                                let selected = peers
+                                    .iter()
+                                    .filter(|(_, peer)| {
+                                        peer.available_slots > 0
+                                            && peer.capabilities.iter().any(|c| c == &capability)
+                                    })
+                                    .max_by(|(peer_a, state_a), (peer_b, state_b)| {
+                                        state_a
+                                            .available_slots
+                                            .cmp(&state_b.available_slots)
+                                            .then_with(|| peer_b.to_string().cmp(&peer_a.to_string()))
+                                    })
+                                    .map(|(peer_id, _)| peer_id.to_string());
+                                let _ = respond_to.send(selected);
+                            }
                             Some(SwarmCommand::Shutdown) | None => {
                                 tracing::info!("Hive swarm node shutting down");
                                 break;
@@ -448,6 +480,20 @@ impl SwarmHandle {
             .map_err(|e| format!("Swarm capability query failed: {}", e))
     }
 
+    /// Select a specific peer that currently advertises the requested capability.
+    pub async fn select_peer(&self, capability: &str) -> Result<Option<String>, String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::SelectPeer {
+                capability: capability.to_string(),
+                respond_to: tx,
+            })
+            .await
+            .map_err(|e| format!("Swarm channel closed: {}", e))?;
+        rx.await
+            .map_err(|e| format!("Swarm peer selection query failed: {}", e))
+    }
+
     /// Shut down the swarm node.
     pub async fn shutdown(&self) -> Result<(), String> {
         self.cmd_tx
@@ -457,10 +503,43 @@ impl SwarmHandle {
     }
 }
 
+fn should_accept_incoming_task(
+    node_id: &str,
+    task: &SwarmTask,
+    seen_tasks: &mut HashMap<Uuid, Instant>,
+    now: Instant,
+) -> bool {
+    seen_tasks.retain(|_, seen_at| now.saturating_duration_since(*seen_at) < SEEN_TASK_TTL);
+    if seen_tasks.len() > SEEN_TASK_MAX {
+        // Best-effort trim of oldest entries to bound memory.
+        let mut entries: Vec<(Uuid, Instant)> = seen_tasks.iter().map(|(k, v)| (*k, *v)).collect();
+        entries.sort_by_key(|(_, t)| *t);
+        let drop_count = entries.len().saturating_sub(SEEN_TASK_MAX);
+        for (task_id, _) in entries.into_iter().take(drop_count) {
+            seen_tasks.remove(&task_id);
+        }
+    }
+
+    if let Some(assignee) = &task.assignee_node
+        && assignee != node_id
+    {
+        return false;
+    }
+
+    if seen_tasks.contains_key(&task.id) {
+        return false;
+    }
+    seen_tasks.insert(task.id, now);
+    true
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SwarmRemoteResult, SwarmResultRouter};
-    use std::time::Duration;
+    use super::{SwarmRemoteResult, SwarmResultRouter, should_accept_incoming_task};
+    use crate::swarm::protocol::SwarmTask;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
     use uuid::Uuid;
 
     #[tokio::test]
@@ -498,5 +577,67 @@ mod tests {
         let removed = router.cleanup_expired().await;
         assert_eq!(removed, 1);
         assert_eq!(router.pending_count().await, 0);
+    }
+
+    #[test]
+    fn incoming_task_rejects_non_assignee() {
+        let mut seen = HashMap::new();
+        let task = SwarmTask {
+            id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            tool_name: "echo".to_string(),
+            params: json!({"x":1}),
+            priority: 1,
+            attempt: 0,
+            deadline_ms: None,
+            origin_node: Some("origin".to_string()),
+            assignee_node: Some("peer-b".to_string()),
+        };
+        assert!(!should_accept_incoming_task(
+            "peer-a",
+            &task,
+            &mut seen,
+            Instant::now()
+        ));
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn incoming_task_rejects_duplicates() {
+        let mut seen = HashMap::new();
+        let task = SwarmTask {
+            id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            tool_name: "echo".to_string(),
+            params: json!({}),
+            priority: 1,
+            attempt: 0,
+            deadline_ms: None,
+            origin_node: Some("origin".to_string()),
+            assignee_node: None,
+        };
+        let now = Instant::now();
+        assert!(should_accept_incoming_task("peer-a", &task, &mut seen, now));
+        assert!(!should_accept_incoming_task("peer-a", &task, &mut seen, now));
+    }
+
+    #[test]
+    fn incoming_task_allows_after_ttl_expiry() {
+        let mut seen = HashMap::new();
+        let task = SwarmTask {
+            id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            tool_name: "echo".to_string(),
+            params: json!({}),
+            priority: 1,
+            attempt: 0,
+            deadline_ms: None,
+            origin_node: None,
+            assignee_node: None,
+        };
+        let t0 = Instant::now();
+        assert!(should_accept_incoming_task("peer-a", &task, &mut seen, t0));
+        let t1 = t0 + Duration::from_secs(301);
+        assert!(should_accept_incoming_task("peer-a", &task, &mut seen, t1));
     }
 }

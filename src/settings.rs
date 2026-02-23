@@ -316,6 +316,10 @@ pub struct AgentSettings {
     #[serde(default = "default_session_idle_timeout")]
     pub session_idle_timeout_secs: u64,
 
+    /// Remote swarm wait timeout before local fallback (milliseconds).
+    #[serde(default = "default_swarm_remote_wait_timeout_ms")]
+    pub swarm_remote_wait_timeout_ms: u64,
+
     /// Enable token-to-tool piped execution path.
     #[serde(default = "default_true")]
     pub enable_piped_tool_execution: bool,
@@ -359,6 +363,26 @@ pub struct AgentSettings {
     /// Auto-deploy approved kernel patch proposals.
     #[serde(default)]
     pub kernel_auto_deploy_patches: bool,
+
+    /// Enable automatic profile/identity synthesis into managed workspace sections.
+    #[serde(default = "default_true")]
+    pub profile_synthesis_enabled: bool,
+
+    /// Debounce interval before flushing profile synthesis updates.
+    #[serde(default = "default_profile_synthesis_debounce")]
+    pub profile_synthesis_debounce_secs: u64,
+
+    /// Max successful turns to batch into one profile synthesis update.
+    #[serde(default = "default_profile_synthesis_max_batch")]
+    pub profile_synthesis_max_batch_turns: u32,
+
+    /// Minimum user-input length (chars) to consider for synthesis.
+    #[serde(default = "default_profile_synthesis_min_chars")]
+    pub profile_synthesis_min_chars: u32,
+
+    /// Whether to use LLM-assisted merge for managed profile sections.
+    #[serde(default = "default_true")]
+    pub profile_synthesis_llm_enabled: bool,
 }
 
 fn default_agent_name() -> String {
@@ -417,6 +441,22 @@ fn default_kernel_slow_threshold_ms() -> f64 {
     5000.0
 }
 
+fn default_profile_synthesis_debounce() -> u64 {
+    45
+}
+
+fn default_profile_synthesis_max_batch() -> u32 {
+    6
+}
+
+fn default_profile_synthesis_min_chars() -> u32 {
+    20
+}
+
+fn default_swarm_remote_wait_timeout_ms() -> u64 {
+    2500
+}
+
 impl Default for AgentSettings {
     fn default() -> Self {
         Self {
@@ -428,6 +468,7 @@ impl Default for AgentSettings {
             repair_check_interval_secs: default_repair_interval(),
             max_repair_attempts: default_max_repair_attempts(),
             session_idle_timeout_secs: default_session_idle_timeout(),
+            swarm_remote_wait_timeout_ms: default_swarm_remote_wait_timeout_ms(),
             enable_piped_tool_execution: true,
             shadow_workers_enabled: true,
             shadow_max_predictions: default_shadow_max_predictions(),
@@ -439,6 +480,11 @@ impl Default for AgentSettings {
             kernel_slow_threshold_ms: default_kernel_slow_threshold_ms(),
             kernel_auto_approve_patches: false,
             kernel_auto_deploy_patches: false,
+            profile_synthesis_enabled: true,
+            profile_synthesis_debounce_secs: default_profile_synthesis_debounce(),
+            profile_synthesis_max_batch_turns: default_profile_synthesis_max_batch(),
+            profile_synthesis_min_chars: default_profile_synthesis_min_chars(),
+            profile_synthesis_llm_enabled: true,
         }
     }
 }

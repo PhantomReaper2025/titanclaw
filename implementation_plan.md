@@ -11,22 +11,31 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 > [!CAUTION]
 > This represents a paradigm shift from a linear conversational agent to a distributed orchestration mesh. Please confirm if this extreme scale of ambition aligns with your vision. 
 
-## Implementation Status (2026-02-21)
+## Implementation Status (2026-02-23)
 
 | Track | Status | Notes |
 |---|---|---|
-| Swarm mesh runtime wiring | ✅ | `swarm` module is wired into runtime lifecycle behind config (`SWARM_ENABLED`, listen/heartbeat/max slots), incoming remote tasks execute through the local tool/safety stack, scheduler offload is capability-gated with deterministic local fallback, and remote completion waiters are bounded with expiry cleanup. |
+| Swarm mesh runtime wiring | ✅ | `swarm` module is wired into runtime lifecycle behind config (`SWARM_ENABLED`, listen/heartbeat/max slots), incoming remote tasks execute through the local tool/safety stack, scheduler offload is capability-gated with deterministic local fallback, task assignments now include assignee-targeting (`assignee_node`) to prevent fan-out execution on every peer, receiving nodes suppress duplicate task IDs with a bounded TTL cache, and remote completion waiters are bounded with expiry cleanup. |
 | Zero-latency text streaming | ✅ | Streaming chunk path is active in agent dispatcher to REPL/Web/WASM channels. |
 | Tool/block-level streaming | ✅ | Tool start/completion/result events are live; shell tool streams incremental stdout/stderr, streamed tool-call deltas surface live shell command drafts (`[draft]`), piped early execution is default-on (toggle with `ENABLE_PIPED_TOOL_EXECUTION=false`), and approval-required commands emit explicit waiting status before execution. |
 | Reflex compiler | ✅ | Background reflex compiler now persists normalized recurring patterns to a reflex registry and routes matching prompts directly to compiled tools before LLM fallback. |
 | GraphRAG + AST indexing | ✅ | `memory_graph` now supports bounded multi-hop traversal, graph scoring, stable ranking, and semantic context fusion in responses. |
 | Docker worker image provisioning hardening | ✅ | Orchestrator `job_manager` now preflights worker image availability and auto-pulls when missing (respects `sandbox.auto_pull_image`), eliminating first-run `No such image` container creation failures. |
 | Chat lifecycle controls | ✅ | Web gateway now supports hard-delete for a single thread and clear-all chats (chat scope only), with UI actions. |
-| Sandbox artifact export | ✅ | Web gateway now supports direct archive download of sandbox project output (`/api/jobs/{id}/files/download`). |
+| Sandbox artifact export | ✅ | Web gateway supports direct archive download of sandbox project output (`/api/jobs/{id}/files/download`) and now streams tar output with a timeout watchdog instead of buffering the full archive in memory. |
 | OpenCode bridge runtime | ✅ | `JobMode::OpenCode` now launches a dedicated `opencode-bridge` worker command (not generic `worker` fallback), passes model defaults through, and streams OpenCode output/events to orchestrator channels. |
 | Routine FullJob scheduler integration | ✅ | `RoutineAction::FullJob` now creates a real job context, schedules it through `Scheduler`, and reports success/failure from terminal job state instead of lightweight fallback. |
 | Anticipatory execution (shadow workers) | ✅ | New `shadow_engine` precomputes likely next-turn responses via bounded cheap-LLM workers, caches by normalized prompt, and serves cache hits instantly with TTL + background pruning. |
 | Self-modifying kernel orchestration | ✅ | New `kernel_orchestrator` loop records live tool latencies from dispatcher execution, detects bottlenecks, creates patch proposals in `KernelMonitor`, and can auto-approve/auto-deploy via `jit_wasm_run` (config-gated). User-facing control is live via `kernel_patch` tool, `/kernel ...` commands, and gateway `/api/kernel/patches*` endpoints. |
+| Reliability hardening (runtime + onboarding) | ✅ | Fixed scheduler subtask success tracking, removed sandbox job-manager panic path, added OAuth callback `state` verification/consumption for WASM auth callbacks, enabled WASM channel setup validation endpoint GET checks with secret placeholder substitution, improved medium-path logging/error surfacing (worker progress status, self-repair broadcasts, scheduler start signal, container cleanup), hardened the web gateway path (URL-decoded SSE auth query tokens, parsed loopback WebSocket Origin validation, DOM-based chat markdown sanitization), hardened sandbox completion handling with structured `/worker/{job_id}/complete` termination plus broader fallback phrase detection/anti-loop handling, made swarm remote wait fallback timeout configurable (`SWARM_REMOTE_WAIT_TIMEOUT_MS`, clamped), and added restartable supervisors (with backoff + shutdown signaling) for critical agent background loops (self-repair, kernel monitor, shadow prune, reflex compiler). |
+| WASM tool metadata/schema registration | ✅ | WASM metadata now resolves via loader sidecar overrides first, then true WIT export introspection (`description()` / `schema()`) during runtime preparation, with explicit warning-logged fallback metadata only as last resort. |
+| Dynamic profile synthesis (managed identity docs) | ✅ | New background profile synthesizer batches successful turns asynchronously (debounced), extracts durable preferences/facts, and updates managed sections in `AGENTS.md`, `IDENTITY.md`, `SOUL.md`, `USER.md`, and `MEMORY.md` while preserving manual content outside markers. |
+| Conversational profile onboarding (OpenClaw-style) | ✅ | Added a shared agent-layer first-chat onboarding flow (soft-block) across web/CLI/Telegram that captures user identity, goals, tone, execution style, and boundaries, supports `/onboard profile` commands, and writes reviewed managed baseline sections into `AGENTS.md`, `IDENTITY.md`, `SOUL.md`, `USER.md`, and `MEMORY.md`. |
+| Session/thread workflow hardening (races + approvals) | ✅ | `resolve_thread` now serializes mapping creation and preserves UUID external thread IDs for the gateway/web UUID-backed thread flow (avoiding duplicate-thread/hydration mismatches) while keeping non-gateway channels channel-scoped, `register_thread` warns on collisions, hydration avoids overwriting concurrently created threads, thread delete/clear now clean in-memory thread mappings/undo state immediately, and pending approvals now expire automatically instead of waiting forever. |
+| Chat durability + turn-state hardening | ✅ | Turn persistence now retries DB writes and emits a visible warning on final failure, runtime thread paths use guarded `try_start_turn()` to prevent invalid state transitions, and approval resume/rejection flows now close/persist turns consistently instead of leaving partial state. |
+| Embeddings input length guard semantics | ✅ | Embedding providers now validate approximate character length (not byte length), apply checks consistently to both single and batch embedding calls, and return clearer `TextTooLong` values for non-ASCII inputs. |
+| WhatsApp unsupported media handling | ✅ | Non-text WhatsApp messages are no longer silently dropped; the channel emits an explicit placeholder message to the agent and logs a warning so users can be informed to resend as text. |
+| PostgreSQL AST graph query gap (documented) | ✅ | AST graph query remains Database/libSQL-only; runtime error message and docs now explicitly state the PostgreSQL-backed workspace limitation. |
 
 ## Execution TODO (Live)
 
@@ -41,6 +50,12 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 - [x] Docker job runner preflight image check + auto-pull fallback for first-run reliability
 - [x] Shadow-worker speculative execution cache with bounded concurrency + TTL
 - [x] Kernel monitor runtime loop with proposal generation + optional auto deploy
+- [x] OAuth callback state nonce verification for WASM extension auth callbacks
+- [x] WASM channel setup validation endpoint execution (GET with secret placeholder substitution)
+- [x] Medium reliability hardening for silent-failure logging + unsupported channel message types
+- [x] True WASM/WIT tool metadata introspection (`description()` / `schema()`) with safe fallback
+- [x] Async debounced profile synthesis into managed sections of core identity docs
+- [x] Conversational profile onboarding in chat with review+confirm and managed-doc baseline write
 
 ## Proposed Changes
 

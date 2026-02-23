@@ -1,0 +1,195 @@
+#tab-chat {
+  flex-direction: row;
+}
+
+.thread-sidebar {
+  width: 220px;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border-right: 1px solid var(--glass-border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  transition: width var(--duration-slow) var(--ease);
+  overflow: hidden;
+}
+
+.thread-sidebar.collapsed {
+  width: 36px;
+}
+
+.thread-sidebar.collapsed .thread-sidebar-header span,
+.thread-sidebar.collapsed .thread-new-btn,
+.thread-sidebar.collapsed .thread-list,
+.thread-sidebar.collapsed .assistant-item,
+.thread-sidebar.collapsed .threads-section-header {
+  display: none;
+}
+
+.thread-sidebar-header {
+  display: flex;
+  align-items: center;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  font-weight: 600;
+  gap: 8px;
+}
+
+.thread-sidebar-header span {
+  flex: 1;
+}
+
+.thread-new-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 16px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  line-height: 1;
+}
+
+.thread-new-btn:hover {
+  background: rgba(255, 26, 26, 0.12);
+}
+
+.assistant-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-secondary);
+}
+
+.assistant-item:hover {
+  background: var(--bg-tertiary);
+}
+
+.assistant-item.active {
+  background: rgba(255, 26, 26, 0.08);
+  color: var(--accent);
+  border-left: 2px solid var(--accent);
+}
+
+.assistant-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.assistant-meta {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+
+.threads-section-header {
+  padding: 8px 12px 4px;
+  font-size: 11px;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-secondary);
+}
+
+.thread-clear-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 8px;
+  font-size: 10px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.thread-clear-btn:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.thread-toggle-btn {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px;
+}
+
+.thread-toggle-btn:hover {
+  color: var(--text);
+}
+
+.thread-list {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.thread-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-secondary);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+.thread-item:hover {
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text);
+}
+
+.thread-item.active {
+  background: var(--accent-subtle);
+  color: var(--accent);
+  border-left: 2px solid var(--accent);
+}
+
+.thread-label {
+  font-family: monospace;
+  font-size: 12px;
+}
+
+.thread-meta {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.thread-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.thread-delete-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 8px;
+  font-size: 10px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.thread-delete-btn:hover {
+  color: #ff8f8f;
+  border-color: #b34646;
+}

@@ -8,11 +8,15 @@
 //! - `thread_ops` - Thread/session operations (user input, undo, approval, persistence)
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
+use tokio::sync::watch;
 
 use crate::agent::context_monitor::ContextMonitor;
 use crate::agent::heartbeat::spawn_heartbeat;
+use crate::agent::profile_onboarding::ProfileOnboardingManager;
+use crate::agent::profile_synthesizer::{ProfileSynthesisConfig, ProfileSynthesizer};
 use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
 use crate::agent::self_repair::{DefaultSelfRepair, RepairResult, SelfRepair};
 use crate::agent::session_manager::SessionManager;
@@ -55,6 +59,82 @@ pub(crate) fn truncate_for_preview(output: &str, max_chars: usize) -> String {
     } else {
         collapsed
     }
+}
+
+fn spawn_supervised_background_task<F>(
+    name: &'static str,
+    mut shutdown_rx: watch::Receiver<bool>,
+    factory: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn() -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        let mut restart_count: u32 = 0;
+        let mut backoff = Duration::from_secs(1);
+
+        loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+
+            let mut child = factory();
+            let join_res = tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_ok() && *shutdown_rx.borrow() {
+                        child.abort();
+                        let _ = child.await;
+                        break;
+                    }
+
+                    // Treat channel closure/spurious wake as a shutdown request to avoid leaks.
+                    child.abort();
+                    let _ = child.await;
+                    break;
+                }
+                res = &mut child => res,
+            };
+
+            let (level, detail, should_restart) = match join_res {
+                Ok(()) => ("warn", "background task returned unexpectedly", true),
+                Err(e) if e.is_cancelled() => ("debug", "background task cancelled", false),
+                Err(e) if e.is_panic() => ("error", "background task panicked", true),
+                Err(_) => ("warn", "background task ended unexpectedly", true),
+            };
+
+            match level {
+                "error" => tracing::error!(task = name, restart_count, "{}", detail),
+                "warn" => tracing::warn!(task = name, restart_count, "{}", detail),
+                _ => tracing::debug!(task = name, restart_count, "{}", detail),
+            }
+
+            if !should_restart || *shutdown_rx.borrow() {
+                break;
+            }
+
+            let sleep_for = backoff;
+            tracing::warn!(
+                task = name,
+                restart_count = restart_count + 1,
+                backoff_ms = sleep_for.as_millis() as u64,
+                "Restarting background task"
+            );
+
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_ok() && *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(sleep_for) => {}
+            }
+
+            restart_count = restart_count.saturating_add(1);
+            backoff = backoff.saturating_mul(2).min(Duration::from_secs(30));
+        }
+
+        tracing::debug!(task = name, "Background supervisor exited");
+    })
 }
 
 /// Core dependencies for the agent.
@@ -104,6 +184,8 @@ pub struct Agent {
     pub(super) kernel_orchestrator:
         Option<Arc<crate::agent::kernel_orchestrator::KernelOrchestrator>>,
     pub(super) shadow_engine: Option<Arc<ShadowEngine>>,
+    pub(super) profile_onboarding: Option<Arc<ProfileOnboardingManager>>,
+    pub(super) profile_synthesizer: Option<Arc<ProfileSynthesizer>>,
 }
 
 impl Agent {
@@ -122,6 +204,26 @@ impl Agent {
     ) -> Self {
         let kernel_orchestrator = deps.kernel_orchestrator.clone();
         let shadow_engine = deps.shadow_engine.clone();
+        let profile_onboarding = match (deps.store.as_ref(), deps.workspace.as_ref()) {
+            (Some(store), Some(ws)) => Some(Arc::new(ProfileOnboardingManager::new(
+                Arc::clone(store),
+                Arc::clone(ws),
+            ))),
+            _ => None,
+        };
+        let profile_synthesizer = deps.workspace.as_ref().map(|ws| {
+            ProfileSynthesizer::new(
+                ProfileSynthesisConfig {
+                    enabled: config.profile_synthesis_enabled,
+                    debounce: config.profile_synthesis_debounce,
+                    max_batch_turns: config.profile_synthesis_max_batch_turns,
+                    min_input_chars: config.profile_synthesis_min_chars,
+                    llm_enabled: config.profile_synthesis_llm_enabled,
+                },
+                Arc::clone(ws),
+                deps.cheap_llm.clone().unwrap_or_else(|| deps.llm.clone()),
+            )
+        });
         let context_manager = context_manager
             .unwrap_or_else(|| Arc::new(ContextManager::new(config.max_parallel_jobs)));
 
@@ -152,6 +254,8 @@ impl Agent {
             routine_config,
             kernel_orchestrator,
             shadow_engine,
+            profile_onboarding,
+            profile_synthesizer,
         }
     }
 
@@ -204,6 +308,14 @@ impl Agent {
         self.shadow_engine.as_ref()
     }
 
+    pub(super) fn profile_onboarding(&self) -> Option<&Arc<ProfileOnboardingManager>> {
+        self.profile_onboarding.as_ref()
+    }
+
+    pub(super) fn profile_synthesizer(&self) -> Option<&Arc<ProfileSynthesizer>> {
+        self.profile_synthesizer.as_ref()
+    }
+
     /// Select active skills for a message using deterministic prefiltering.
     pub(super) fn select_active_skills(
         &self,
@@ -249,6 +361,10 @@ impl Agent {
         // Start channels
         let mut message_stream = self.channels.start_all().await?;
 
+        // Background supervisors share a shutdown signal so critical loops can be
+        // restarted on panic/exit and stopped promptly during shutdown.
+        let (background_shutdown_tx, background_shutdown_rx) = watch::channel(false);
+
         // Start self-repair task with notification forwarding
         let repair = Arc::new(DefaultSelfRepair::new(
             self.context_manager.clone(),
@@ -257,7 +373,13 @@ impl Agent {
         ));
         let repair_interval = self.config.repair_check_interval;
         let repair_channels = self.channels.clone();
-        let repair_handle = tokio::spawn(async move {
+        let repair_handle = spawn_supervised_background_task(
+            "self_repair",
+            background_shutdown_rx.clone(),
+            move || {
+                let repair = Arc::clone(&repair);
+                let repair_channels = repair_channels.clone();
+                tokio::spawn(async move {
             loop {
                 tokio::time::sleep(repair_interval).await;
 
@@ -304,7 +426,17 @@ impl Agent {
 
                     if let Some(msg) = notification {
                         let response = OutgoingResponse::text(format!("Self-Repair: {}", msg));
-                        let _ = repair_channels.broadcast_all("default", response).await;
+                        for (channel, result) in
+                            repair_channels.broadcast_all("default", response).await
+                        {
+                            if let Err(e) = result {
+                                tracing::warn!(
+                                    channel = %channel,
+                                    "Failed to broadcast self-repair notification: {}",
+                                    e
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -318,7 +450,17 @@ impl Agent {
                                 "Self-Repair: Tool '{}' repaired: {}",
                                 tool.name, message
                             ));
-                            let _ = repair_channels.broadcast_all("default", response).await;
+                            for (channel, result) in
+                                repair_channels.broadcast_all("default", response).await
+                            {
+                                if let Err(e) = result {
+                                    tracing::warn!(
+                                        channel = %channel,
+                                        "Failed to broadcast self-repair tool notification: {}",
+                                        e
+                                    );
+                                }
+                            }
                         }
                         Ok(result) => {
                             tracing::info!("Tool repair result: {:?}", result);
@@ -329,17 +471,26 @@ impl Agent {
                     }
                 }
             }
-        });
+                })
+            },
+        );
 
         let kernel_handle = if let Some(orchestrator) = self.kernel_orchestrator.clone() {
             if orchestrator.enabled() {
                 let interval = orchestrator.interval();
-                Some(tokio::spawn(async move {
-                    loop {
-                        tokio::time::sleep(interval).await;
-                        orchestrator.tick().await;
-                    }
-                }))
+                Some(spawn_supervised_background_task(
+                    "kernel_orchestrator",
+                    background_shutdown_rx.clone(),
+                    move || {
+                        let orchestrator = Arc::clone(&orchestrator);
+                        tokio::spawn(async move {
+                            loop {
+                                tokio::time::sleep(interval).await;
+                                orchestrator.tick().await;
+                            }
+                        })
+                    },
+                ))
             } else {
                 None
             }
@@ -349,12 +500,19 @@ impl Agent {
 
         let shadow_prune_handle = if let Some(shadow) = self.shadow_engine.clone() {
             if shadow.enabled() {
-                Some(tokio::spawn(async move {
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                        shadow.prune_expired().await;
-                    }
-                }))
+                Some(spawn_supervised_background_task(
+                    "shadow_prune",
+                    background_shutdown_rx.clone(),
+                    move || {
+                        let shadow = Arc::clone(&shadow);
+                        tokio::spawn(async move {
+                            loop {
+                                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                                shadow.prune_expired().await;
+                            }
+                        })
+                    },
+                ))
             } else {
                 None
             }
@@ -524,12 +682,22 @@ impl Agent {
         // Spawn Reflex compiler background ticker
         let reflex_handle = if let Some(store) = self.store() {
             tracing::info!("Reflex compiler background ticker enabled (evaluating every 5m)");
-            Some(crate::agent::reflex::spawn_reflex_compiler(
-                Arc::clone(store),
-                self.llm().clone(),
-                self.safety().clone(),
-                self.tools().clone(),
-                std::time::Duration::from_secs(300),
+            let llm = self.llm().clone();
+            let safety = self.safety().clone();
+            let tools = self.tools().clone();
+            let store = Arc::clone(store);
+            Some(spawn_supervised_background_task(
+                "reflex_compiler",
+                background_shutdown_rx.clone(),
+                move || {
+                    crate::agent::reflex::spawn_reflex_compiler(
+                        Arc::clone(&store),
+                        llm.clone(),
+                        safety.clone(),
+                        tools.clone(),
+                        std::time::Duration::from_secs(300),
+                    )
+                },
             ))
         } else {
             None
@@ -710,7 +878,12 @@ impl Agent {
 
         // Cleanup
         tracing::info!("Agent shutting down...");
-        repair_handle.abort();
+        let _ = background_shutdown_tx.send(true);
+        let mut repair_handle = repair_handle;
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut repair_handle).await;
+        if !repair_handle.is_finished() {
+            repair_handle.abort();
+        }
         pruning_handle.abort();
         if let Some(handle) = heartbeat_handle {
             handle.abort();
@@ -719,13 +892,25 @@ impl Agent {
             cron_handle.abort();
         }
         if let Some(handle) = reflex_handle {
-            handle.abort();
+            let mut handle = handle;
+            let _ = tokio::time::timeout(Duration::from_secs(2), &mut handle).await;
+            if !handle.is_finished() {
+                handle.abort();
+            }
         }
         if let Some(handle) = kernel_handle {
-            handle.abort();
+            let mut handle = handle;
+            let _ = tokio::time::timeout(Duration::from_secs(2), &mut handle).await;
+            if !handle.is_finished() {
+                handle.abort();
+            }
         }
         if let Some(handle) = shadow_prune_handle {
-            handle.abort();
+            let mut handle = handle;
+            let _ = tokio::time::timeout(Duration::from_secs(2), &mut handle).await;
+            if !handle.is_finished() {
+                handle.abort();
+            }
         }
         self.scheduler.stop_all().await;
         self.channels.shutdown_all().await?;
@@ -804,6 +989,14 @@ impl Agent {
                     // Fall through to normal handling
                 }
             }
+        }
+
+        // Conversational profile onboarding interception (OpenClaw-style, soft-block).
+        if let Some(response) = self
+            .maybe_handle_profile_onboarding(message, &submission)
+            .await?
+        {
+            return Ok(Some(response));
         }
 
         tracing::debug!(

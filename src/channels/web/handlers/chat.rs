@@ -9,6 +9,7 @@ use axum::{
     response::IntoResponse,
 };
 use serde::Deserialize;
+use url::Url;
 use uuid::Uuid;
 
 use crate::channels::IncomingMessage;
@@ -228,14 +229,7 @@ pub async fn chat_ws_handler(
             )
         })?;
 
-    let host = origin
-        .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"))
-        .and_then(|rest| rest.split(':').next()?.split('/').next())
-        .unwrap_or("");
-
-    let is_local = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
-    if !is_local {
+    if !is_allowed_local_ws_origin(origin) {
         return Err((
             StatusCode::FORBIDDEN,
             "WebSocket origin not allowed".to_string(),
@@ -251,6 +245,42 @@ pub struct HistoryQuery {
     pub before: Option<String>,
 }
 
+fn is_allowed_local_ws_origin(origin: &str) -> bool {
+    let Ok(url) = Url::parse(origin) else {
+        return false;
+    };
+    match url.host() {
+        Some(url::Host::Domain(host)) => host == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+fn turn_infos_from_thread(thread: &crate::agent::session::Thread) -> Vec<TurnInfo> {
+    thread
+        .turns
+        .iter()
+        .map(|t| TurnInfo {
+            turn_number: t.turn_number,
+            user_input: t.user_input.clone(),
+            response: t.response.clone(),
+            state: format!("{:?}", t.state),
+            started_at: t.started_at.to_rfc3339(),
+            completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
+            tool_calls: t
+                .tool_calls
+                .iter()
+                .map(|tc| ToolCallInfo {
+                    name: tc.name.clone(),
+                    has_result: tc.result.is_some(),
+                    has_error: tc.error.is_some(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 pub async fn chat_history_handler(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<HistoryQuery>,
@@ -259,9 +289,6 @@ pub async fn chat_history_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Session manager not available".to_string(),
     ))?;
-
-    let session = session_manager.get_or_create_session(&state.user_id).await;
-    let sess = session.lock().await;
 
     let limit = query.limit.unwrap_or(50);
     let before_cursor = query
@@ -279,13 +306,32 @@ pub async fn chat_history_handler(
         })
         .transpose()?;
 
-    // Find the thread
-    let thread_id = if let Some(ref tid) = query.thread_id {
+    let session = session_manager.get_or_create_session(&state.user_id).await;
+    let explicit_thread_id = if let Some(ref tid) = query.thread_id {
         Uuid::parse_str(tid)
             .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid thread_id".to_string()))?
     } else {
-        sess.active_thread
-            .ok_or((StatusCode::NOT_FOUND, "No active thread".to_string()))?
+        Uuid::nil()
+    };
+
+    let (thread_id, in_memory_has_thread, in_memory_turns) = {
+        let sess = session.lock().await;
+        let resolved_thread_id = if query.thread_id.is_some() {
+            explicit_thread_id
+        } else {
+            sess.active_thread
+                .ok_or((StatusCode::NOT_FOUND, "No active thread".to_string()))?
+        };
+        let in_memory_has_thread = sess.threads.contains_key(&resolved_thread_id);
+        let in_memory_turns = if before_cursor.is_none() {
+            sess.threads
+                .get(&resolved_thread_id)
+                .filter(|thread| !thread.turns.is_empty())
+                .map(turn_infos_from_thread)
+        } else {
+            None
+        };
+        (resolved_thread_id, in_memory_has_thread, in_memory_turns)
     };
 
     // Verify the thread belongs to the authenticated user before returning any data.
@@ -296,7 +342,7 @@ pub async fn chat_history_handler(
             .conversation_belongs_to_user(thread_id, &state.user_id)
             .await
             .unwrap_or(false);
-        if !owned && !sess.threads.contains_key(&thread_id) {
+        if !owned && !in_memory_has_thread {
             return Err((StatusCode::NOT_FOUND, "Thread not found".to_string()));
         }
     }
@@ -321,31 +367,7 @@ pub async fn chat_history_handler(
     }
 
     // Try in-memory first (freshest data for active threads)
-    if let Some(thread) = sess.threads.get(&thread_id)
-        && !thread.turns.is_empty()
-    {
-        let turns: Vec<TurnInfo> = thread
-            .turns
-            .iter()
-            .map(|t| TurnInfo {
-                turn_number: t.turn_number,
-                user_input: t.user_input.clone(),
-                response: t.response.clone(),
-                state: format!("{:?}", t.state),
-                started_at: t.started_at.to_rfc3339(),
-                completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
-                tool_calls: t
-                    .tool_calls
-                    .iter()
-                    .map(|tc| ToolCallInfo {
-                        name: tc.name.clone(),
-                        has_result: tc.result.is_some(),
-                        has_error: tc.error.is_some(),
-                    })
-                    .collect(),
-            })
-            .collect();
-
+    if let Some(turns) = in_memory_turns {
         return Ok(Json(HistoryResponse {
             thread_id,
             turns,

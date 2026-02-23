@@ -1,0 +1,40 @@
+
+#toasts {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast {
+  padding: 10px 16px;
+  border-radius: var(--radius);
+  font-size: 13px;
+  color: #fff;
+  pointer-events: auto;
+  transform: translateX(120%);
+  transition: transform 0.25s ease;
+  max-width: 360px;
+  word-break: break-word;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.toast.visible {
+  transform: translateX(0);
+}
+
+.toast-info {
+  background: var(--accent);
+}
+
+.toast-success {
+  background: var(--success);
+}
+
+.toast-error {
+  background: var(--danger);
+}

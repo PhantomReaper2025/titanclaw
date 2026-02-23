@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::llm::ChatMessage;
+use crate::llm::{ChatMessage, ToolCall};
 
 /// A session containing one or more threads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +74,18 @@ impl Session {
         self.active_thread = Some(thread_id);
         self.last_active_at = Utc::now();
         self.threads.get_mut(&thread_id).expect("just inserted")
+    }
+
+    /// Create or select a thread with a specific ID (used for external UUID-backed threads).
+    pub fn create_thread_with_id(&mut self, thread_id: Uuid) -> &mut Thread {
+        self.threads
+            .entry(thread_id)
+            .or_insert_with(|| Thread::with_id(thread_id, self.id));
+        self.active_thread = Some(thread_id);
+        self.last_active_at = Utc::now();
+        self.threads
+            .get_mut(&thread_id)
+            .expect("just inserted or existed")
     }
 
     /// Get the active thread.
@@ -231,12 +243,27 @@ impl Thread {
 
     /// Start a new turn with user input.
     pub fn start_turn(&mut self, user_input: impl Into<String>) -> &mut Turn {
+        self.try_start_turn(user_input)
+            .expect("invalid thread state for start_turn")
+    }
+
+    /// Start a new turn with user input, validating thread state.
+    pub fn try_start_turn(&mut self, user_input: impl Into<String>) -> Result<&mut Turn, String> {
+        match self.state {
+            ThreadState::Idle | ThreadState::Interrupted => {}
+            other => {
+                return Err(format!(
+                    "cannot start turn while thread is in state {:?}",
+                    other
+                ));
+            }
+        }
         let turn_number = self.turns.len();
         let turn = Turn::new(turn_number, user_input);
         self.turns.push(turn);
         self.state = ThreadState::Processing;
         self.updated_at = Utc::now();
-        self.turns.last_mut().expect("just pushed")
+        Ok(self.turns.last_mut().expect("just pushed"))
     }
 
     /// Complete the current turn with a response.
@@ -246,6 +273,35 @@ impl Thread {
         }
         self.state = ThreadState::Idle;
         self.updated_at = Utc::now();
+    }
+
+    /// Record a tool call on the current turn (if one is active).
+    pub fn record_tool_call(
+        &mut self,
+        tool_call_id: impl Into<String>,
+        name: impl Into<String>,
+        params: serde_json::Value,
+    ) {
+        if let Some(turn) = self.turns.last_mut() {
+            turn.record_tool_call(tool_call_id, name, params);
+            self.updated_at = Utc::now();
+        }
+    }
+
+    /// Record a tool result on the current turn (if one is active).
+    pub fn record_tool_result(&mut self, result: serde_json::Value, result_text: Option<String>) {
+        if let Some(turn) = self.turns.last_mut() {
+            turn.record_tool_result(result, result_text);
+            self.updated_at = Utc::now();
+        }
+    }
+
+    /// Record a tool error on the current turn (if one is active).
+    pub fn record_tool_error(&mut self, error: impl Into<String>) {
+        if let Some(turn) = self.turns.last_mut() {
+            turn.record_tool_error(error);
+            self.updated_at = Utc::now();
+        }
     }
 
     /// Fail the current turn with an error.
@@ -310,6 +366,35 @@ impl Thread {
         let mut messages = Vec::new();
         for turn in &self.turns {
             messages.push(ChatMessage::user(&turn.user_input));
+
+            for (idx, tc) in turn.tool_calls.iter().enumerate() {
+                let call_id = tc
+                    .tool_call_id
+                    .clone()
+                    .unwrap_or_else(|| format!("turn-{}-tool-{}", turn.turn_number, idx));
+                let tool_call = ToolCall {
+                    id: call_id.clone(),
+                    name: tc.name.clone(),
+                    arguments: tc.parameters.clone(),
+                };
+
+                messages.push(ChatMessage::assistant_with_tool_calls(
+                    None,
+                    vec![tool_call],
+                ));
+
+                let result_content = match (&tc.error, &tc.result_text, &tc.result) {
+                    (Some(err), _, _) => err.clone(),
+                    (_, Some(text), _) => text.clone(),
+                    (_, _, Some(value)) => {
+                        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+                    }
+                    _ => "<tool output unavailable>".to_string(),
+                };
+
+                messages.push(ChatMessage::tool_result(&call_id, &tc.name, result_content));
+            }
+
             if let Some(ref response) = turn.response {
                 messages.push(ChatMessage::assistant(response));
             }
@@ -432,19 +517,27 @@ impl Turn {
     }
 
     /// Record a tool call.
-    pub fn record_tool_call(&mut self, name: impl Into<String>, params: serde_json::Value) {
+    pub fn record_tool_call(
+        &mut self,
+        tool_call_id: impl Into<String>,
+        name: impl Into<String>,
+        params: serde_json::Value,
+    ) {
         self.tool_calls.push(TurnToolCall {
+            tool_call_id: Some(tool_call_id.into()),
             name: name.into(),
             parameters: params,
             result: None,
+            result_text: None,
             error: None,
         });
     }
 
     /// Record tool call result.
-    pub fn record_tool_result(&mut self, result: serde_json::Value) {
+    pub fn record_tool_result(&mut self, result: serde_json::Value, result_text: Option<String>) {
         if let Some(call) = self.tool_calls.last_mut() {
             call.result = Some(result);
+            call.result_text = result_text;
         }
     }
 
@@ -459,13 +552,21 @@ impl Turn {
 /// Record of a tool call made during a turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnToolCall {
+    /// Original LLM tool call ID, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     /// Tool name.
     pub name: String,
     /// Parameters passed to the tool.
     pub parameters: serde_json::Value,
     /// Result from the tool (if successful).
+    #[serde(default)]
     pub result: Option<serde_json::Value>,
+    /// Text that was sent back to the LLM (sanitized + wrapped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_text: Option<String>,
     /// Error from the tool (if failed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -511,11 +612,29 @@ mod tests {
     #[test]
     fn test_turn_tool_calls() {
         let mut turn = Turn::new(0, "Test input");
-        turn.record_tool_call("echo", serde_json::json!({"message": "test"}));
-        turn.record_tool_result(serde_json::json!("test"));
+        turn.record_tool_call("call-echo", "echo", serde_json::json!({"message": "test"}));
+        turn.record_tool_result(serde_json::json!("test"), Some("test".to_string()));
 
         assert_eq!(turn.tool_calls.len(), 1);
         assert!(turn.tool_calls[0].result.is_some());
+        assert_eq!(turn.tool_calls[0].result_text.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn test_thread_messages_include_tool_results() {
+        let mut thread = Thread::new(Uuid::new_v4());
+
+        thread.start_turn("Run tool");
+        thread.record_tool_call("call-echo", "echo", serde_json::json!({"message": "ping"}));
+        thread.record_tool_result(serde_json::json!("pong"), Some("pong".to_string()));
+        thread.complete_turn("Final answer");
+
+        let messages = thread.messages();
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(messages[1].tool_calls.as_ref(), Some(calls) if calls[0].name == "echo"));
+        assert_eq!(messages[2].role, crate::llm::Role::Tool);
+        assert_eq!(messages[2].content, "pong");
+        assert_eq!(messages[3].content, "Final answer");
     }
 
     #[test]
@@ -892,7 +1011,11 @@ mod tests {
     #[test]
     fn test_turn_tool_call_error() {
         let mut turn = Turn::new(0, "test");
-        turn.record_tool_call("http", serde_json::json!({"url": "example.com"}));
+        turn.record_tool_call(
+            "call-http",
+            "http",
+            serde_json::json!({"url": "example.com"}),
+        );
         turn.record_tool_error("timeout");
 
         assert_eq!(turn.tool_calls.len(), 1);
@@ -976,6 +1099,14 @@ mod tests {
 
         assert_eq!(thread.state, ThreadState::Idle);
         assert!(thread.pending_approval.is_none());
+    }
+
+    #[test]
+    fn test_try_start_turn_rejects_invalid_state() {
+        let mut thread = Thread::new(Uuid::new_v4());
+        thread.state = ThreadState::AwaitingApproval;
+        let err = thread.try_start_turn("should fail").unwrap_err();
+        assert!(err.contains("AwaitingApproval"));
     }
 
     #[test]

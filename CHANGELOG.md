@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-02-23
+
+### Fixed
+
+- Session/thread workflow reliability: gateway/web external UUID thread IDs are preserved during resolution (non-gateway channels stay channel-scoped), thread mapping creation is serialized to reduce duplicate-thread races, hydration avoids overwriting concurrently created in-memory threads, `register_thread` logs mapping collisions instead of silently overwriting, and chat thread delete/clear now cleans in-memory thread mappings + undo managers immediately instead of waiting for session pruning.
+- Pending approval requests now expire automatically (timeout) and are canceled instead of leaving threads waiting indefinitely.
+- Conversation turn persistence now retries DB writes (with backoff) and emits an in-channel warning if persistence still fails after retries, reducing silent chat-history loss.
+- Approval rejection/resume paths now finalize and persist the current turn consistently, and runtime turn starts use guarded state checks (`try_start_turn`) to avoid invalid state transitions.
+- Scheduler subtask tracking no longer reports successful subtasks as errors during background task execution.
+- Sandbox job tool now returns a structured execution error when sandbox dependencies/job manager are unavailable instead of panicking the agent process.
+- WASM OAuth callback endpoint now requires and validates/consumes the `state` nonce before accepting remote auth callbacks.
+- WASM channel onboarding validation endpoints are now executed (HTTP GET) with secret placeholder substitution, catching misconfigurations during setup instead of deferring failure to runtime.
+- Embedding providers now enforce approximate character-length checks (not byte length) consistently for both single and batched embedding requests.
+- WhatsApp channel no longer silently drops non-text inbound messages; unsupported message types are surfaced as explicit placeholder messages to the agent and logged as warnings.
+- AST graph query error messaging now explicitly documents that PostgreSQL-backed workspaces are not yet supported for this feature.
+- Web gateway SSE auth now accepts URL-encoded query tokens (for EventSource clients), and WebSocket Origin validation correctly parses localhost loopback hosts including IPv6.
+- Jobs UI manual-create flow now sends JSON with the correct content type and surfaces backend error messages in the UI instead of generic HTTP status text.
+- Sandbox worker completion detection now recognizes common completion phrasings (including repeated “Job Complete” style outputs), adds a completion-like repetition guard to stop terminal-state loops, and continues to terminate jobs via the structured `/worker/{job_id}/complete` report path.
+- Manual `/compact` now snapshots and compacts outside the session mutex, then applies results only if the thread is unchanged, reducing chat stalls during compaction.
+- Thread turn tool-call records now preserve tool-call IDs / sanitized tool-result text, and `Thread::messages()` rebuilds tool messages into LLM context.
+- Swarm task broadcasts now honor task-level assignee targeting (`assignee_node`) and receiver-side duplicate task suppression, preventing repeated execution across peers after broadcast/replay.
+- Critical background loops (self-repair, kernel orchestrator, shadow cache pruning, reflex compiler) now run under restartable supervisors with backoff and shutdown signaling instead of silently dying on panic/unexpected exit.
+
+### Changed
+
+- WASM tool loader now reads optional sidecar metadata/schema overrides (`description`, `schema`, `tool.{description,schema}`) and applies them at registration time; runtime fallback metadata remains but is warning-logged.
+- NEAR AI session renewal menu no longer offers the unimplemented NEAR Wallet auth option (GitHub/Google only).
+- WASM tool preparation now probes WIT exports (`description()` / `schema()`) to populate LLM-facing metadata before falling back to generic runtime metadata.
+- Web chat markdown rendering now uses DOM-based allowlist sanitization and DOM-bound copy-button wiring (replacing regex sanitization and inline `onclick` handlers).
+- Sandbox archive downloads now stream `tar` output with a timeout watchdog instead of buffering full archives in gateway memory.
+- Swarm remote wait fallback timeout default increased from `300ms` to `2500ms` to reduce premature local fallback under normal network/tool latency.
+- Swarm remote wait fallback timeout is now configurable via `SWARM_REMOTE_WAIT_TIMEOUT_MS` (clamped to a safe range) instead of being hardcoded.
+
+### Added
+
+- Background profile synthesis engine that batches successful turns asynchronously (debounced) and updates managed sections in workspace core docs (`AGENTS.md`, `IDENTITY.md`, `SOUL.md`, `USER.md`, `MEMORY.md`) while preserving manual content outside markers.
+- New profile synthesis configuration knobs (`PROFILE_SYNTHESIS_*`) for enablement, debounce, batching, minimum turn size, and optional LLM merge.
+- Conversational profile onboarding (OpenClaw-style) with a soft-block first-chat flow that asks identity/goals/tone/work-style/boundaries questions, supports `/onboard profile` commands (`status|defer|skip|reset`), and writes managed baseline sections to core docs after review + confirm.
+
 ## [1.0.0](https://github.com/PhantomReaper2025/titanclaw/compare/v0.6.3...v1.0.0) - 2026-02-22
 
 ### Added

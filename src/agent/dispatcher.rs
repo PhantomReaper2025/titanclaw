@@ -728,7 +728,7 @@ impl Agent {
                             && let Some(turn) = thread.last_turn_mut()
                         {
                             for tc in &tool_calls {
-                                turn.record_tool_call(&tc.name, tc.arguments.clone());
+                                turn.record_tool_call(&tc.id, &tc.name, tc.arguments.clone());
                             }
                         }
                     }
@@ -875,6 +875,20 @@ impl Agent {
                             }
                         }
 
+                        let result_content = match &tool_result {
+                            Ok(output) => {
+                                // Sanitize output before showing to LLM
+                                let sanitized =
+                                    self.safety().sanitize_tool_output(&tc.name, &output);
+                                self.safety().wrap_for_llm(
+                                    &tc.name,
+                                    &sanitized.content,
+                                    sanitized.was_modified,
+                                )
+                            }
+                            Err(e) => format!("Error: {}", e),
+                        };
+
                         // Record result in thread
                         {
                             let mut sess = session.lock().await;
@@ -883,7 +897,10 @@ impl Agent {
                             {
                                 match &tool_result {
                                     Ok(output) => {
-                                        turn.record_tool_result(serde_json::json!(output));
+                                        turn.record_tool_result(
+                                            serde_json::json!(output),
+                                            Some(result_content.clone()),
+                                        );
                                     }
                                     Err(e) => {
                                         turn.record_tool_error(e.to_string());
@@ -920,21 +937,6 @@ impl Agent {
                                 .await;
                             return Ok(AgenticLoopResult::Response(instructions));
                         }
-
-                        // Add tool result to context for next LLM call
-                        let result_content = match tool_result {
-                            Ok(output) => {
-                                // Sanitize output before showing to LLM
-                                let sanitized =
-                                    self.safety().sanitize_tool_output(&tc.name, &output);
-                                self.safety().wrap_for_llm(
-                                    &tc.name,
-                                    &sanitized.content,
-                                    sanitized.was_modified,
-                                )
-                            }
-                            Err(e) => format!("Error: {}", e),
-                        };
 
                         context_messages.push(ChatMessage::tool_result(
                             &tc.id,
