@@ -9,7 +9,7 @@ exclude = [
 
 [package]
 name = "titanclaw"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 rust-version = "1.92"
 description = "Secure personal AI assistant that protects your data and expands its capabilities on the fly"

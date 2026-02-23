@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-02-23
+
+### Fixed
+
+- Patch release retag on the latest `main` commit so published source includes the onboarding/profile synthesis/WASM introspection modules and compiles successfully (the earlier `v1.0.1` tag pointed to a prior commit).
+
 ## [1.0.1] - 2026-02-23
 
 ### Fixed
