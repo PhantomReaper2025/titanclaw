@@ -1,0 +1,22 @@
+# TitanClaw Project Overview
+
+- Purpose: `TitanClaw` is a security-first personal AI runtime/assistant focused on real automation (not only chat), with isolated execution, tool orchestration, memory, and multi-channel interfaces.
+- Lineage: Built on IronClaw Rust architecture; roadmap/status tracked in `implementation_plan.md`.
+- Primary language: Rust (edition `2024`, `rust-version = 1.92`).
+- Packaging/runtime: Single Rust binary (`titanclaw`) plus optional Docker worker runtime for isolated jobs.
+- Major subsystems (from `README.md` + `src/`): agent loop/router, scheduler, routines engine, tool registry (built-in + WASM + MCP), orchestrator/docker workers, workspace/memory store, channels (CLI/web/webhooks/WASM integrations), swarm mesh (`src/swarm`).
+- Key integrations/technologies observed in `Cargo.toml`:
+  - async runtime: `tokio`, `futures`
+  - web/server/channels: `axum`, `tower`, `tower-http`
+  - CLI: `clap`, `crossterm`, `rustyline`
+  - persistence: PostgreSQL (`tokio-postgres`, `deadpool-postgres`, `refinery`, `pgvector`) and optional `libsql`
+  - serialization/config: `serde`, `serde_json`, `toml`, `dotenvy`
+  - observability: `tracing`, `tracing-subscriber`
+  - sandbox/tooling: `wasmtime`, `wasmtime-wasi`, Docker via `bollard`, MCP support, WASM tools/channels
+  - networking/distributed: `libp2p` (swarm mesh)
+- Features: default features enable both `postgres` and `libsql`; additional `integration` feature exists.
+- Top-level source structure:
+  - `src/main.rs` binary entrypoint
+  - `src/lib.rs` library root exposing many modules (`agent`, `cli`, `orchestrator`, `sandbox`, `tools`, `swarm`, `workspace`, etc.)
+  - `channels-src/` and `tools-src/` contain separate channel/tool packages
+  - `migrations/` DB migrations, `tests/` test code, `scripts/` helper scripts, `.github/workflows/` CI

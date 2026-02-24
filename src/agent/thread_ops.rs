@@ -853,9 +853,9 @@ impl Agent {
             let strategy = self
                 .context_monitor
                 .suggest_compaction(&messages)
-                .unwrap_or(crate::agent::context_monitor::CompactionStrategy::Summarize {
-                    keep_recent: 5,
-                });
+                .unwrap_or(
+                    crate::agent::context_monitor::CompactionStrategy::Summarize { keep_recent: 5 },
+                );
             (thread.clone(), thread.updated_at, usage, strategy)
         };
 

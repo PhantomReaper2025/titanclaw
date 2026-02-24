@@ -380,97 +380,98 @@ impl Agent {
                 let repair = Arc::clone(&repair);
                 let repair_channels = repair_channels.clone();
                 tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(repair_interval).await;
+                    loop {
+                        tokio::time::sleep(repair_interval).await;
 
-                // Check stuck jobs
-                let stuck_jobs = repair.detect_stuck_jobs().await;
-                for job in stuck_jobs {
-                    tracing::info!("Attempting to repair stuck job {}", job.job_id);
-                    let result = repair.repair_stuck_job(&job).await;
-                    let notification = match &result {
-                        Ok(RepairResult::Success { message }) => {
-                            tracing::info!("Repair succeeded: {}", message);
-                            Some(format!(
-                                "Job {} was stuck for {}s, recovery succeeded: {}",
-                                job.job_id,
-                                job.stuck_duration.as_secs(),
-                                message
-                            ))
-                        }
-                        Ok(RepairResult::Failed { message }) => {
-                            tracing::error!("Repair failed: {}", message);
-                            Some(format!(
-                                "Job {} was stuck for {}s, recovery failed permanently: {}",
-                                job.job_id,
-                                job.stuck_duration.as_secs(),
-                                message
-                            ))
-                        }
-                        Ok(RepairResult::ManualRequired { message }) => {
-                            tracing::warn!("Manual intervention needed: {}", message);
-                            Some(format!(
-                                "Job {} needs manual intervention: {}",
-                                job.job_id, message
-                            ))
-                        }
-                        Ok(RepairResult::Retry { message }) => {
-                            tracing::warn!("Repair needs retry: {}", message);
-                            None // Don't spam the user on retries
-                        }
-                        Err(e) => {
-                            tracing::error!("Repair error: {}", e);
-                            None
-                        }
-                    };
+                        // Check stuck jobs
+                        let stuck_jobs = repair.detect_stuck_jobs().await;
+                        for job in stuck_jobs {
+                            tracing::info!("Attempting to repair stuck job {}", job.job_id);
+                            let result = repair.repair_stuck_job(&job).await;
+                            let notification = match &result {
+                                Ok(RepairResult::Success { message }) => {
+                                    tracing::info!("Repair succeeded: {}", message);
+                                    Some(format!(
+                                        "Job {} was stuck for {}s, recovery succeeded: {}",
+                                        job.job_id,
+                                        job.stuck_duration.as_secs(),
+                                        message
+                                    ))
+                                }
+                                Ok(RepairResult::Failed { message }) => {
+                                    tracing::error!("Repair failed: {}", message);
+                                    Some(format!(
+                                        "Job {} was stuck for {}s, recovery failed permanently: {}",
+                                        job.job_id,
+                                        job.stuck_duration.as_secs(),
+                                        message
+                                    ))
+                                }
+                                Ok(RepairResult::ManualRequired { message }) => {
+                                    tracing::warn!("Manual intervention needed: {}", message);
+                                    Some(format!(
+                                        "Job {} needs manual intervention: {}",
+                                        job.job_id, message
+                                    ))
+                                }
+                                Ok(RepairResult::Retry { message }) => {
+                                    tracing::warn!("Repair needs retry: {}", message);
+                                    None // Don't spam the user on retries
+                                }
+                                Err(e) => {
+                                    tracing::error!("Repair error: {}", e);
+                                    None
+                                }
+                            };
 
-                    if let Some(msg) = notification {
-                        let response = OutgoingResponse::text(format!("Self-Repair: {}", msg));
-                        for (channel, result) in
-                            repair_channels.broadcast_all("default", response).await
-                        {
-                            if let Err(e) = result {
-                                tracing::warn!(
-                                    channel = %channel,
-                                    "Failed to broadcast self-repair notification: {}",
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Check broken tools
-                let broken_tools = repair.detect_broken_tools().await;
-                for tool in broken_tools {
-                    tracing::info!("Attempting to repair broken tool: {}", tool.name);
-                    match repair.repair_broken_tool(&tool).await {
-                        Ok(RepairResult::Success { message }) => {
-                            let response = OutgoingResponse::text(format!(
-                                "Self-Repair: Tool '{}' repaired: {}",
-                                tool.name, message
-                            ));
-                            for (channel, result) in
-                                repair_channels.broadcast_all("default", response).await
-                            {
-                                if let Err(e) = result {
-                                    tracing::warn!(
-                                        channel = %channel,
-                                        "Failed to broadcast self-repair tool notification: {}",
-                                        e
-                                    );
+                            if let Some(msg) = notification {
+                                let response =
+                                    OutgoingResponse::text(format!("Self-Repair: {}", msg));
+                                for (channel, result) in
+                                    repair_channels.broadcast_all("default", response).await
+                                {
+                                    if let Err(e) = result {
+                                        tracing::warn!(
+                                            channel = %channel,
+                                            "Failed to broadcast self-repair notification: {}",
+                                            e
+                                        );
+                                    }
                                 }
                             }
                         }
-                        Ok(result) => {
-                            tracing::info!("Tool repair result: {:?}", result);
-                        }
-                        Err(e) => {
-                            tracing::error!("Tool repair error: {}", e);
+
+                        // Check broken tools
+                        let broken_tools = repair.detect_broken_tools().await;
+                        for tool in broken_tools {
+                            tracing::info!("Attempting to repair broken tool: {}", tool.name);
+                            match repair.repair_broken_tool(&tool).await {
+                                Ok(RepairResult::Success { message }) => {
+                                    let response = OutgoingResponse::text(format!(
+                                        "Self-Repair: Tool '{}' repaired: {}",
+                                        tool.name, message
+                                    ));
+                                    for (channel, result) in
+                                        repair_channels.broadcast_all("default", response).await
+                                    {
+                                        if let Err(e) = result {
+                                            tracing::warn!(
+                                                channel = %channel,
+                                                "Failed to broadcast self-repair tool notification: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                                Ok(result) => {
+                                    tracing::info!("Tool repair result: {:?}", result);
+                                }
+                                Err(e) => {
+                                    tracing::error!("Tool repair error: {}", e);
+                                }
+                            }
                         }
                     }
-                }
-            }
                 })
             },
         );

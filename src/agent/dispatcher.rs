@@ -10,6 +10,11 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::agent::Agent;
+use crate::agent::autonomy_telemetry::{
+    ExecutionAttemptRecord, ExecutionAttemptStatus, PolicyDecisionKind, PolicyDecisionRecord,
+    classify_failure, elapsed_ms, emit_execution_attempt, emit_policy_decision,
+    truncate_error_preview,
+};
 use crate::agent::session::{PendingApproval, Session, ThreadState};
 use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
@@ -744,6 +749,8 @@ impl Agent {
                                 let sess = session.lock().await;
                                 sess.is_tool_auto_approved(&tc.name)
                             };
+                            let mut approval_reason_codes =
+                                vec!["tool_requires_approval".to_string()];
 
                             // Override auto-approval for destructive parameters
                             // (e.g. `rm -rf`, `git push --force` in shell commands).
@@ -753,9 +760,21 @@ impl Agent {
                                     "Parameters require explicit approval despite auto-approve"
                                 );
                                 is_auto_approved = false;
+                                approval_reason_codes
+                                    .push("destructive_params_override_auto_approval".to_string());
                             }
 
                             if !is_auto_approved {
+                                emit_policy_decision(&PolicyDecisionRecord {
+                                    user_id: message.user_id.clone(),
+                                    channel: message.channel.clone(),
+                                    thread_id,
+                                    tool_name: tc.name.clone(),
+                                    tool_call_id: tc.id.clone(),
+                                    decision: PolicyDecisionKind::RequireApproval,
+                                    reason_codes: approval_reason_codes,
+                                    auto_approved: Some(false),
+                                });
                                 // Need approval - store pending request and return
                                 let pending = PendingApproval {
                                     request_id: Uuid::new_v4(),
@@ -768,6 +787,17 @@ impl Agent {
 
                                 return Ok(AgenticLoopResult::NeedApproval { pending });
                             }
+
+                            emit_policy_decision(&PolicyDecisionRecord {
+                                user_id: message.user_id.clone(),
+                                channel: message.channel.clone(),
+                                thread_id,
+                                tool_name: tc.name.clone(),
+                                tool_call_id: tc.id.clone(),
+                                decision: PolicyDecisionKind::Allow,
+                                reason_codes: vec!["session_auto_approval".to_string()],
+                                auto_approved: Some(true),
+                            });
                         }
 
                         // Hook: BeforeToolCall — allow hooks to modify or reject tool calls
@@ -780,6 +810,16 @@ impl Agent {
                             };
                             match self.hooks().run(&event).await {
                                 Err(crate::hooks::HookError::Rejected { reason }) => {
+                                    emit_policy_decision(&PolicyDecisionRecord {
+                                        user_id: message.user_id.clone(),
+                                        channel: message.channel.clone(),
+                                        thread_id,
+                                        tool_name: tc.name.clone(),
+                                        tool_call_id: tc.id.clone(),
+                                        decision: PolicyDecisionKind::Deny,
+                                        reason_codes: vec!["hook_rejected".to_string()],
+                                        auto_approved: None,
+                                    });
                                     context_messages.push(ChatMessage::tool_result(
                                         &tc.id,
                                         &tc.name,
@@ -788,6 +828,16 @@ impl Agent {
                                     continue;
                                 }
                                 Err(err) => {
+                                    emit_policy_decision(&PolicyDecisionRecord {
+                                        user_id: message.user_id.clone(),
+                                        channel: message.channel.clone(),
+                                        thread_id,
+                                        tool_name: tc.name.clone(),
+                                        tool_call_id: tc.id.clone(),
+                                        decision: PolicyDecisionKind::Deny,
+                                        reason_codes: vec!["hook_policy_error".to_string()],
+                                        auto_approved: None,
+                                    });
                                     context_messages.push(ChatMessage::tool_result(
                                         &tc.id,
                                         &tc.name,
@@ -798,7 +848,21 @@ impl Agent {
                                 Ok(crate::hooks::HookOutcome::Continue {
                                     modified: Some(new_params),
                                 }) => match serde_json::from_str(&new_params) {
-                                    Ok(parsed) => tc.arguments = parsed,
+                                    Ok(parsed) => {
+                                        emit_policy_decision(&PolicyDecisionRecord {
+                                            user_id: message.user_id.clone(),
+                                            channel: message.channel.clone(),
+                                            thread_id,
+                                            tool_name: tc.name.clone(),
+                                            tool_call_id: tc.id.clone(),
+                                            decision: PolicyDecisionKind::Modify,
+                                            reason_codes: vec![
+                                                "hook_modified_parameters".to_string(),
+                                            ],
+                                            auto_approved: None,
+                                        });
+                                        tc.arguments = parsed;
+                                    }
                                     Err(e) => {
                                         tracing::warn!(
                                             tool = %tc.name,
@@ -823,10 +887,13 @@ impl Agent {
                             .await;
 
                         let live_stream = tc.name == "shell";
+                        let tool_attempt_started = std::time::Instant::now();
+                        let mut piped_cache_hit = false;
                         let tool_result = if live_stream
                             && self.config.enable_piped_tool_execution
                             && let Some(cached) = early_shell_results.lock().await.remove(&tc.id)
                         {
+                            piped_cache_hit = true;
                             match cached {
                                 Ok(output) => Ok(output),
                                 Err(reason) => Err(crate::error::ToolError::ExecutionFailed {
@@ -858,6 +925,29 @@ impl Agent {
                                 &message.metadata,
                             )
                             .await;
+
+                        let tool_attempt_elapsed = tool_attempt_started.elapsed();
+                        let (attempt_status, failure_class, error_preview) = match &tool_result {
+                            Ok(_) => (ExecutionAttemptStatus::Succeeded, None, None),
+                            Err(err) => (
+                                ExecutionAttemptStatus::Failed,
+                                Some(classify_failure(err)),
+                                Some(truncate_error_preview(err)),
+                            ),
+                        };
+                        emit_execution_attempt(&ExecutionAttemptRecord {
+                            user_id: message.user_id.clone(),
+                            channel: message.channel.clone(),
+                            thread_id,
+                            tool_name: tc.name.clone(),
+                            tool_call_id: tc.id.clone(),
+                            live_stream,
+                            piped_cache_hit,
+                            elapsed_ms: elapsed_ms(tool_attempt_elapsed),
+                            status: attempt_status,
+                            failure_class,
+                            error_preview,
+                        });
 
                         if !live_stream && let Ok(ref output) = tool_result {
                             for preview in chunk_tool_result_preview(output) {

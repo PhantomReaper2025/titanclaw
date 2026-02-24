@@ -1,0 +1,28 @@
+# Style and Conventions
+
+- Language/style baseline: Rust `2024` edition codebase with idiomatic Rust module organization.
+- Naming conventions observed:
+  - modules/files: `snake_case` (e.g., `tracing_fmt`, `boot_screen`)
+  - functions: `snake_case`
+  - types/traits/enums: `PascalCase`
+  - constants/env vars: `SCREAMING_SNAKE_CASE`
+- Error handling patterns:
+  - `anyhow::Result` at binary/command boundaries (`src/main.rs`)
+  - custom error modules/types in `src/error.rs` and subsystem-specific errors
+- Async/concurrency:
+  - `tokio` async runtime used broadly (`#[tokio::main]`, async functions, Arc-based shared state)
+- Configuration and feature-gating:
+  - environment/config-driven setup (`Config::from_env`, `.env` support via `dotenvy`)
+  - `#[cfg(feature = ...)]` and target OS conditionals are used; preserve feature compatibility when editing
+- Logging/observability:
+  - `tracing` + `tracing-subscriber` preferred over ad-hoc prints for runtime code
+- CLI patterns:
+  - `clap` parser with subcommands; command handling is centralized in CLI modules and `src/main.rs`
+- Docs/comments:
+  - Rust module docs (`//!`) and standard Rust comments are used; add concise comments only when logic is non-obvious
+- Formatting/linting:
+  - no custom `rustfmt.toml`/`clippy.toml` observed at repo root; assume standard Rust formatting and heed CI lint rules
+- Repo process conventions from `AGENTS.md`:
+  - behavior changes may require updating `implementation_plan.md`
+  - canonical docs sync expected for `AGENTS.md`, `IDENTITY.md`, `README.md`, `implementation_plan.md`, `CHANGELOG.md`
+  - sandbox jobs should use structured completion signaling as primary completion mechanism

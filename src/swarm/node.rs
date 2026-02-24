@@ -618,7 +618,9 @@ mod tests {
         };
         let now = Instant::now();
         assert!(should_accept_incoming_task("peer-a", &task, &mut seen, now));
-        assert!(!should_accept_incoming_task("peer-a", &task, &mut seen, now));
+        assert!(!should_accept_incoming_task(
+            "peer-a", &task, &mut seen, now
+        ));
     }
 
     #[test]

@@ -123,5 +123,11 @@ pub fn spawn_reflex_compiler(
     tools: Arc<ToolRegistry>,
     check_interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_reflex_compiler_loop(store, llm, safety, tools, check_interval))
+    tokio::spawn(run_reflex_compiler_loop(
+        store,
+        llm,
+        safety,
+        tools,
+        check_interval,
+    ))
 }
