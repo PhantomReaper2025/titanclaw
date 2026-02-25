@@ -269,6 +269,33 @@ impl PlanStore for PgBackend {
         Ok(())
     }
 
+    async fn get_plan_step(&self, id: Uuid) -> Result<Option<PlanStep>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt("SELECT * FROM autonomy_plan_steps WHERE id = $1", &[&id])
+            .await?;
+        row.map(|r| row_to_plan_step(&r)).transpose()
+    }
+
+    async fn list_plan_steps_for_plan(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<Vec<PlanStep>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT *
+                FROM autonomy_plan_steps
+                WHERE plan_id = $1
+                ORDER BY sequence_num ASC, created_at ASC, id ASC
+                "#,
+                &[&plan_id],
+            )
+            .await?;
+        rows.iter().map(row_to_plan_step).collect()
+    }
+
     async fn update_plan_step_status(
         &self,
         id: Uuid,

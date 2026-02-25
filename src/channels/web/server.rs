@@ -30,7 +30,8 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::agent::{
-    Goal, GoalRiskClass, GoalSource, GoalStatus, Plan, PlanStatus, PlannerKind, SessionManager,
+    Goal, GoalRiskClass, GoalSource, GoalStatus, Plan, PlanStatus, PlanStep, PlanStepKind,
+    PlanStepStatus, PlannerKind, SessionManager,
 };
 use crate::channels::IncomingMessage;
 use crate::channels::web::auth::{AuthState, auth_middleware};
@@ -235,6 +236,15 @@ pub async fn start_server(
         )
         .route("/api/plans/{id}", get(plans_detail_handler))
         .route("/api/plans/{id}/status", post(plans_status_update_handler))
+        .route(
+            "/api/plans/{id}/steps",
+            get(plan_steps_list_handler).post(plan_steps_create_handler),
+        )
+        .route("/api/plan-steps/{id}", get(plan_step_detail_handler))
+        .route(
+            "/api/plan-steps/{id}/status",
+            post(plan_step_status_update_handler),
+        )
         // Logs
         .route("/api/logs/events", get(logs_events_handler))
         // Extensions
@@ -2954,6 +2964,67 @@ struct PlanStatusUpdateRequest {
     status: PlanStatus,
 }
 
+#[derive(Debug, Deserialize)]
+struct PlanStepsCreateRequest {
+    steps: Vec<PlanStepCreateInput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanStepCreateInput {
+    sequence_num: i32,
+    kind: PlanStepKind,
+    title: String,
+    description: String,
+    #[serde(default)]
+    tool_candidates: serde_json::Value,
+    #[serde(default)]
+    inputs: serde_json::Value,
+    #[serde(default)]
+    preconditions: serde_json::Value,
+    #[serde(default)]
+    postconditions: serde_json::Value,
+    rollback: Option<serde_json::Value>,
+    #[serde(default)]
+    policy_requirements: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanStepStatusUpdateRequest {
+    status: PlanStepStatus,
+}
+
+async fn load_owned_plan(
+    state: &GatewayState,
+    store: &dyn Database,
+    plan_id: Uuid,
+) -> Result<Plan, (StatusCode, String)> {
+    let plan = store
+        .get_plan(plan_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Plan not found".to_string()))?;
+
+    let goal = store
+        .get_goal(plan.goal_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Goal not found".to_string()))?;
+
+    if goal.owner_user_id != state.user_id {
+        return Err((StatusCode::NOT_FOUND, "Plan not found".to_string()));
+    }
+
+    Ok(plan)
+}
+
+fn normalize_plan_step_json(value: serde_json::Value) -> serde_json::Value {
+    if value.is_null() {
+        serde_json::json!({})
+    } else {
+        value
+    }
+}
+
 async fn goals_create_handler(
     State(state): State<Arc<GatewayState>>,
     Json(body): Json<GoalCreateRequest>,
@@ -3296,6 +3367,179 @@ async fn plans_status_update_handler(
         ))?;
 
     Ok(Json(serde_json::json!({ "plan": updated })))
+}
+
+async fn plan_steps_list_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let plan_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plan ID".to_string()))?;
+
+    let plan = load_owned_plan(state.as_ref(), store.as_ref(), plan_id).await?;
+
+    let mut steps = store
+        .list_plan_steps_for_plan(plan.id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    steps.sort_by_key(|s| (s.sequence_num, s.created_at, s.id));
+
+    Ok(Json(serde_json::json!({
+        "plan_id": plan.id,
+        "steps": steps
+    })))
+}
+
+async fn plan_steps_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(body): Json<PlanStepsCreateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if body.steps.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "At least one plan step is required".to_string(),
+        ));
+    }
+
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let plan_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plan ID".to_string()))?;
+
+    let plan = load_owned_plan(state.as_ref(), store.as_ref(), plan_id).await?;
+
+    let mut seen = std::collections::HashSet::new();
+    for step in &body.steps {
+        if step.sequence_num <= 0 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "sequence_num must be positive".to_string(),
+            ));
+        }
+        if !seen.insert(step.sequence_num) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("duplicate sequence_num {}", step.sequence_num),
+            ));
+        }
+        if step.title.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "step title is required".to_string(),
+            ));
+        }
+        if step.description.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "step description is required".to_string(),
+            ));
+        }
+    }
+
+    let now = chrono::Utc::now();
+    let steps: Vec<PlanStep> = body
+        .steps
+        .into_iter()
+        .map(|input| PlanStep {
+            id: Uuid::new_v4(),
+            plan_id: plan.id,
+            sequence_num: input.sequence_num,
+            kind: input.kind,
+            status: PlanStepStatus::Pending,
+            title: input.title.trim().to_string(),
+            description: input.description.trim().to_string(),
+            tool_candidates: normalize_plan_step_json(input.tool_candidates),
+            inputs: normalize_plan_step_json(input.inputs),
+            preconditions: normalize_plan_step_json(input.preconditions),
+            postconditions: normalize_plan_step_json(input.postconditions),
+            rollback: input.rollback,
+            policy_requirements: normalize_plan_step_json(input.policy_requirements),
+            started_at: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .collect();
+
+    store
+        .create_plan_steps(&steps)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "plan_id": plan.id,
+        "steps": steps
+    })))
+}
+
+async fn plan_step_detail_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let step_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plan step ID".to_string()))?;
+
+    let step = store
+        .get_plan_step(step_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Plan step not found".to_string()))?;
+
+    let _plan = load_owned_plan(state.as_ref(), store.as_ref(), step.plan_id).await?;
+
+    Ok(Json(serde_json::json!({ "step": step })))
+}
+
+async fn plan_step_status_update_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(body): Json<PlanStepStatusUpdateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let step_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plan step ID".to_string()))?;
+
+    let step = store
+        .get_plan_step(step_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Plan step not found".to_string()))?;
+
+    let _plan = load_owned_plan(state.as_ref(), store.as_ref(), step.plan_id).await?;
+
+    store
+        .update_plan_step_status(step_id, body.status)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let updated = store
+        .get_plan_step(step_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Plan step disappeared after update".to_string(),
+        ))?;
+
+    Ok(Json(serde_json::json!({ "step": updated })))
 }
 
 // --- Routines handlers ---

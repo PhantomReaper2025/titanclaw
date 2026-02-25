@@ -689,6 +689,65 @@ impl PlanStore for LibSqlBackend {
         Ok(())
     }
 
+    async fn get_plan_step(&self, id: Uuid) -> Result<Option<PlanStep>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    id, plan_id, sequence_num, kind, status, title, description,
+                    tool_candidates, inputs, preconditions, postconditions, "rollback",
+                    policy_requirements, started_at, completed_at, created_at, updated_at
+                FROM autonomy_plan_steps
+                WHERE id = ?1
+                "#,
+                params![id.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            Some(row) => Ok(Some(row_to_plan_step_libsql(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn list_plan_steps_for_plan(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<Vec<PlanStep>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    id, plan_id, sequence_num, kind, status, title, description,
+                    tool_candidates, inputs, preconditions, postconditions, "rollback",
+                    policy_requirements, started_at, completed_at, created_at, updated_at
+                FROM autonomy_plan_steps
+                WHERE plan_id = ?1
+                ORDER BY sequence_num ASC, created_at ASC, id ASC
+                "#,
+                params![plan_id.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut steps = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            steps.push(row_to_plan_step_libsql(&row)?);
+        }
+        Ok(steps)
+    }
+
     async fn update_plan_step_status(
         &self,
         id: Uuid,
