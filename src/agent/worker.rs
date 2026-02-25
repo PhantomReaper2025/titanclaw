@@ -11,9 +11,12 @@ use uuid::Uuid;
 use crate::agent::scheduler::WorkerMessage;
 use crate::agent::task::TaskOutput;
 use crate::agent::{
+    Evidence as AutonomyEvidence, EvidenceKind as AutonomyEvidenceKind,
     ExecutionAttempt as AutonomyExecutionAttempt,
     ExecutionAttemptStatus as AutonomyExecutionAttemptStatus, Goal, GoalRiskClass, GoalSource,
-    GoalStatus, Plan, PlanStatus, PlanStep, PlanStepKind, PlanStepStatus, PlannerKind,
+    GoalStatus, Plan, PlanStatus, PlanStep, PlanStepKind, PlanStepStatus,
+    PlanVerification as AutonomyPlanVerification,
+    PlanVerificationStatus as AutonomyPlanVerificationStatus, PlannerKind,
 };
 use crate::context::{ContextManager, JobState};
 use crate::db::Database;
@@ -322,6 +325,55 @@ impl Worker {
                 plan_id = %persisted.plan_id,
                 step_id = %step_id,
                 "Failed to persist worker execution attempt: {}",
+                e
+            );
+        }
+    }
+
+    async fn record_plan_verification_best_effort(
+        &self,
+        persisted: &PersistedPlanRun,
+        status: AutonomyPlanVerificationStatus,
+        completion_claimed: bool,
+        summary: &str,
+        checks: serde_json::Value,
+        evidence_items: Vec<AutonomyEvidence>,
+    ) {
+        let Some(store) = self.store() else {
+            return;
+        };
+        let user_id = self
+            .context_manager()
+            .get_context(self.job_id)
+            .await
+            .map(|c| c.user_id)
+            .unwrap_or_else(|_| "default".to_string());
+
+        let evidence_count = i32::try_from(evidence_items.len()).unwrap_or(i32::MAX);
+        let evidence =
+            serde_json::to_value(&evidence_items).unwrap_or_else(|_| serde_json::json!([]));
+        let verification = AutonomyPlanVerification {
+            id: Uuid::new_v4(),
+            goal_id: Some(persisted.goal_id),
+            plan_id: persisted.plan_id,
+            job_id: Some(self.job_id),
+            user_id,
+            channel: "worker".to_string(),
+            verifier_kind: "execute_plan_completion_check".to_string(),
+            status,
+            completion_claimed,
+            evidence_count,
+            summary: summary.to_string(),
+            checks,
+            evidence,
+            created_at: Utc::now(),
+        };
+
+        if let Err(e) = store.record_plan_verification(&verification).await {
+            tracing::warn!(
+                job = %self.job_id,
+                plan_id = %persisted.plan_id,
+                "Failed to persist worker plan verification: {}",
                 e
             );
         }
@@ -917,6 +969,9 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         plan: &ActionPlan,
         persisted_plan: Option<&PersistedPlanRun>,
     ) -> Result<(), Error> {
+        let mut executed_steps = 0usize;
+        let mut succeeded_steps = 0usize;
+        let mut failed_steps = 0usize;
         for (i, action) in plan.actions.iter().enumerate() {
             // Check for stop signal
             if let Ok(msg) = rx.try_recv() {
@@ -964,6 +1019,13 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 .execute_tool(&action.tool_name, &action.parameters)
                 .await;
             let elapsed_ms = started.elapsed().as_millis() as i64;
+            let step_succeeded = result.is_ok();
+            executed_steps += 1;
+            if step_succeeded {
+                succeeded_steps += 1;
+            } else {
+                failed_steps += 1;
+            }
 
             // Create a synthetic ToolSelection for process_tool_result.
             // Plan actions don't originate from an LLM tool_call response so
@@ -994,7 +1056,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             if let Some(p) = persisted_plan
                 && let Some(step_id) = p.step_ids.get(i)
             {
-                let status = if result.is_ok() {
+                let status = if step_succeeded {
                     PlanStepStatus::Succeeded
                 } else {
                     PlanStepStatus::Failed
@@ -1030,7 +1092,8 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         let response = reasoning.respond(reason_ctx).await?;
         reason_ctx.messages.push(ChatMessage::assistant(&response));
 
-        if crate::util::llm_signals_completion(&response) {
+        let completion_claimed = crate::util::llm_signals_completion(&response);
+        if completion_claimed {
             self.mark_completed().await?;
             if let Some(p) = persisted_plan {
                 self.set_plan_status_best_effort(p.plan_id, PlanStatus::Completed)
@@ -1053,6 +1116,57 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 self.set_goal_status_best_effort(p.goal_id, GoalStatus::Blocked)
                     .await;
             }
+        }
+
+        if let Some(p) = persisted_plan {
+            let verification_status = if completion_claimed {
+                if failed_steps == 0 {
+                    AutonomyPlanVerificationStatus::Passed
+                } else {
+                    AutonomyPlanVerificationStatus::Inconclusive
+                }
+            } else {
+                AutonomyPlanVerificationStatus::Failed
+            };
+            let now = Utc::now();
+            let checks = serde_json::json!({
+                "planned_steps": plan.actions.len(),
+                "executed_steps": executed_steps,
+                "succeeded_steps": succeeded_steps,
+                "failed_steps": failed_steps,
+                "all_planned_steps_executed": executed_steps == plan.actions.len(),
+            });
+            let evidence = vec![
+                AutonomyEvidence {
+                    kind: AutonomyEvidenceKind::Observation,
+                    source: "worker.execute_plan".to_string(),
+                    summary: "Final completion verification after planned actions".to_string(),
+                    confidence: 0.8,
+                    payload: checks.clone(),
+                    created_at: now,
+                },
+                AutonomyEvidence {
+                    kind: AutonomyEvidenceKind::UserConfirmation,
+                    source: "llm_completion_check".to_string(),
+                    summary: response.chars().take(400).collect(),
+                    confidence: 0.5,
+                    payload: serde_json::json!({
+                        "completion_claimed": completion_claimed,
+                        "response_excerpt_truncated": response.chars().count() > 400
+                    }),
+                    created_at: now,
+                },
+            ];
+
+            self.record_plan_verification_best_effort(
+                p,
+                verification_status,
+                completion_claimed,
+                &response,
+                checks,
+                evidence,
+            )
+            .await;
         }
 
         Ok(())

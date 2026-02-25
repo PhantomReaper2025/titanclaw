@@ -702,6 +702,30 @@ CREATE INDEX IF NOT EXISTS idx_autonomy_policy_decisions_execution_attempt
 CREATE INDEX IF NOT EXISTS idx_autonomy_policy_decisions_decision_created
     ON autonomy_policy_decisions(decision, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS autonomy_plan_verifications (
+    id TEXT PRIMARY KEY,
+    goal_id TEXT REFERENCES autonomy_goals(id) ON DELETE SET NULL,
+    plan_id TEXT NOT NULL REFERENCES autonomy_plans(id) ON DELETE CASCADE,
+    job_id TEXT,
+    user_id TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    verifier_kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    completion_claimed INTEGER NOT NULL DEFAULT 0,
+    evidence_count INTEGER NOT NULL DEFAULT 0,
+    summary TEXT NOT NULL,
+    checks TEXT NOT NULL DEFAULT '{}',
+    evidence TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_autonomy_plan_verifications_plan_created
+    ON autonomy_plan_verifications(plan_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_autonomy_plan_verifications_goal_created
+    ON autonomy_plan_verifications(goal_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_autonomy_plan_verifications_status_created
+    ON autonomy_plan_verifications(status, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS autonomy_incidents (
     id TEXT PRIMARY KEY,
     goal_id TEXT REFERENCES autonomy_goals(id) ON DELETE SET NULL,

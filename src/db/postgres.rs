@@ -16,8 +16,8 @@ use uuid::Uuid;
 use crate::agent::BrokenTool;
 use crate::agent::autonomy::v1::{
     ExecutionAttempt, ExecutionAttemptStatus, Goal, GoalRiskClass, GoalSource, GoalStatus, Plan,
-    PlanStatus, PlanStep, PlanStepKind, PlanStepStatus, PlannerKind, PolicyDecision,
-    PolicyDecisionKind,
+    PlanStatus, PlanStep, PlanStepKind, PlanStepStatus, PlanVerification, PlanVerificationStatus,
+    PlannerKind, PolicyDecision, PolicyDecisionKind,
 };
 use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::config::DatabaseConfig;
@@ -585,6 +585,59 @@ impl AutonomyExecutionStore for PgBackend {
             .await?;
         rows.iter().map(row_to_policy_decision).collect()
     }
+
+    async fn record_plan_verification(
+        &self,
+        verification: &PlanVerification,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        let status_str = plan_verification_status_to_str(verification.status);
+
+        conn.execute(
+            r#"
+            INSERT INTO autonomy_plan_verifications (
+                id, goal_id, plan_id, job_id, user_id, channel, verifier_kind, status,
+                completion_claimed, evidence_count, summary, checks, evidence, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8,
+                $9, $10, $11, $12, $13, $14
+            )
+            "#,
+            &[
+                &verification.id,
+                &verification.goal_id,
+                &verification.plan_id,
+                &verification.job_id,
+                &verification.user_id,
+                &verification.channel,
+                &verification.verifier_kind,
+                &status_str,
+                &verification.completion_claimed,
+                &verification.evidence_count,
+                &verification.summary,
+                &verification.checks,
+                &verification.evidence,
+                &verification.created_at,
+            ],
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn list_plan_verifications_for_plan(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<Vec<PlanVerification>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT * FROM autonomy_plan_verifications WHERE plan_id = $1 ORDER BY created_at DESC, id DESC",
+                &[&plan_id],
+            )
+            .await?;
+        rows.iter().map(row_to_plan_verification).collect()
+    }
 }
 
 fn enum_parse_error(kind: &str, value: &str) -> DatabaseError {
@@ -782,6 +835,23 @@ fn policy_decision_kind_from_str(value: &str) -> Result<PolicyDecisionKind, Data
     }
 }
 
+fn plan_verification_status_to_str(value: PlanVerificationStatus) -> &'static str {
+    match value {
+        PlanVerificationStatus::Passed => "passed",
+        PlanVerificationStatus::Failed => "failed",
+        PlanVerificationStatus::Inconclusive => "inconclusive",
+    }
+}
+
+fn plan_verification_status_from_str(value: &str) -> Result<PlanVerificationStatus, DatabaseError> {
+    match value {
+        "passed" => Ok(PlanVerificationStatus::Passed),
+        "failed" => Ok(PlanVerificationStatus::Failed),
+        "inconclusive" => Ok(PlanVerificationStatus::Inconclusive),
+        _ => Err(enum_parse_error("plan_verification_status", value)),
+    }
+}
+
 fn opt_u64_to_i64(value: Option<u64>, field: &str) -> Result<Option<i64>, DatabaseError> {
     value.map(|v| u64_to_i64(v, field)).transpose()
 }
@@ -936,6 +1006,27 @@ fn row_to_policy_decision(row: &Row) -> Result<PolicyDecision, DatabaseError> {
         requires_approval: row.get("requires_approval"),
         auto_approved: row.get("auto_approved"),
         evidence_required: row.get("evidence_required"),
+        created_at: row.get("created_at"),
+    })
+}
+
+fn row_to_plan_verification(row: &Row) -> Result<PlanVerification, DatabaseError> {
+    let status: String = row.get("status");
+
+    Ok(PlanVerification {
+        id: row.get("id"),
+        goal_id: row.get("goal_id"),
+        plan_id: row.get("plan_id"),
+        job_id: row.get("job_id"),
+        user_id: row.get("user_id"),
+        channel: row.get("channel"),
+        verifier_kind: row.get("verifier_kind"),
+        status: plan_verification_status_from_str(&status)?,
+        completion_claimed: row.get("completion_claimed"),
+        evidence_count: row.get("evidence_count"),
+        summary: row.get("summary"),
+        checks: row.get("checks"),
+        evidence: row.get("evidence"),
         created_at: row.get("created_at"),
     })
 }

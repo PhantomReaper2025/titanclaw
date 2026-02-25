@@ -256,6 +256,10 @@ pub async fn start_server(
             get(plan_execution_attempts_list_handler),
         )
         .route(
+            "/api/plans/{id}/verifications",
+            get(plan_verifications_list_handler),
+        )
+        .route(
             "/api/plans/{id}/steps",
             get(plan_steps_list_handler).post(plan_steps_create_handler),
         )
@@ -4038,6 +4042,33 @@ async fn plan_execution_attempts_list_handler(
     })))
 }
 
+async fn plan_verifications_list_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let plan_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plan ID".to_string()))?;
+
+    let plan = load_owned_plan(state.as_ref(), store.as_ref(), plan_id).await?;
+
+    let mut verifications = store
+        .list_plan_verifications_for_plan(plan.id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    verifications.sort_by_key(|v| (v.created_at, v.id));
+    verifications.reverse();
+
+    Ok(Json(serde_json::json!({
+        "plan_id": plan.id,
+        "plan_verifications": verifications
+    })))
+}
+
 async fn plan_steps_list_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
@@ -4649,6 +4680,7 @@ struct GatewayStatusResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{PlanVerification, PlanVerificationStatus};
     use crate::db::Database;
     use serde_json::json;
 
@@ -5059,6 +5091,75 @@ mod tests {
         .await
         .unwrap_err();
 
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1, "Plan not found");
+    }
+
+    #[tokio::test]
+    async fn test_plan_verifications_list_handler_orders_desc_and_enforces_ownership() {
+        let (_dir, store) = make_test_store().await;
+        let alice_state = make_test_gateway_state("alice", store.clone());
+        let bob_state = make_test_gateway_state("bob", store.clone());
+        let (goal, plan) = seed_goal_and_plan(store.as_ref(), "alice").await;
+
+        let now = chrono::Utc::now();
+        let older = PlanVerification {
+            id: Uuid::new_v4(),
+            goal_id: Some(goal.id),
+            plan_id: plan.id,
+            job_id: Some(Uuid::new_v4()),
+            user_id: "alice".to_string(),
+            channel: "worker".to_string(),
+            verifier_kind: "execute_plan_completion_check".to_string(),
+            status: PlanVerificationStatus::Inconclusive,
+            completion_claimed: true,
+            evidence_count: 1,
+            summary: "older verification".to_string(),
+            checks: json!({"executed_steps": 1, "failed_steps": 1}),
+            evidence: json!([{"kind":"observation","summary":"older"}]),
+            created_at: now - chrono::TimeDelta::minutes(2),
+        };
+        let newer = PlanVerification {
+            id: Uuid::new_v4(),
+            goal_id: Some(goal.id),
+            plan_id: plan.id,
+            job_id: Some(Uuid::new_v4()),
+            user_id: "alice".to_string(),
+            channel: "worker".to_string(),
+            verifier_kind: "execute_plan_completion_check".to_string(),
+            status: PlanVerificationStatus::Passed,
+            completion_claimed: true,
+            evidence_count: 2,
+            summary: "newer verification".to_string(),
+            checks: json!({"executed_steps": 2, "failed_steps": 0}),
+            evidence: json!([{"kind":"observation","summary":"newer"}]),
+            created_at: now - chrono::TimeDelta::minutes(1),
+        };
+        store
+            .record_plan_verification(&older)
+            .await
+            .expect("seed older verification");
+        store
+            .record_plan_verification(&newer)
+            .await
+            .expect("seed newer verification");
+
+        let Json(body) =
+            plan_verifications_list_handler(State(alice_state), Path(plan.id.to_string()))
+                .await
+                .expect("list verifications");
+        assert_eq!(body["plan_id"], json!(plan.id));
+        let verifications = body["plan_verifications"]
+            .as_array()
+            .expect("verifications array");
+        assert_eq!(verifications.len(), 2);
+        assert_eq!(verifications[0]["id"], json!(newer.id));
+        assert_eq!(verifications[1]["id"], json!(older.id));
+        assert_eq!(verifications[0]["status"], json!("passed"));
+
+        let err = plan_verifications_list_handler(State(bob_state), Path(plan.id.to_string()))
+            .await
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
         assert_eq!(err.1, "Plan not found");
     }

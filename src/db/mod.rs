@@ -29,7 +29,7 @@ use uuid::Uuid;
 use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::agent::{
     BrokenTool, ExecutionAttempt, Goal, GoalStatus, Plan, PlanStatus, PlanStep, PlanStepStatus,
-    PolicyDecision,
+    PlanVerification, PolicyDecision,
 };
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::error::DatabaseError;
@@ -627,6 +627,24 @@ pub trait AutonomyExecutionStore: Send + Sync {
         &self,
         _goal_id: Uuid,
     ) -> Result<Vec<PolicyDecision>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy execution store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn record_plan_verification(
+        &self,
+        _verification: &PlanVerification,
+    ) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy execution store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn list_plan_verifications_for_plan(
+        &self,
+        _plan_id: Uuid,
+    ) -> Result<Vec<PlanVerification>, DatabaseError> {
         Err(DatabaseError::Query(
             "autonomy execution store not implemented for backend".to_string(),
         ))

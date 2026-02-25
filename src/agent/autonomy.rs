@@ -104,6 +104,14 @@ pub mod v1 {
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "snake_case")]
+    pub enum PlanVerificationStatus {
+        Passed,
+        Failed,
+        Inconclusive,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
     pub enum EvidenceKind {
         ToolResult,
         FileDiff,
@@ -222,6 +230,26 @@ pub mod v1 {
         pub auto_approved: Option<bool>,
         #[serde(default)]
         pub evidence_required: Value,
+        pub created_at: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct PlanVerification {
+        pub id: Uuid,
+        pub goal_id: Option<Uuid>,
+        pub plan_id: Uuid,
+        pub job_id: Option<Uuid>,
+        pub user_id: String,
+        pub channel: String,
+        pub verifier_kind: String,
+        pub status: PlanVerificationStatus,
+        pub completion_claimed: bool,
+        pub evidence_count: i32,
+        pub summary: String,
+        #[serde(default)]
+        pub checks: Value,
+        #[serde(default)]
+        pub evidence: Value,
         pub created_at: DateTime<Utc>,
     }
 

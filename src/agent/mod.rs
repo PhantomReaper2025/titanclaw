@@ -44,7 +44,7 @@ pub use agent_loop::{Agent, AgentDeps};
 pub use autonomy::v1::{
     Evidence, EvidenceKind, ExecutionAttempt, ExecutionAttemptStatus, Goal, GoalRiskClass,
     GoalSource, GoalStatus, Incident, Plan, PlanStatus, PlanStep, PlanStepKind, PlanStepStatus,
-    PlannerKind, PolicyDecision, PolicyDecisionKind,
+    PlanVerification, PlanVerificationStatus, PlannerKind, PolicyDecision, PolicyDecisionKind,
 };
 pub use compaction::{CompactionResult, ContextCompactor};
 pub use context_monitor::{CompactionStrategy, ContextBreakdown, ContextMonitor};

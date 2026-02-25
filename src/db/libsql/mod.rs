@@ -28,7 +28,8 @@ use crate::agent::routine::{
     NotifyConfig, Routine, RoutineAction, RoutineGuardrails, RoutineRun, RunStatus, Trigger,
 };
 use crate::agent::{
-    ExecutionAttempt, Goal, GoalStatus, Plan, PlanStatus, PlanStep, PlanStepStatus, PolicyDecision,
+    ExecutionAttempt, Goal, GoalStatus, Plan, PlanStatus, PlanStep, PlanStepStatus,
+    PlanVerification, PolicyDecision,
 };
 use crate::context::JobState;
 use crate::db::{AutonomyExecutionStore, Database, GoalStore, PlanStore};
@@ -1089,6 +1090,74 @@ impl AutonomyExecutionStore for LibSqlBackend {
         }
         Ok(decisions)
     }
+
+    async fn record_plan_verification(
+        &self,
+        verification: &PlanVerification,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let status = enum_to_snake_case(&verification.status)?;
+
+        conn.execute(
+            r#"
+            INSERT INTO autonomy_plan_verifications (
+                id, goal_id, plan_id, job_id, user_id, channel, verifier_kind, status,
+                completion_claimed, evidence_count, summary, checks, evidence, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            "#,
+            params![
+                verification.id.to_string(),
+                opt_text_owned(verification.goal_id.map(|id| id.to_string())),
+                verification.plan_id.to_string(),
+                opt_text_owned(verification.job_id.map(|id| id.to_string())),
+                verification.user_id.as_str(),
+                verification.channel.as_str(),
+                verification.verifier_kind.as_str(),
+                status,
+                verification.completion_claimed as i64,
+                verification.evidence_count as i64,
+                verification.summary.as_str(),
+                verification.checks.to_string(),
+                verification.evidence.to_string(),
+                fmt_ts(&verification.created_at),
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn list_plan_verifications_for_plan(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<Vec<PlanVerification>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    id, goal_id, plan_id, job_id, user_id, channel, verifier_kind, status,
+                    completion_claimed, evidence_count, summary, checks, evidence, created_at
+                FROM autonomy_plan_verifications
+                WHERE plan_id = ?1
+                ORDER BY created_at DESC, id DESC
+                "#,
+                params![plan_id.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut verifications = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            verifications.push(row_to_plan_verification_libsql(&row)?);
+        }
+        Ok(verifications)
+    }
 }
 
 // ==================== Row conversion helpers ====================
@@ -1280,6 +1349,27 @@ pub(crate) fn row_to_policy_decision_libsql(
         auto_approved: get_opt_bool(row, 15),
         evidence_required: get_json(row, 16),
         created_at: get_ts(row, 17),
+    })
+}
+
+pub(crate) fn row_to_plan_verification_libsql(
+    row: &libsql::Row,
+) -> Result<PlanVerification, DatabaseError> {
+    Ok(PlanVerification {
+        id: get_text(row, 0).parse().unwrap_or_default(),
+        goal_id: get_opt_uuid(row, 1),
+        plan_id: get_text(row, 2).parse().unwrap_or_default(),
+        job_id: get_opt_uuid(row, 3),
+        user_id: get_text(row, 4),
+        channel: get_text(row, 5),
+        verifier_kind: get_text(row, 6),
+        status: enum_from_snake_case(&get_text(row, 7), "PlanVerificationStatus")?,
+        completion_claimed: get_i64(row, 8) != 0,
+        evidence_count: get_i64(row, 9) as i32,
+        summary: get_text(row, 10),
+        checks: get_json(row, 11),
+        evidence: get_json(row, 12),
+        created_at: get_ts(row, 13),
     })
 }
 
