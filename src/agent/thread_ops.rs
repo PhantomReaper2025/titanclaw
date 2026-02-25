@@ -1055,109 +1055,111 @@ impl Agent {
             // Execute the approved tool and continue the loop
             let job_ctx =
                 JobContext::with_user(&message.user_id, "chat", "Interactive chat session");
-            persist_chat_policy_decision_best_effort(
-                self,
-                message,
-                thread_id,
-                &job_ctx,
-                &pending.tool_name,
-                &pending.tool_call_id,
-                TelemetryPolicyDecisionKind::Allow,
-                vec![if always {
-                    "user_approved_tool_and_enabled_auto_approval".to_string()
-                } else {
-                    "user_approved_tool".to_string()
-                }],
-                Some(always),
-                "approval_resume_decision",
-            );
-
             let mut approved_params = pending.parameters.clone();
-            match evaluate_tool_call_hook(
-                self.hooks().as_ref(),
-                &pending.tool_name,
-                &approved_params,
-                &message.user_id,
-                "chat_approval_resume",
-            )
-            .await
-            {
-                HookToolPolicyOutcome::Continue { parameters } => {
-                    approved_params = parameters;
-                }
-                HookToolPolicyOutcome::Modified {
-                    parameters,
-                    reason_codes,
-                } => {
-                    persist_chat_policy_decision_best_effort(
-                        self,
-                        message,
-                        thread_id,
-                        &job_ctx,
-                        &pending.tool_name,
-                        &pending.tool_call_id,
-                        TelemetryPolicyDecisionKind::Modify,
-                        reason_codes,
-                        None,
-                        "approval_resume_hook",
-                    );
-                    approved_params = parameters;
-                }
-                HookToolPolicyOutcome::Deny {
-                    reason,
-                    reason_codes,
-                } => {
-                    persist_chat_policy_decision_best_effort(
-                        self,
-                        message,
-                        thread_id,
-                        &job_ctx,
-                        &pending.tool_name,
-                        &pending.tool_call_id,
-                        TelemetryPolicyDecisionKind::Deny,
-                        reason_codes,
-                        None,
-                        "approval_resume_hook",
-                    );
-                    let blocked_msg = format!(
-                        "Tool '{}' was approved, but a policy hook blocked execution: {}",
-                        pending.tool_name, reason
-                    );
-                    let persist_user_input = {
-                        let mut sess = session.lock().await;
-                        if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                            if let Some(turn) = thread.last_turn_mut() {
-                                turn.record_tool_error(format!(
-                                    "blocked by hook after approval: {}",
-                                    reason
-                                ));
-                            }
-                            let user_input = thread.last_turn().map(|t| t.user_input.clone());
-                            thread.complete_turn(&blocked_msg);
-                            user_input
-                        } else {
-                            None
-                        }
-                    };
-                    let _ = self
-                        .channels
-                        .send_status(
-                            &message.channel,
-                            StatusUpdate::Status("Blocked by policy".into()),
-                            &message.metadata,
-                        )
-                        .await;
-                    if let Some(user_input) = persist_user_input {
-                        self.persist_turn(
-                            thread_id,
-                            &message.user_id,
-                            &user_input,
-                            Some(&blocked_msg),
-                            &message.channel,
-                            &message.metadata,
-                        );
+            if self.config.autonomy_policy_engine_v1 {
+                persist_chat_policy_decision_best_effort(
+                    self,
+                    message,
+                    thread_id,
+                    &job_ctx,
+                    &pending.tool_name,
+                    &pending.tool_call_id,
+                    TelemetryPolicyDecisionKind::Allow,
+                    vec![if always {
+                        "user_approved_tool_and_enabled_auto_approval".to_string()
+                    } else {
+                        "user_approved_tool".to_string()
+                    }],
+                    Some(always),
+                    "approval_resume_decision",
+                );
+
+                match evaluate_tool_call_hook(
+                    self.hooks().as_ref(),
+                    &pending.tool_name,
+                    &approved_params,
+                    &message.user_id,
+                    "chat_approval_resume",
+                )
+                .await
+                {
+                    HookToolPolicyOutcome::Continue { parameters } => {
+                        approved_params = parameters;
                     }
-                    return Ok(SubmissionResult::response(blocked_msg));
+                    HookToolPolicyOutcome::Modified {
+                        parameters,
+                        reason_codes,
+                    } => {
+                        persist_chat_policy_decision_best_effort(
+                            self,
+                            message,
+                            thread_id,
+                            &job_ctx,
+                            &pending.tool_name,
+                            &pending.tool_call_id,
+                            TelemetryPolicyDecisionKind::Modify,
+                            reason_codes,
+                            None,
+                            "approval_resume_hook",
+                        );
+                        approved_params = parameters;
+                    }
+                    HookToolPolicyOutcome::Deny {
+                        reason,
+                        reason_codes,
+                    } => {
+                        persist_chat_policy_decision_best_effort(
+                            self,
+                            message,
+                            thread_id,
+                            &job_ctx,
+                            &pending.tool_name,
+                            &pending.tool_call_id,
+                            TelemetryPolicyDecisionKind::Deny,
+                            reason_codes,
+                            None,
+                            "approval_resume_hook",
+                        );
+                        let blocked_msg = format!(
+                            "Tool '{}' was approved, but a policy hook blocked execution: {}",
+                            pending.tool_name, reason
+                        );
+                        let persist_user_input = {
+                            let mut sess = session.lock().await;
+                            if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                                if let Some(turn) = thread.last_turn_mut() {
+                                    turn.record_tool_error(format!(
+                                        "blocked by hook after approval: {}",
+                                        reason
+                                    ));
+                                }
+                                let user_input = thread.last_turn().map(|t| t.user_input.clone());
+                                thread.complete_turn(&blocked_msg);
+                                user_input
+                            } else {
+                                None
+                            }
+                        };
+                        let _ = self
+                            .channels
+                            .send_status(
+                                &message.channel,
+                                StatusUpdate::Status("Blocked by policy".into()),
+                                &message.metadata,
+                            )
+                            .await;
+                        if let Some(user_input) = persist_user_input {
+                            self.persist_turn(
+                                thread_id,
+                                &message.user_id,
+                                &user_input,
+                                Some(&blocked_msg),
+                                &message.channel,
+                                &message.metadata,
+                            );
+                        }
+                        return Ok(SubmissionResult::response(blocked_msg));
+                    }
                 }
             }
 
@@ -1363,20 +1365,22 @@ impl Agent {
             }
         } else {
             // Rejected - clear approval and return to idle
-            let job_ctx =
-                JobContext::with_user(&message.user_id, "chat", "Interactive chat session");
-            persist_chat_policy_decision_best_effort(
-                self,
-                message,
-                thread_id,
-                &job_ctx,
-                &pending.tool_name,
-                &pending.tool_call_id,
-                TelemetryPolicyDecisionKind::Deny,
-                vec!["user_rejected_tool".to_string()],
-                Some(false),
-                "approval_resume_decision",
-            );
+            if self.config.autonomy_policy_engine_v1 {
+                let job_ctx =
+                    JobContext::with_user(&message.user_id, "chat", "Interactive chat session");
+                persist_chat_policy_decision_best_effort(
+                    self,
+                    message,
+                    thread_id,
+                    &job_ctx,
+                    &pending.tool_name,
+                    &pending.tool_call_id,
+                    TelemetryPolicyDecisionKind::Deny,
+                    vec!["user_rejected_tool".to_string()],
+                    Some(false),
+                    "approval_resume_decision",
+                );
+            }
             let rejection_msg = format!(
                 "Tool '{}' was rejected. The agent will not execute this tool.\n\n\
                  You can continue the conversation or try a different approach.",

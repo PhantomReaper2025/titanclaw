@@ -15,6 +15,12 @@ pub struct AgentConfig {
     pub max_repair_attempts: u32,
     /// Whether to use planning before tool execution.
     pub use_planning: bool,
+    /// Enable Autonomy Policy Engine v1 runtime path enhancements.
+    pub autonomy_policy_engine_v1: bool,
+    /// Enable Autonomy Verifier v1 pre-completion soft gate.
+    pub autonomy_verifier_v1: bool,
+    /// Enable bounded automatic replanning in worker planned execution.
+    pub autonomy_replanner_v1: bool,
     /// Session idle timeout. Sessions inactive longer than this are pruned.
     pub session_idle_timeout: Duration,
     /// Remote swarm wait timeout before local fallback.
@@ -117,6 +123,30 @@ impl AgentConfig {
                     message: format!("must be 'true' or 'false': {e}"),
                 })?
                 .unwrap_or(settings.agent.use_planning),
+            autonomy_policy_engine_v1: optional_env("AUTONOMY_POLICY_ENGINE_V1")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "AUTONOMY_POLICY_ENGINE_V1".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(settings.agent.autonomy_policy_engine_v1),
+            autonomy_verifier_v1: optional_env("AUTONOMY_VERIFIER_V1")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "AUTONOMY_VERIFIER_V1".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(settings.agent.autonomy_verifier_v1),
+            autonomy_replanner_v1: optional_env("AUTONOMY_REPLANNER_V1")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "AUTONOMY_REPLANNER_V1".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(settings.agent.autonomy_replanner_v1),
             session_idle_timeout: Duration::from_secs(
                 optional_env("SESSION_IDLE_TIMEOUT_SECS")?
                     .map(|s| s.parse())
@@ -295,5 +325,50 @@ impl AgentConfig {
                 })?
                 .unwrap_or(settings.agent.profile_synthesis_llm_enabled),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::Settings;
+    use std::sync::Mutex;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn clear_autonomy_flag_env() {
+        // SAFETY: env mutation is serialized under ENV_MUTEX in tests.
+        unsafe {
+            std::env::remove_var("AUTONOMY_POLICY_ENGINE_V1");
+            std::env::remove_var("AUTONOMY_VERIFIER_V1");
+            std::env::remove_var("AUTONOMY_REPLANNER_V1");
+        }
+    }
+
+    #[test]
+    fn autonomy_runtime_flags_default_true() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        clear_autonomy_flag_env();
+        let cfg = AgentConfig::resolve(&Settings::default()).expect("resolve");
+        assert!(cfg.autonomy_policy_engine_v1);
+        assert!(cfg.autonomy_verifier_v1);
+        assert!(cfg.autonomy_replanner_v1);
+    }
+
+    #[test]
+    fn autonomy_runtime_flags_env_override() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        clear_autonomy_flag_env();
+        // SAFETY: env mutation is serialized under ENV_MUTEX in tests.
+        unsafe {
+            std::env::set_var("AUTONOMY_POLICY_ENGINE_V1", "false");
+            std::env::set_var("AUTONOMY_VERIFIER_V1", "false");
+            std::env::set_var("AUTONOMY_REPLANNER_V1", "false");
+        }
+        let cfg = AgentConfig::resolve(&Settings::default()).expect("resolve");
+        assert!(!cfg.autonomy_policy_engine_v1);
+        assert!(!cfg.autonomy_verifier_v1);
+        assert!(!cfg.autonomy_replanner_v1);
+        clear_autonomy_flag_env();
     }
 }

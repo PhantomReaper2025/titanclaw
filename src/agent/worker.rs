@@ -50,6 +50,9 @@ pub struct WorkerDeps {
     pub hooks: Arc<HookRegistry>,
     pub timeout: Duration,
     pub use_planning: bool,
+    pub autonomy_policy_engine_v1: bool,
+    pub autonomy_verifier_v1: bool,
+    pub autonomy_replanner_v1: bool,
 }
 
 /// Worker that executes a single job.
@@ -167,6 +170,14 @@ impl Worker {
 
     fn use_planning(&self) -> bool {
         self.deps.use_planning
+    }
+
+    fn autonomy_verifier_v1(&self) -> bool {
+        self.deps.autonomy_verifier_v1
+    }
+
+    fn autonomy_replanner_v1(&self) -> bool {
+        self.deps.autonomy_replanner_v1
     }
 
     async fn persist_action_plan(
@@ -748,6 +759,19 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
         // If we have a plan, execute it (with bounded automatic replanning).
         if let Some((mut current_plan, mut current_persisted_plan)) = plan {
+            if !self.autonomy_replanner_v1() {
+                let _ = self
+                    .execute_plan(
+                        rx,
+                        reasoning,
+                        reason_ctx,
+                        &current_plan,
+                        current_persisted_plan.as_ref(),
+                    )
+                    .await?;
+                return Ok(());
+            }
+
             let budgets = ReplanBudgets::default();
             let mut replan_state = ReplanRuntimeState::default();
 
@@ -1077,18 +1101,20 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         if let ApprovalPolicyOutcome::RequireApproval { reason_codes } =
             evaluate_worker_tool_approval(tool.as_ref())
         {
-            persist_worker_policy_decision_best_effort(
-                deps,
-                &job_ctx,
-                tool_name,
-                None,
-                AutonomyPolicyDecisionKind::RequireApproval,
-                reason_codes,
-                true,
-                Some(false),
-                "tool_call_preflight",
-                serde_json::json!({}),
-            );
+            if deps.autonomy_policy_engine_v1 {
+                persist_worker_policy_decision_best_effort(
+                    deps,
+                    &job_ctx,
+                    tool_name,
+                    None,
+                    AutonomyPolicyDecisionKind::RequireApproval,
+                    reason_codes,
+                    true,
+                    Some(false),
+                    "tool_call_preflight",
+                    serde_json::json!({}),
+                );
+            }
             return Err(crate::error::ToolError::AuthRequired {
                 name: tool_name.to_string(),
             }
@@ -1110,36 +1136,40 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 parameters,
                 reason_codes,
             } => {
-                persist_worker_policy_decision_best_effort(
-                    deps,
-                    &job_ctx,
-                    tool_name,
-                    None,
-                    AutonomyPolicyDecisionKind::Modify,
-                    reason_codes,
-                    false,
-                    None,
-                    "tool_call_hook",
-                    serde_json::json!({}),
-                );
+                if deps.autonomy_policy_engine_v1 {
+                    persist_worker_policy_decision_best_effort(
+                        deps,
+                        &job_ctx,
+                        tool_name,
+                        None,
+                        AutonomyPolicyDecisionKind::Modify,
+                        reason_codes,
+                        false,
+                        None,
+                        "tool_call_hook",
+                        serde_json::json!({}),
+                    );
+                }
                 parameters
             }
             HookToolPolicyOutcome::Deny {
                 reason,
                 reason_codes,
             } => {
-                persist_worker_policy_decision_best_effort(
-                    deps,
-                    &job_ctx,
-                    tool_name,
-                    None,
-                    AutonomyPolicyDecisionKind::Deny,
-                    reason_codes,
-                    false,
-                    None,
-                    "tool_call_hook",
-                    serde_json::json!({}),
-                );
+                if deps.autonomy_policy_engine_v1 {
+                    persist_worker_policy_decision_best_effort(
+                        deps,
+                        &job_ctx,
+                        tool_name,
+                        None,
+                        AutonomyPolicyDecisionKind::Deny,
+                        reason_codes,
+                        false,
+                        None,
+                        "tool_call_hook",
+                        serde_json::json!({}),
+                    );
+                }
                 return Err(crate::error::ToolError::ExecutionFailed {
                     name: tool_name.to_string(),
                     reason: format!("Blocked by hook: {}", reason),
@@ -1555,7 +1585,9 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 .process_tool_result(reason_ctx, &selection, result)
                 .await?;
 
-            if let Some((reason, detail)) = step_replan_request {
+            if self.autonomy_replanner_v1()
+                && let Some((reason, detail)) = step_replan_request
+            {
                 tracing::info!(
                     job = %self.job_id,
                     replan_reason = reason.code(),
@@ -1611,7 +1643,9 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         reason_ctx.messages.push(ChatMessage::assistant(&response));
 
         let completion_claimed = crate::util::llm_signals_completion(&response);
-        let verifier_result = if let Some(p) = persisted_plan {
+        let verifier_result = if self.autonomy_verifier_v1()
+            && let Some(p) = persisted_plan
+        {
             let (risk_class, acceptance_criteria) =
                 self.load_goal_verifier_context(p.goal_id).await;
             Some(VerifierV1::verify_completion(VerificationRequest {
@@ -1724,7 +1758,8 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             ));
         }
 
-        if let Some((reason, detail)) = replan_request
+        if self.autonomy_replanner_v1()
+            && let Some((reason, detail)) = replan_request
             && persisted_plan.is_some()
         {
             return Ok(PlanExecutionOutcome::ReplanRequested { reason, detail });
@@ -1814,8 +1849,11 @@ impl From<TaskOutput> for Result<String, Error> {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::{Error, ToolError};
     use crate::llm::ToolSelection;
     use crate::util::llm_signals_completion;
+
+    use super::{ReplanReason, classify_replan_reason_for_step_error};
 
     #[test]
     fn test_tool_selection_preserves_call_id() {
@@ -1892,5 +1930,29 @@ mod tests {
         assert!(!llm_signals_completion(
             "The tool returned: TASK_COMPLETE signal"
         ));
+    }
+
+    #[test]
+    fn test_classify_replan_reason_for_policy_denial() {
+        let err: Error = ToolError::AuthRequired {
+            name: "shell".to_string(),
+        }
+        .into();
+        assert_eq!(
+            classify_replan_reason_for_step_error(&err),
+            Some(ReplanReason::PolicyDenied)
+        );
+    }
+
+    #[test]
+    fn test_classify_replan_reason_for_missing_tool() {
+        let err: Error = ToolError::NotFound {
+            name: "missing".to_string(),
+        }
+        .into();
+        assert_eq!(
+            classify_replan_reason_for_step_error(&err),
+            Some(ReplanReason::ToolUnavailable)
+        );
     }
 }

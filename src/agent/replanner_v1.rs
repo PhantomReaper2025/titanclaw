@@ -87,4 +87,11 @@ mod tests {
         state.record_replan();
         assert!(!state.can_replan(budgets));
     }
+
+    #[test]
+    fn test_replan_prompt_includes_reason_code() {
+        let prompt = ReplannerV1::replan_prompt(ReplanReason::PolicyDenied, "approval required");
+        assert!(prompt.contains("policy_denied"));
+        assert!(prompt.contains("approval required"));
+    }
 }

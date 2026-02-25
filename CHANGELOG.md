@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Goal reprioritization support: `POST /api/goals/{id}/priority` and `titanclaw goal set-priority` with user-scoped ownership checks (PostgreSQL + libSQL).
 - Goal/plan list filtering/sorting/pagination support: web list endpoints accept optional `status`, `sort`, `offset`, and `limit` query params, and CLI `goal list` / `plan list` now support `--status`, `--sort`, `--offset`, and `--limit`.
 - Internal autonomy runtime control-plane v1 modules: `PlannerV1`, shared policy-evaluation helpers, `VerifierV1`, and `ReplannerV1` scaffolding with targeted unit tests.
+- Internal runtime rollout flags for autonomy control-plane v1 behavior: `AUTONOMY_POLICY_ENGINE_V1`, `AUTONOMY_VERIFIER_V1`, and `AUTONOMY_REPLANNER_V1` (default enabled).
 
 ### Changed
 
@@ -36,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Worker plan verification persistence now captures richer per-step checks/evidence summaries and also records an `Inconclusive` verification on early `execute_plan()` completion-path exits (future-proofing the dormant `completed` branch).
 - Worker planned execution now routes initial planning through `PlannerV1`, performs pre-completion `VerifierV1` soft gating before final completion state transitions, and can perform bounded automatic replanning (with persisted next plan revisions when autonomy linkage is available) when steps fail or completion checks indicate remaining work.
 - Dispatcher, worker, and approval-resume tool preflight paths now share policy-evaluation helper logic for approval/hook decisions; approval resume re-checks hook policy before executing an approved tool and persists explicit approve/reject autonomy policy-decision records.
+- Runtime control-plane v1 behavior can now be staged: worker policy-decision persistence, verifier soft gating, and automatic replanning are each gated by internal config flags while preserving the existing persistence/CRUD/inspection surfaces.
 - Job runtime context now carries optional autonomy linkage IDs (`goal_id` / `plan_id` / `plan_step_id`) in memory so worker/dispatcher paths can correlate records more consistently during execution.
 - `agent_jobs` now persists optional autonomy linkage IDs (`autonomy_goal_id`, `autonomy_plan_id`, `autonomy_plan_step_id`) across PostgreSQL/libSQL (`V17` + libSQL schema compatibility path), so autonomy correlation survives DB save/load and restart boundaries.
 

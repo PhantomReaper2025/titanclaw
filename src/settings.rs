@@ -303,6 +303,18 @@ pub struct AgentSettings {
     #[serde(default = "default_true")]
     pub use_planning: bool,
 
+    /// Enable Autonomy Policy Engine v1 runtime path enhancements.
+    #[serde(default = "default_true")]
+    pub autonomy_policy_engine_v1: bool,
+
+    /// Enable Autonomy Verifier v1 pre-completion soft gate.
+    #[serde(default = "default_true")]
+    pub autonomy_verifier_v1: bool,
+
+    /// Enable bounded automatic replanning in worker planned execution.
+    #[serde(default = "default_true")]
+    pub autonomy_replanner_v1: bool,
+
     /// Self-repair check interval in seconds.
     #[serde(default = "default_repair_interval")]
     pub repair_check_interval_secs: u64,
@@ -465,6 +477,9 @@ impl Default for AgentSettings {
             job_timeout_secs: default_job_timeout(),
             stuck_threshold_secs: default_stuck_threshold(),
             use_planning: true,
+            autonomy_policy_engine_v1: true,
+            autonomy_verifier_v1: true,
+            autonomy_replanner_v1: true,
             repair_check_interval_secs: default_repair_interval(),
             max_repair_attempts: default_max_repair_attempts(),
             session_idle_timeout_secs: default_session_idle_timeout(),

@@ -224,4 +224,16 @@ mod tests {
         assert_eq!(out.status, PlanVerificationStatus::Inconclusive);
         assert!(out.allow_completion);
     }
+
+    #[test]
+    fn test_verifier_blocks_high_risk_contradiction_and_requests_replan() {
+        let mut req = base_request();
+        req.risk_class = GoalRiskClass::Critical;
+        req.failed_steps = 1;
+        req.succeeded_steps = 1;
+        let out = VerifierV1::verify_completion(req);
+        assert_eq!(out.status, PlanVerificationStatus::Inconclusive);
+        assert!(!out.allow_completion);
+        assert_eq!(out.next_action, VerificationNextAction::Replan);
+    }
 }

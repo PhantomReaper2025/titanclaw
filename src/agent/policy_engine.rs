@@ -192,4 +192,24 @@ mod tests {
             _ => panic!("unexpected outcome"),
         }
     }
+
+    #[test]
+    fn test_worker_approval_requires_approval() {
+        let tool = TestTool {
+            needs_approval: true,
+            force_explicit_for_params: false,
+        };
+        match evaluate_worker_tool_approval(&tool) {
+            ApprovalPolicyOutcome::RequireApproval { reason_codes } => {
+                assert_eq!(reason_codes, vec!["tool_requires_approval"]);
+            }
+            _ => panic!("unexpected outcome"),
+        }
+    }
+
+    #[test]
+    fn test_map_policy_decision_kind_supports_require_more_evidence() {
+        let mapped = map_policy_decision_kind(TelemetryPolicyDecisionKind::RequireMoreEvidence);
+        assert_eq!(mapped, AutonomyPolicyDecisionKind::RequireMoreEvidence);
+    }
 }

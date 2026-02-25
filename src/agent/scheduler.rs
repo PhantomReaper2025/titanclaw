@@ -155,6 +155,9 @@ impl Scheduler {
                 hooks: self.hooks.clone(),
                 timeout: self.config.job_timeout,
                 use_planning: self.config.use_planning,
+                autonomy_policy_engine_v1: self.config.autonomy_policy_engine_v1,
+                autonomy_verifier_v1: self.config.autonomy_verifier_v1,
+                autonomy_replanner_v1: self.config.autonomy_replanner_v1,
             };
             let worker = Worker::new(job_id, deps);
 
