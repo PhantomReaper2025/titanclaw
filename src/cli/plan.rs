@@ -76,6 +76,44 @@ pub enum PlanCommand {
         #[arg(long, default_value = DEFAULT_USER_ID)]
         user_id: String,
     },
+
+    /// Create a new revision from an existing plan (replan workflow)
+    Replan {
+        /// Existing plan ID to replan from
+        id: Uuid,
+
+        /// Owner user ID (used to validate goal ownership)
+        #[arg(long, default_value = DEFAULT_USER_ID)]
+        user_id: String,
+
+        /// Optional summary override for the new revision
+        #[arg(long)]
+        summary: Option<String>,
+
+        /// Optional confidence override [0.0, 1.0]
+        #[arg(long)]
+        confidence: Option<f64>,
+
+        /// Optional status override (default: draft)
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Optional planner kind override (reasoning_v1|rule_based|hybrid)
+        #[arg(long)]
+        planner_kind: Option<String>,
+
+        /// Optional estimated execution time override
+        #[arg(long)]
+        estimated_time_secs: Option<u64>,
+
+        /// Optional estimated cost override
+        #[arg(long)]
+        estimated_cost: Option<f64>,
+
+        /// Keep the source plan status unchanged (do not mark superseded)
+        #[arg(long)]
+        no_supersede_current: bool,
+    },
 }
 
 pub async fn run_plan_command(cmd: PlanCommand) -> anyhow::Result<()> {
@@ -110,6 +148,31 @@ pub async fn run_plan_command(cmd: PlanCommand) -> anyhow::Result<()> {
             status,
             user_id,
         } => set_plan_status(db.as_ref(), id, &status, &user_id).await,
+        PlanCommand::Replan {
+            id,
+            user_id,
+            summary,
+            confidence,
+            status,
+            planner_kind,
+            estimated_time_secs,
+            estimated_cost,
+            no_supersede_current,
+        } => {
+            replan_plan(
+                db.as_ref(),
+                id,
+                &user_id,
+                summary,
+                confidence,
+                status,
+                planner_kind,
+                estimated_time_secs,
+                estimated_cost,
+                !no_supersede_current,
+            )
+            .await
+        }
     }
 }
 
@@ -312,6 +375,108 @@ async fn set_plan_status(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn replan_plan(
+    db: &dyn crate::db::Database,
+    source_plan_id: Uuid,
+    user_id: &str,
+    summary: Option<String>,
+    confidence: Option<f64>,
+    status_raw: Option<String>,
+    planner_kind_raw: Option<String>,
+    estimated_time_secs: Option<u64>,
+    estimated_cost: Option<f64>,
+    supersede_current: bool,
+) -> anyhow::Result<()> {
+    if let Some(confidence) = confidence
+        && !(0.0..=1.0).contains(&confidence)
+    {
+        anyhow::bail!("confidence must be between 0.0 and 1.0");
+    }
+
+    let source_plan = db
+        .get_plan(source_plan_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to load source plan {}", source_plan_id))?
+        .ok_or_else(|| anyhow::anyhow!("plan not found: {}", source_plan_id))?;
+
+    let goal = db
+        .get_goal(source_plan.goal_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to load goal {}", source_plan.goal_id))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "goal {} for plan {} not found",
+                source_plan.goal_id,
+                source_plan.id
+            )
+        })?;
+    if goal.owner_user_id != user_id {
+        anyhow::bail!("plan {} not found for user {}", source_plan_id, user_id);
+    }
+
+    let existing = db
+        .list_plans_for_goal(source_plan.goal_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to list plans for goal {}", source_plan.goal_id))?;
+    let revision = existing.iter().map(|p| p.revision).max().unwrap_or(0) + 1;
+
+    let now = Utc::now();
+    let new_plan = Plan {
+        id: Uuid::new_v4(),
+        goal_id: source_plan.goal_id,
+        revision,
+        status: match status_raw {
+            Some(s) => parse_plan_status(&s)?,
+            None => PlanStatus::Draft,
+        },
+        planner_kind: match planner_kind_raw {
+            Some(s) => parse_planner_kind(&s)?,
+            None => source_plan.planner_kind,
+        },
+        source_action_plan: source_plan.source_action_plan.clone(),
+        assumptions: source_plan.assumptions.clone(),
+        confidence: confidence.unwrap_or(source_plan.confidence),
+        estimated_cost: estimated_cost.or(source_plan.estimated_cost),
+        estimated_time_secs: estimated_time_secs.or(source_plan.estimated_time_secs),
+        summary: match summary {
+            Some(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            None => source_plan.summary.clone(),
+        },
+        created_at: now,
+        updated_at: now,
+    };
+
+    db.create_plan(&new_plan)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to create replanned revision for {}", source_plan_id))?;
+
+    if supersede_current {
+        db.update_plan_status(source_plan.id, PlanStatus::Superseded)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
+            .with_context(|| format!("failed to supersede source plan {}", source_plan.id))?;
+    }
+
+    println!(
+        "Created replanned plan {} (rev {}) from {}",
+        new_plan.id, new_plan.revision, source_plan.id
+    );
+    println!("{}", serde_json::to_string_pretty(&new_plan)?);
+    Ok(())
+}
+
 fn parse_plan_status(s: &str) -> anyhow::Result<PlanStatus> {
     match s.trim().to_ascii_lowercase().as_str() {
         "draft" => Ok(PlanStatus::Draft),
@@ -323,6 +488,18 @@ fn parse_plan_status(s: &str) -> anyhow::Result<PlanStatus> {
         "superseded" => Ok(PlanStatus::Superseded),
         _ => anyhow::bail!(
             "invalid plan status '{}'; expected draft|ready|running|paused|failed|completed|superseded",
+            s
+        ),
+    }
+}
+
+fn parse_planner_kind(s: &str) -> anyhow::Result<PlannerKind> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "reasoning_v1" => Ok(PlannerKind::ReasoningV1),
+        "rule_based" => Ok(PlannerKind::RuleBased),
+        "hybrid" => Ok(PlannerKind::Hybrid),
+        _ => anyhow::bail!(
+            "invalid planner kind '{}'; expected reasoning_v1|rule_based|hybrid",
             s
         ),
     }

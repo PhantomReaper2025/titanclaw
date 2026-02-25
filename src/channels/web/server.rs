@@ -240,6 +240,7 @@ pub async fn start_server(
         )
         .route("/api/plans/{id}", get(plans_detail_handler))
         .route("/api/plans/{id}/status", post(plans_status_update_handler))
+        .route("/api/plans/{id}/replan", post(plans_replan_handler))
         .route(
             "/api/plans/{id}/executions",
             get(plan_execution_attempts_list_handler),
@@ -2977,6 +2978,19 @@ struct PlanStatusUpdateRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct PlanReplanRequest {
+    status: Option<PlanStatus>,
+    planner_kind: Option<PlannerKind>,
+    source_action_plan: Option<serde_json::Value>,
+    assumptions: Option<serde_json::Value>,
+    confidence: Option<f64>,
+    estimated_cost: Option<f64>,
+    estimated_time_secs: Option<u64>,
+    summary: Option<String>,
+    supersede_current: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct PlanStepsCreateRequest {
     steps: Vec<PlanStepCreateInput>,
 }
@@ -3491,6 +3505,88 @@ async fn plans_status_update_handler(
         ))?;
 
     Ok(Json(serde_json::json!({ "plan": updated })))
+}
+
+async fn plans_replan_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(body): Json<PlanReplanRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let plan_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plan ID".to_string()))?;
+
+    if let Some(confidence) = body.confidence
+        && !(0.0..=1.0).contains(&confidence)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "confidence must be between 0.0 and 1.0".to_string(),
+        ));
+    }
+
+    let previous = load_owned_plan(state.as_ref(), store.as_ref(), plan_id).await?;
+    let existing = store
+        .list_plans_for_goal(previous.goal_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let next_revision = existing.iter().map(|p| p.revision).max().unwrap_or(0) + 1;
+
+    let now = chrono::Utc::now();
+    let summary = match body.summary {
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        None => previous.summary.clone(),
+    };
+
+    let new_plan = Plan {
+        id: Uuid::new_v4(),
+        goal_id: previous.goal_id,
+        revision: next_revision,
+        status: body.status.unwrap_or(PlanStatus::Draft),
+        planner_kind: body.planner_kind.unwrap_or(previous.planner_kind),
+        source_action_plan: body
+            .source_action_plan
+            .or_else(|| previous.source_action_plan.clone()),
+        assumptions: body
+            .assumptions
+            .unwrap_or_else(|| previous.assumptions.clone()),
+        confidence: body.confidence.unwrap_or(previous.confidence),
+        estimated_cost: body.estimated_cost.or(previous.estimated_cost),
+        estimated_time_secs: body.estimated_time_secs.or(previous.estimated_time_secs),
+        summary,
+        created_at: now,
+        updated_at: now,
+    };
+
+    store
+        .create_plan(&new_plan)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let supersede_previous = body.supersede_current.unwrap_or(true);
+    if supersede_previous {
+        store
+            .update_plan_status(previous.id, PlanStatus::Superseded)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    Ok(Json(serde_json::json!({
+        "plan": new_plan,
+        "previous_plan_id": previous.id,
+        "previous_plan_superseded": supersede_previous
+    })))
 }
 
 async fn plan_execution_attempts_list_handler(
