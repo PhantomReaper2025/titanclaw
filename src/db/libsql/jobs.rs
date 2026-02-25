@@ -29,8 +29,9 @@ impl JobStore for LibSqlBackend {
                 INSERT INTO agent_jobs (
                     id, conversation_id, title, description, category, status, source,
                     budget_amount, budget_token, bid_amount, estimated_cost, estimated_time_secs,
-                    actual_cost, repair_attempts, created_at, started_at, completed_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                    actual_cost, repair_attempts, created_at, started_at, completed_at,
+                    autonomy_goal_id, autonomy_plan_id, autonomy_plan_step_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
                 ON CONFLICT (id) DO UPDATE SET
                     title = excluded.title,
                     description = excluded.description,
@@ -41,7 +42,10 @@ impl JobStore for LibSqlBackend {
                     actual_cost = excluded.actual_cost,
                     repair_attempts = excluded.repair_attempts,
                     started_at = excluded.started_at,
-                    completed_at = excluded.completed_at
+                    completed_at = excluded.completed_at,
+                    autonomy_goal_id = excluded.autonomy_goal_id,
+                    autonomy_plan_id = excluded.autonomy_plan_id,
+                    autonomy_plan_step_id = excluded.autonomy_plan_step_id
                 "#,
                 params![
                     ctx.job_id.to_string(),
@@ -61,6 +65,9 @@ impl JobStore for LibSqlBackend {
                     fmt_ts(&ctx.created_at),
                     fmt_opt_ts(&ctx.started_at),
                     fmt_opt_ts(&ctx.completed_at),
+                    opt_text_owned(ctx.autonomy_goal_id.map(|id| id.to_string())),
+                    opt_text_owned(ctx.autonomy_plan_id.map(|id| id.to_string())),
+                    opt_text_owned(ctx.autonomy_plan_step_id.map(|id| id.to_string())),
                 ],
             )
             .await
@@ -75,7 +82,8 @@ impl JobStore for LibSqlBackend {
                 r#"
                 SELECT id, conversation_id, title, description, category, status, user_id,
                        budget_amount, budget_token, bid_amount, estimated_cost, estimated_time_secs,
-                       actual_cost, repair_attempts, created_at, started_at, completed_at
+                       actual_cost, repair_attempts, created_at, started_at, completed_at,
+                       autonomy_goal_id, autonomy_plan_id, autonomy_plan_step_id
                 FROM agent_jobs WHERE id = ?1
                 "#,
                 params![id.to_string()],
@@ -116,9 +124,9 @@ impl JobStore for LibSqlBackend {
                     completed_at: get_opt_ts(&row, 16),
                     transitions: Vec::new(),
                     metadata: serde_json::Value::Null,
-                    autonomy_goal_id: None,
-                    autonomy_plan_id: None,
-                    autonomy_plan_step_id: None,
+                    autonomy_goal_id: get_opt_text(&row, 17).and_then(|s| s.parse().ok()),
+                    autonomy_plan_id: get_opt_text(&row, 18).and_then(|s| s.parse().ok()),
+                    autonomy_plan_step_id: get_opt_text(&row, 19).and_then(|s| s.parse().ok()),
                     extra_env: std::sync::Arc::new(std::collections::HashMap::new()),
                 }))
             }

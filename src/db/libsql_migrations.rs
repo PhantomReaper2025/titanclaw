@@ -67,6 +67,9 @@ CREATE TABLE IF NOT EXISTS agent_jobs (
     user_id TEXT NOT NULL DEFAULT 'default',
     project_dir TEXT,
     job_mode TEXT NOT NULL DEFAULT 'worker',
+    autonomy_goal_id TEXT,
+    autonomy_plan_id TEXT,
+    autonomy_plan_step_id TEXT,
     budget_amount TEXT,
     budget_token TEXT,
     bid_amount TEXT,
@@ -90,6 +93,9 @@ CREATE INDEX IF NOT EXISTS idx_agent_jobs_conversation ON agent_jobs(conversatio
 CREATE INDEX IF NOT EXISTS idx_agent_jobs_source ON agent_jobs(source);
 CREATE INDEX IF NOT EXISTS idx_agent_jobs_user ON agent_jobs(user_id);
 CREATE INDEX IF NOT EXISTS idx_agent_jobs_created ON agent_jobs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_jobs_autonomy_goal ON agent_jobs(autonomy_goal_id);
+CREATE INDEX IF NOT EXISTS idx_agent_jobs_autonomy_plan ON agent_jobs(autonomy_plan_id);
+CREATE INDEX IF NOT EXISTS idx_agent_jobs_autonomy_plan_step ON agent_jobs(autonomy_plan_step_id);
 
 CREATE TABLE IF NOT EXISTS job_actions (
     id TEXT PRIMARY KEY,

@@ -36,7 +36,7 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 | Embeddings input length guard semantics | ✅ | Embedding providers now validate approximate character length (not byte length), apply checks consistently to both single and batch embedding calls, and return clearer `TextTooLong` values for non-ASCII inputs. |
 | WhatsApp unsupported media handling | ✅ | Non-text WhatsApp messages are no longer silently dropped; the channel emits an explicit placeholder message to the agent and logs a warning so users can be informed to resend as text. |
 | PostgreSQL AST graph query gap (documented) | ✅ | AST graph query remains Database/libSQL-only; runtime error message and docs now explicitly state the PostgreSQL-backed workspace limitation. |
-| Autonomy Control Plane v1 groundwork (types + persistence schema) | 🚧 | Added versioned autonomy domain types (`src/agent/autonomy.rs`), implemented Postgres/libSQL autonomy store CRUD for goals/plans/steps/execution/policy records, added schema migrations/scaffolding (`V11`-`V16` + libSQL mirror), wired best-effort worker/dispatcher persistence so planned worker runs and chat tool approvals/execution attempts now emit DB-backed autonomy records, and exposed read-only gateway inspection endpoints for goals/plans to validate persistence. |
+| Autonomy Control Plane v1 groundwork (types + persistence schema) | 🚧 | Added versioned autonomy domain types (`src/agent/autonomy.rs`), implemented Postgres/libSQL autonomy store CRUD for goals/plans/steps/execution/policy records, added schema migrations/scaffolding (`V11`-`V17` + libSQL mirror), wired best-effort worker/dispatcher persistence so planned worker runs and chat tool approvals/execution attempts now emit DB-backed autonomy records, persisted `agent_jobs` autonomy link fields for restart-safe correlation, and exposed read-only gateway inspection endpoints for goals/plans to validate persistence. |
 
 ## Execution TODO (Live)
 
@@ -59,6 +59,7 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 - [x] Conversational profile onboarding in chat with review+confirm and managed-doc baseline write
 - [x] Autonomy Control Plane v1 groundwork: domain types + DB trait surface + Postgres/libSQL schema scaffolding (`V11`-`V16`)
 - [x] Autonomy Control Plane v1 runtime persistence instrumentation (worker plan bridge + dispatcher policy/execution records, best-effort)
+- [x] Persist job-level autonomy linkage IDs in `agent_jobs` across Postgres/libSQL (`V17` + libSQL schema compatibility path)
 - [x] Read-only gateway inspection endpoints for autonomy goals/plans (user-scoped)
 
 ## Proposed Changes

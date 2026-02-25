@@ -153,8 +153,9 @@ impl Store {
             INSERT INTO agent_jobs (
                 id, conversation_id, title, description, category, status, source,
                 budget_amount, budget_token, bid_amount, estimated_cost, estimated_time_secs,
-                actual_cost, repair_attempts, created_at, started_at, completed_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                actual_cost, repair_attempts, created_at, started_at, completed_at,
+                autonomy_goal_id, autonomy_plan_id, autonomy_plan_step_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
             ON CONFLICT (id) DO UPDATE SET
                 title = EXCLUDED.title,
                 description = EXCLUDED.description,
@@ -165,7 +166,10 @@ impl Store {
                 actual_cost = EXCLUDED.actual_cost,
                 repair_attempts = EXCLUDED.repair_attempts,
                 started_at = EXCLUDED.started_at,
-                completed_at = EXCLUDED.completed_at
+                completed_at = EXCLUDED.completed_at,
+                autonomy_goal_id = EXCLUDED.autonomy_goal_id,
+                autonomy_plan_id = EXCLUDED.autonomy_plan_id,
+                autonomy_plan_step_id = EXCLUDED.autonomy_plan_step_id
             "#,
             &[
                 &ctx.job_id,
@@ -185,6 +189,9 @@ impl Store {
                 &ctx.created_at,
                 &ctx.started_at,
                 &ctx.completed_at,
+                &ctx.autonomy_goal_id,
+                &ctx.autonomy_plan_id,
+                &ctx.autonomy_plan_step_id,
             ],
         )
         .await?;
@@ -201,7 +208,8 @@ impl Store {
                 r#"
                 SELECT id, conversation_id, title, description, category, status, user_id,
                        budget_amount, budget_token, bid_amount, estimated_cost, estimated_time_secs,
-                       actual_cost, repair_attempts, created_at, started_at, completed_at
+                       actual_cost, repair_attempts, created_at, started_at, completed_at,
+                       autonomy_goal_id, autonomy_plan_id, autonomy_plan_step_id
                 FROM agent_jobs WHERE id = $1
                 "#,
                 &[&id],
@@ -237,9 +245,9 @@ impl Store {
                     completed_at: row.get("completed_at"),
                     transitions: Vec::new(), // Not loaded from DB for now
                     metadata: serde_json::Value::Null,
-                    autonomy_goal_id: None,
-                    autonomy_plan_id: None,
-                    autonomy_plan_step_id: None,
+                    autonomy_goal_id: row.get("autonomy_goal_id"),
+                    autonomy_plan_id: row.get("autonomy_plan_id"),
+                    autonomy_plan_step_id: row.get("autonomy_plan_step_id"),
                     total_tokens_used: 0,
                     max_tokens: 0,
                     extra_env: std::sync::Arc::new(std::collections::HashMap::new()),

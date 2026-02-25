@@ -356,6 +356,28 @@ fn get_json_string_array(row: &libsql::Row, idx: i32) -> Vec<String> {
     }
 }
 
+async fn ensure_agent_jobs_autonomy_link_columns(conn: &Connection) -> Result<(), DatabaseError> {
+    for column in [
+        "autonomy_goal_id",
+        "autonomy_plan_id",
+        "autonomy_plan_step_id",
+    ] {
+        let sql = format!("ALTER TABLE agent_jobs ADD COLUMN {} TEXT", column);
+        if let Err(e) = conn.execute(&sql, ()).await {
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("duplicate column name") || msg.contains("no such table") {
+                continue;
+            }
+            return Err(DatabaseError::Migration(format!(
+                "Failed to add agent_jobs.{}: {}",
+                column, e
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 #[async_trait]
 impl Database for LibSqlBackend {
     async fn run_migrations(&self) -> Result<(), DatabaseError> {
@@ -365,6 +387,10 @@ impl Database for LibSqlBackend {
         conn.query("PRAGMA journal_mode=WAL", ())
             .await
             .map_err(|e| DatabaseError::Migration(format!("Failed to enable WAL mode: {}", e)))?;
+        // Backward-compatibility for existing databases: SQLite doesn't support
+        // `ADD COLUMN IF NOT EXISTS`, so patch missing columns before the
+        // consolidated schema runs and creates indexes that depend on them.
+        ensure_agent_jobs_autonomy_link_columns(&conn).await?;
         conn.execute_batch(libsql_migrations::SCHEMA)
             .await
             .map_err(|e| DatabaseError::Migration(format!("libSQL migration failed: {}", e)))?;
