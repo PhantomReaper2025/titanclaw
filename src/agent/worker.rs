@@ -1933,11 +1933,15 @@ impl From<TaskOutput> for Result<String, Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
     use async_trait::async_trait;
     use chrono::Utc;
+    use rust_decimal::Decimal;
     use tokio::sync::mpsc;
     use uuid::Uuid;
 
@@ -1947,9 +1951,12 @@ mod tests {
     };
     use crate::config::SafetyConfig;
     use crate::context::{ContextManager, JobState};
-    use crate::error::{Error, ToolError};
+    use crate::error::{Error, LlmError, ToolError};
     use crate::hooks::HookRegistry;
-    use crate::llm::{ActionPlan, Reasoning, ReasoningContext, ToolSelection};
+    use crate::llm::{
+        ActionPlan, CompletionRequest, CompletionResponse, FinishReason, LlmProvider, Reasoning,
+        ReasoningContext, ToolCompletionRequest, ToolCompletionResponse, ToolSelection,
+    };
     use crate::safety::SafetyLayer;
     use crate::testing::{StubLlm, TestHarnessBuilder};
     use crate::tools::{Tool, ToolOutput, ToolRegistry};
@@ -2107,6 +2114,107 @@ mod tests {
                 serde_json::json!({"ok": true}),
                 Duration::from_millis(1),
             ))
+        }
+    }
+
+    enum ScriptedLlmResponse {
+        Complete(String),
+        CompleteWithTools(String),
+    }
+
+    struct SequenceLlm {
+        responses: Mutex<VecDeque<ScriptedLlmResponse>>,
+        complete_calls: AtomicU32,
+        complete_with_tools_calls: AtomicU32,
+    }
+
+    impl SequenceLlm {
+        fn new(responses: Vec<ScriptedLlmResponse>) -> Self {
+            Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+                complete_calls: AtomicU32::new(0),
+                complete_with_tools_calls: AtomicU32::new(0),
+            }
+        }
+
+        fn pop(&self) -> Result<ScriptedLlmResponse, LlmError> {
+            self.responses
+                .lock()
+                .expect("sequence llm mutex poisoned")
+                .pop_front()
+                .ok_or_else(|| LlmError::InvalidResponse {
+                    provider: "sequence-llm".to_string(),
+                    reason: "No scripted LLM responses remain".to_string(),
+                })
+        }
+
+        fn remaining(&self) -> usize {
+            self.responses
+                .lock()
+                .expect("sequence llm mutex poisoned")
+                .len()
+        }
+
+        fn complete_calls(&self) -> u32 {
+            self.complete_calls.load(Ordering::Relaxed)
+        }
+
+        fn complete_with_tools_calls(&self) -> u32 {
+            self.complete_with_tools_calls.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SequenceLlm {
+        fn model_name(&self) -> &str {
+            "sequence-llm"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            self.complete_calls.fetch_add(1, Ordering::Relaxed);
+            match self.pop()? {
+                ScriptedLlmResponse::Complete(content) => Ok(CompletionResponse {
+                    content,
+                    input_tokens: 10,
+                    output_tokens: 10,
+                    finish_reason: FinishReason::Stop,
+                    response_id: None,
+                }),
+                ScriptedLlmResponse::CompleteWithTools(_) => Err(LlmError::InvalidResponse {
+                    provider: self.model_name().to_string(),
+                    reason: "Scripted response kind mismatch: expected complete()".to_string(),
+                }),
+            }
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, LlmError> {
+            self.complete_with_tools_calls
+                .fetch_add(1, Ordering::Relaxed);
+            match self.pop()? {
+                ScriptedLlmResponse::CompleteWithTools(content) => Ok(ToolCompletionResponse {
+                    content: Some(content),
+                    tool_calls: Vec::new(),
+                    input_tokens: 10,
+                    output_tokens: 10,
+                    finish_reason: FinishReason::Stop,
+                    response_id: None,
+                }),
+                ScriptedLlmResponse::Complete(_) => Err(LlmError::InvalidResponse {
+                    provider: self.model_name().to_string(),
+                    reason: "Scripted response kind mismatch: expected complete_with_tools()"
+                        .to_string(),
+                }),
+            }
         }
     }
 
@@ -2282,5 +2390,164 @@ mod tests {
             crate::agent::PlanVerificationStatus::Inconclusive
         );
         assert_eq!(verifications[0].completion_claimed, true);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_worker_run_step_failure_triggers_replan_and_completes_new_revision() {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(NoopTool)).await;
+
+        let scripted_llm = Arc::new(SequenceLlm::new(vec![
+            ScriptedLlmResponse::Complete(
+                serde_json::json!({
+                    "goal": "Fix the issue",
+                    "actions": [{
+                        "tool_name": "missing_tool",
+                        "parameters": {},
+                        "reasoning": "Try a tool that does not exist",
+                        "expected_outcome": "This should fail and trigger replan"
+                    }],
+                    "estimated_cost": null,
+                    "estimated_time_secs": 5,
+                    "confidence": 0.7
+                })
+                .to_string(),
+            ),
+            ScriptedLlmResponse::Complete(
+                serde_json::json!({
+                    "goal": "Fix the issue",
+                    "actions": [{
+                        "tool_name": "noop_tool",
+                        "parameters": {},
+                        "reasoning": "Run the available tool to finish the task",
+                        "expected_outcome": "Successful no-op"
+                    }],
+                    "estimated_cost": null,
+                    "estimated_time_secs": 5,
+                    "confidence": 0.9
+                })
+                .to_string(),
+            ),
+            ScriptedLlmResponse::CompleteWithTools("The job is complete.".to_string()),
+        ]));
+        let llm: Arc<dyn LlmProvider> = scripted_llm.clone();
+
+        let harness = TestHarnessBuilder::new()
+            .with_tools(Arc::clone(&tools))
+            .with_llm(Arc::clone(&llm))
+            .build()
+            .await;
+
+        let context_manager = Arc::new(ContextManager::new(4));
+        let job_id = context_manager
+            .create_job_for_user("user-1", "Replan test", "Trigger an automatic replan")
+            .await
+            .expect("create job");
+        context_manager
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(JobState::InProgress, Some("test setup".to_string()))
+            })
+            .await
+            .expect("update context")
+            .expect("transition to in_progress");
+
+        let worker = Worker::new(
+            job_id,
+            WorkerDeps {
+                context_manager: Arc::clone(&context_manager),
+                llm: Arc::clone(&llm),
+                safety: harness.deps.safety.clone(),
+                tools: Arc::clone(&tools),
+                store: Some(harness.db.clone()),
+                hooks: Arc::new(HookRegistry::new()),
+                timeout: Duration::from_secs(10),
+                use_planning: true,
+                autonomy_policy_engine_v1: true,
+                autonomy_verifier_v1: true,
+                autonomy_replanner_v1: true,
+            },
+        );
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(crate::agent::scheduler::WorkerMessage::Start)
+            .await
+            .expect("send start");
+        worker.run(rx).await.expect("worker run");
+
+        let ctx = context_manager
+            .get_context(job_id)
+            .await
+            .expect("job context");
+        assert_eq!(ctx.state, JobState::Completed);
+        let goal_id = ctx.autonomy_goal_id.expect("goal link persisted");
+        let final_plan_id = ctx.autonomy_plan_id.expect("plan link persisted");
+
+        let goal = harness
+            .db
+            .get_goal(goal_id)
+            .await
+            .expect("get goal")
+            .expect("goal exists");
+        assert_eq!(goal.status, GoalStatus::Completed);
+
+        let mut plans = harness
+            .db
+            .list_plans_for_goal(goal_id)
+            .await
+            .expect("list plans");
+        plans.sort_by_key(|p| p.revision);
+        assert_eq!(
+            plans.len(),
+            2,
+            "expected initial plan plus one replan revision"
+        );
+        assert_eq!(plans[0].revision, 1);
+        assert_eq!(plans[0].status, PlanStatus::Superseded);
+        assert_eq!(plans[1].revision, 2);
+        assert_eq!(plans[1].status, PlanStatus::Completed);
+        assert_eq!(plans[1].id, final_plan_id);
+
+        let rev1_steps = harness
+            .db
+            .list_plan_steps_for_plan(plans[0].id)
+            .await
+            .expect("list rev1 steps");
+        let rev2_steps = harness
+            .db
+            .list_plan_steps_for_plan(plans[1].id)
+            .await
+            .expect("list rev2 steps");
+        assert_eq!(rev1_steps.len(), 1);
+        assert_eq!(rev2_steps.len(), 1);
+        assert_eq!(rev1_steps[0].status, PlanStepStatus::Failed);
+        assert_eq!(rev2_steps[0].status, PlanStepStatus::Succeeded);
+        assert!(rev1_steps[0].sequence_num > 0);
+        assert!(rev2_steps[0].sequence_num > 0);
+
+        let rev1_verifications = harness
+            .db
+            .list_plan_verifications_for_plan(plans[0].id)
+            .await
+            .expect("list rev1 verifications");
+        let rev2_verifications = harness
+            .db
+            .list_plan_verifications_for_plan(plans[1].id)
+            .await
+            .expect("list rev2 verifications");
+        assert!(
+            rev1_verifications.is_empty(),
+            "step failure replan should occur before final completion verification"
+        );
+        assert_eq!(rev2_verifications.len(), 1);
+        assert_eq!(
+            rev2_verifications[0].status,
+            crate::agent::PlanVerificationStatus::Passed
+        );
+        assert!(rev2_verifications[0].completion_claimed);
+
+        assert_eq!(scripted_llm.complete_calls(), 2);
+        assert_eq!(scripted_llm.complete_with_tools_calls(), 1);
+        assert_eq!(scripted_llm.remaining(), 0);
     }
 }
