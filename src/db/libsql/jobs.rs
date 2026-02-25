@@ -116,6 +116,9 @@ impl JobStore for LibSqlBackend {
                     completed_at: get_opt_ts(&row, 16),
                     transitions: Vec::new(),
                     metadata: serde_json::Value::Null,
+                    autonomy_goal_id: None,
+                    autonomy_plan_id: None,
+                    autonomy_plan_step_id: None,
                     extra_env: std::sync::Arc::new(std::collections::HashMap::new()),
                 }))
             }

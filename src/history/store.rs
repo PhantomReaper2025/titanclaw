@@ -237,6 +237,9 @@ impl Store {
                     completed_at: row.get("completed_at"),
                     transitions: Vec::new(), // Not loaded from DB for now
                     metadata: serde_json::Value::Null,
+                    autonomy_goal_id: None,
+                    autonomy_plan_id: None,
+                    autonomy_plan_step_id: None,
                     total_tokens_used: 0,
                     max_tokens: 0,
                     extra_env: std::sync::Arc::new(std::collections::HashMap::new()),

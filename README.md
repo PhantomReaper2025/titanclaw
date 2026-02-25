@@ -46,7 +46,7 @@ Based on `implementation_plan.md`, this is where the upgrade stands today.
 | Conversational profile onboarding | ✅ | OpenClaw-style first-chat onboarding asks who you are, what TitanClaw should mainly do, tone/work style, and boundaries; uses a soft-block flow with review+confirm and writes managed baseline sections into the same core docs |
 | Session/thread workflow hardening | ✅ | Gateway/web external UUID thread IDs are preserved during resolution (reduces hydrate/resolve races and duplicate-thread mismatches) while non-gateway channels stay channel-scoped, and stale approval waits auto-expire instead of blocking sessions indefinitely |
 | Chat durability/error-path hardening | ✅ | Conversation persistence retries on DB failures with in-channel warning on final failure, `try_start_turn()` guards prevent invalid turn starts in runtime paths, and approval rejection/resume paths now persist and close turns consistently |
-| Autonomy Control Plane v1 groundwork (internal) | 🚧 | DB-backed autonomy tables (`goals`, `plans`, `plan_steps`, execution/policy records) and dual-backend store implementations are in place; worker planned runs and dispatcher approval/tool attempts now best-effort persist internal autonomy records (no user-facing goal/plan APIs yet) |
+| Autonomy Control Plane v1 groundwork (internal) | 🚧 | DB-backed autonomy tables (`goals`, `plans`, `plan_steps`, execution/policy records) and dual-backend store implementations are in place; worker planned runs and dispatcher approval/tool attempts now best-effort persist internal autonomy records, and the web gateway exposes read-only inspection endpoints for goals/plans (`/api/goals*`, `/api/plans*`) |
 
 ## Capabilities
 
@@ -82,6 +82,7 @@ Based on `implementation_plan.md`, this is where the upgrade stands today.
 - Shadow-worker speculative response cache for likely follow-up prompts (bounded + TTL)
 - Kernel monitor runtime loop for slow-tool detection with optional JIT patch deploy pipeline
 - Internal Autonomy Control Plane v1 persistence scaffolding (goal/plan/step + execution/policy records in Postgres and libSQL)
+- Read-only web inspection endpoints for autonomy goals/plans (`GET /api/goals`, `GET /api/goals/{id}`, `GET /api/goals/{id}/plans`, `GET /api/plans?goal_id=...`, `GET /api/plans/{id}`)
 
 ### Current TODO
 

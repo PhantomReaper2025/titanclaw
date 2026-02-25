@@ -118,6 +118,7 @@ fn failure_class_to_string(
 fn persist_policy_decision_best_effort(
     agent: &Agent,
     message: &IncomingMessage,
+    job_ctx: &JobContext,
     tool_name: &str,
     tool_call_id: &str,
     decision: TelemetryPolicyDecisionKind,
@@ -129,9 +130,9 @@ fn persist_policy_decision_best_effort(
     };
     let record = AutonomyPolicyDecision {
         id: Uuid::new_v4(),
-        goal_id: None,
-        plan_id: None,
-        plan_step_id: None,
+        goal_id: job_ctx.autonomy_goal_id,
+        plan_id: job_ctx.autonomy_plan_id,
+        plan_step_id: job_ctx.autonomy_plan_step_id,
         execution_attempt_id: None,
         user_id: message.user_id.clone(),
         channel: message.channel.clone(),
@@ -173,9 +174,9 @@ fn persist_execution_attempt_best_effort(
     };
     let record = AutonomyExecutionAttempt {
         id: Uuid::new_v4(),
-        goal_id: None,
-        plan_id: None,
-        plan_step_id: None,
+        goal_id: job_ctx.autonomy_goal_id,
+        plan_id: job_ctx.autonomy_plan_id,
+        plan_step_id: job_ctx.autonomy_plan_step_id,
         job_id: Some(job_ctx.job_id),
         thread_id: Some(thread_id),
         user_id: message.user_id.clone(),
@@ -896,6 +897,7 @@ impl Agent {
                                 persist_policy_decision_best_effort(
                                     self,
                                     message,
+                                    &job_ctx,
                                     &tc.name,
                                     &tc.id,
                                     TelemetryPolicyDecisionKind::RequireApproval,
@@ -928,6 +930,7 @@ impl Agent {
                             persist_policy_decision_best_effort(
                                 self,
                                 message,
+                                &job_ctx,
                                 &tc.name,
                                 &tc.id,
                                 TelemetryPolicyDecisionKind::Allow,
@@ -959,6 +962,7 @@ impl Agent {
                                     persist_policy_decision_best_effort(
                                         self,
                                         message,
+                                        &job_ctx,
                                         &tc.name,
                                         &tc.id,
                                         TelemetryPolicyDecisionKind::Deny,
@@ -986,6 +990,7 @@ impl Agent {
                                     persist_policy_decision_best_effort(
                                         self,
                                         message,
+                                        &job_ctx,
                                         &tc.name,
                                         &tc.id,
                                         TelemetryPolicyDecisionKind::Deny,
@@ -1018,6 +1023,7 @@ impl Agent {
                                         persist_policy_decision_best_effort(
                                             self,
                                             message,
+                                            &job_ctx,
                                             &tc.name,
                                             &tc.id,
                                             TelemetryPolicyDecisionKind::Modify,

@@ -137,6 +137,12 @@ pub struct JobContext {
     pub transitions: Vec<StateTransition>,
     /// Metadata.
     pub metadata: serde_json::Value,
+    /// Linked autonomy goal (control-plane v1), if this job is associated.
+    pub autonomy_goal_id: Option<Uuid>,
+    /// Linked autonomy plan (control-plane v1), if this job is associated.
+    pub autonomy_plan_id: Option<Uuid>,
+    /// Linked autonomy plan step currently executing, if known.
+    pub autonomy_plan_step_id: Option<Uuid>,
     /// Extra environment variables to inject into spawned child processes.
     ///
     /// Used by the worker runtime to pass fetched credentials to tools
@@ -181,8 +187,11 @@ impl JobContext {
             completed_at: None,
             repair_attempts: 0,
             transitions: Vec::new(),
-            extra_env: Arc::new(HashMap::new()),
             metadata: serde_json::Value::Null,
+            autonomy_goal_id: None,
+            autonomy_plan_id: None,
+            autonomy_plan_step_id: None,
+            extra_env: Arc::new(HashMap::new()),
         }
     }
 
@@ -280,6 +289,17 @@ impl JobContext {
         }
         self.repair_attempts += 1;
         self.transition_to(JobState::InProgress, Some("Recovery attempt".to_string()))
+    }
+
+    /// Attach autonomy control-plane linkage IDs to this job context.
+    pub fn set_autonomy_links(&mut self, goal_id: Option<Uuid>, plan_id: Option<Uuid>) {
+        self.autonomy_goal_id = goal_id;
+        self.autonomy_plan_id = plan_id;
+    }
+
+    /// Set the currently executing autonomy plan step for this job.
+    pub fn set_autonomy_plan_step(&mut self, plan_step_id: Option<Uuid>) {
+        self.autonomy_plan_step_id = plan_step_id;
     }
 }
 

@@ -198,6 +198,23 @@ impl Worker {
             return None;
         }
 
+        if let Err(e) = self
+            .context_manager()
+            .update_context(self.job_id, |ctx| {
+                ctx.set_autonomy_links(Some(goal_id), Some(plan_id));
+                ctx.set_autonomy_plan_step(None);
+            })
+            .await
+        {
+            tracing::warn!(
+                job = %self.job_id,
+                goal_id = %goal_id,
+                plan_id = %plan_id,
+                "Failed to attach autonomy linkage to job context: {}",
+                e
+            );
+        }
+
         Some(PersistedPlanRun {
             goal_id,
             plan_id,
@@ -932,6 +949,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             {
                 self.set_plan_step_status_best_effort(*step_id, PlanStepStatus::Running)
                     .await;
+                let _ = self
+                    .context_manager()
+                    .update_context(self.job_id, |ctx| {
+                        ctx.set_autonomy_plan_step(Some(*step_id));
+                    })
+                    .await;
             }
 
             // Execute the planned tool
@@ -977,6 +1000,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     PlanStepStatus::Failed
                 };
                 self.set_plan_step_status_best_effort(*step_id, status)
+                    .await;
+                let _ = self
+                    .context_manager()
+                    .update_context(self.job_id, |ctx| {
+                        ctx.set_autonomy_plan_step(None);
+                    })
                     .await;
             }
 

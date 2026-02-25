@@ -62,6 +62,7 @@ When behavior changes, keep these docs aligned in the same branch:
 - Autonomy Control Plane v1 groundwork (internal persistence):
   - versioned autonomy domain types and dual-backend (PostgreSQL/libSQL) autonomy tables exist for goals/plans/plan steps/execution attempts/policy decisions/incidents
   - worker planned executions and dispatcher approval/tool-attempt paths now best-effort persist internal autonomy records (tracing emitters and approval UX remain unchanged)
+  - web gateway now exposes read-only inspection endpoints for autonomy goals/plans (`GET /api/goals`, `GET /api/goals/{id}`, `GET /api/goals/{id}/plans`, `GET /api/plans`, `GET /api/plans/{id}`) with user scoping
 - Web gateway auth/render hardening:
   - SSE query-token auth accepts URL-encoded tokens
   - WebSocket Origin validation parses loopback hosts correctly (including IPv6)

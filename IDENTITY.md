@@ -20,6 +20,7 @@
   - `CODING_RUNTIME_DEFAULT`
   - `OPENCODE_MODEL_DEFAULT`
 - Internal autonomy control-plane v1 persistence is now scaffolded across both PostgreSQL and libSQL backends (goals/plans/plan steps/execution attempts/policy decisions/incidents), with worker/dispatcher runtime paths best-effort writing records for planned worker runs and chat tool policy/execution events.
+- Web gateway exposes read-only autonomy inspection endpoints for goals/plans (user-scoped) to aid validation of the new persistence layer before write/management APIs are added.
 
 ## UX and Operations Identity
 
