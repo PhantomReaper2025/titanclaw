@@ -13,22 +13,26 @@
 
 mod config;
 mod doctor;
+mod goal;
 mod mcp;
 pub mod memory;
 pub mod oauth_defaults;
 mod pairing;
+mod plan;
 mod service;
 pub mod status;
 mod tool;
 
 pub use config::{ConfigCommand, run_config_command};
 pub use doctor::run_doctor_command;
+pub use goal::{GoalCommand, run_goal_command};
 pub use mcp::{McpCommand, run_mcp_command};
 pub use memory::MemoryCommand;
 #[cfg(feature = "postgres")]
 pub use memory::run_memory_command;
 pub use memory::run_memory_command_with_db;
 pub use pairing::{PairingCommand, run_pairing_command, run_pairing_command_with_store};
+pub use plan::{PlanCommand, run_plan_command};
 pub use service::{ServiceCommand, run_service_command};
 pub use status::run_status_command;
 pub use tool::{ToolCommand, run_tool_command};
@@ -101,6 +105,14 @@ pub enum Command {
     /// DM pairing (approve inbound requests from unknown senders)
     #[command(subcommand)]
     Pairing(PairingCommand),
+
+    /// Manage autonomous goals
+    #[command(subcommand)]
+    Goal(GoalCommand),
+
+    /// Manage autonomous plans
+    #[command(subcommand)]
+    Plan(PlanCommand),
 
     /// Manage OS service (launchd / systemd)
     #[command(subcommand)]
