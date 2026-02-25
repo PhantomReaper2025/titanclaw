@@ -100,6 +100,16 @@ pub enum GoalCommand {
         user_id: String,
     },
 
+    /// Cancel a goal (alias for abandoned)
+    Cancel {
+        /// Goal ID
+        id: Uuid,
+
+        /// Owner user ID to validate access
+        #[arg(long, default_value = DEFAULT_USER_ID)]
+        user_id: String,
+    },
+
     /// Mark a goal as abandoned
     Abandon {
         /// Goal ID
@@ -152,6 +162,9 @@ pub async fn run_goal_command(cmd: GoalCommand) -> anyhow::Result<()> {
         } => set_goal_priority(db.as_ref(), id, priority, &user_id).await,
         GoalCommand::Complete { id, user_id } => {
             set_goal_status(db.as_ref(), id, "completed", &user_id).await
+        }
+        GoalCommand::Cancel { id, user_id } => {
+            set_goal_status(db.as_ref(), id, "abandoned", &user_id).await
         }
         GoalCommand::Abandon { id, user_id } => {
             set_goal_status(db.as_ref(), id, "abandoned", &user_id).await

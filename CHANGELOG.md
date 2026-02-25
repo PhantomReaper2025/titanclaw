@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Atomic plan-step replacement support for replans: `POST /api/plans/{id}/steps/replace` and `titanclaw plan-step replace`, backed by transactional `replace_plan_steps_for_plan` implementations in PostgreSQL and libSQL.
 - Plan revisioning actions: `POST /api/plans/{id}/replan` and `titanclaw plan replan` create the next plan revision from an existing plan with optional metadata overrides, optional superseding of the source plan, and optional source-step copying into the new revision.
 - Replan now also supports inline step payloads in one call: `POST /api/plans/{id}/replan` accepts `steps`, and `titanclaw plan replan` accepts `--steps-file` / `--steps-json` (mutually exclusive with step-copy mode).
-- Goal/plan lifecycle convenience actions: web aliases (`POST /api/goals/{id}/complete`, `/abandon`, `POST /api/plans/{id}/complete`, `/supersede`) and matching CLI aliases (`titanclaw goal complete|abandon`, `titanclaw plan complete|supersede`) on top of the existing status-update APIs.
+- Goal/plan lifecycle convenience actions: web aliases (`POST /api/goals/{id}/cancel`, `/complete`, `/abandon`, `POST /api/plans/{id}/cancel`, `/complete`, `/supersede`) and matching CLI aliases (`titanclaw goal cancel|complete|abandon`, `titanclaw plan cancel|complete|supersede`) on top of the existing status-update APIs.
 - Goal reprioritization support: `POST /api/goals/{id}/priority` and `titanclaw goal set-priority` with user-scoped ownership checks (PostgreSQL + libSQL).
 - Goal/plan list filtering support: web list endpoints accept optional `status` and `limit` query params, and CLI `goal list` / `plan list` now support `--status` and `--limit`.
 

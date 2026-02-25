@@ -233,6 +233,7 @@ pub async fn start_server(
             "/api/goals/{id}/priority",
             post(goals_priority_update_handler),
         )
+        .route("/api/goals/{id}/cancel", post(goals_cancel_handler))
         .route("/api/goals/{id}/complete", post(goals_complete_handler))
         .route("/api/goals/{id}/abandon", post(goals_abandon_handler))
         .route(
@@ -246,6 +247,7 @@ pub async fn start_server(
         )
         .route("/api/plans/{id}", get(plans_detail_handler))
         .route("/api/plans/{id}/status", post(plans_status_update_handler))
+        .route("/api/plans/{id}/cancel", post(plans_cancel_handler))
         .route("/api/plans/{id}/complete", post(plans_complete_handler))
         .route("/api/plans/{id}/supersede", post(plans_supersede_handler))
         .route("/api/plans/{id}/replan", post(plans_replan_handler))
@@ -3378,6 +3380,26 @@ async fn goals_complete_handler(
     Ok(Json(serde_json::json!({ "goal": updated })))
 }
 
+async fn goals_cancel_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let goal_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid goal ID".to_string()))?;
+    let updated = update_owned_goal_status_and_load(
+        state.as_ref(),
+        store.as_ref(),
+        goal_id,
+        GoalStatus::Abandoned,
+    )
+    .await?;
+    Ok(Json(serde_json::json!({ "goal": updated })))
+}
+
 async fn goals_abandon_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
@@ -3672,6 +3694,26 @@ async fn plans_complete_handler(
         store.as_ref(),
         plan_id,
         PlanStatus::Completed,
+    )
+    .await?;
+    Ok(Json(serde_json::json!({ "plan": updated })))
+}
+
+async fn plans_cancel_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let plan_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plan ID".to_string()))?;
+    let updated = update_owned_plan_status_and_load(
+        state.as_ref(),
+        store.as_ref(),
+        plan_id,
+        PlanStatus::Superseded,
     )
     .await?;
     Ok(Json(serde_json::json!({ "plan": updated })))
@@ -4907,7 +4949,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_goals_complete_and_abandon_handlers_update_owned_goal_status() {
+    async fn test_goals_complete_cancel_and_abandon_handlers_update_owned_goal_status() {
         let (_dir, store) = make_test_store().await;
         let state = make_test_gateway_state("alice", store.clone());
         let (goal, _plan) = seed_goal_and_plan(store.as_ref(), "alice").await;
@@ -4925,6 +4967,19 @@ mod tests {
             .expect("goal exists");
         assert_eq!(after_complete.status, GoalStatus::Completed);
         assert!(after_complete.completed_at.is_some());
+
+        let Json(cancel_body) =
+            goals_cancel_handler(State(state.clone()), Path(goal.id.to_string()))
+                .await
+                .expect("cancel goal");
+        assert_eq!(cancel_body["goal"]["status"], json!("abandoned"));
+
+        let after_cancel = store
+            .get_goal(goal.id)
+            .await
+            .expect("reload goal")
+            .expect("goal exists");
+        assert_eq!(after_cancel.status, GoalStatus::Abandoned);
 
         let Json(abandon_body) = goals_abandon_handler(State(state), Path(goal.id.to_string()))
             .await
@@ -4959,6 +5014,19 @@ mod tests {
             .expect("plan exists");
         assert_eq!(after_complete.status, PlanStatus::Completed);
 
+        let Json(cancel_body) =
+            plans_cancel_handler(State(alice_state.clone()), Path(plan.id.to_string()))
+                .await
+                .expect("cancel plan");
+        assert_eq!(cancel_body["plan"]["status"], json!("superseded"));
+
+        let after_cancel = store
+            .get_plan(plan.id)
+            .await
+            .expect("reload plan")
+            .expect("plan exists");
+        assert_eq!(after_cancel.status, PlanStatus::Superseded);
+
         let Json(supersede_body) =
             plans_supersede_handler(State(alice_state), Path(plan.id.to_string()))
                 .await
@@ -4972,7 +5040,7 @@ mod tests {
             .expect("plan exists");
         assert_eq!(after_supersede.status, PlanStatus::Superseded);
 
-        let err = plans_complete_handler(State(bob_state), Path(plan.id.to_string()))
+        let err = plans_cancel_handler(State(bob_state), Path(plan.id.to_string()))
             .await
             .unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);

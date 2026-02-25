@@ -97,6 +97,16 @@ pub enum PlanCommand {
         user_id: String,
     },
 
+    /// Cancel a plan revision (alias for superseded)
+    Cancel {
+        /// Plan ID
+        id: Uuid,
+
+        /// Owner user ID (used to validate goal ownership)
+        #[arg(long, default_value = DEFAULT_USER_ID)]
+        user_id: String,
+    },
+
     /// Mark a plan as superseded
     Supersede {
         /// Plan ID
@@ -197,6 +207,9 @@ pub async fn run_plan_command(cmd: PlanCommand) -> anyhow::Result<()> {
         } => set_plan_status(db.as_ref(), id, &status, &user_id).await,
         PlanCommand::Complete { id, user_id } => {
             set_plan_status(db.as_ref(), id, "completed", &user_id).await
+        }
+        PlanCommand::Cancel { id, user_id } => {
+            set_plan_status(db.as_ref(), id, "superseded", &user_id).await
         }
         PlanCommand::Supersede { id, user_id } => {
             set_plan_status(db.as_ref(), id, "superseded", &user_id).await
