@@ -68,6 +68,26 @@ pub enum GoalCommand {
         #[arg(long, default_value = DEFAULT_USER_ID)]
         user_id: String,
     },
+
+    /// Mark a goal as completed
+    Complete {
+        /// Goal ID
+        id: Uuid,
+
+        /// Owner user ID to validate access
+        #[arg(long, default_value = DEFAULT_USER_ID)]
+        user_id: String,
+    },
+
+    /// Mark a goal as abandoned
+    Abandon {
+        /// Goal ID
+        id: Uuid,
+
+        /// Owner user ID to validate access
+        #[arg(long, default_value = DEFAULT_USER_ID)]
+        user_id: String,
+    },
 }
 
 pub async fn run_goal_command(cmd: GoalCommand) -> anyhow::Result<()> {
@@ -100,6 +120,12 @@ pub async fn run_goal_command(cmd: GoalCommand) -> anyhow::Result<()> {
             status,
             user_id,
         } => set_goal_status(db.as_ref(), id, &status, &user_id).await,
+        GoalCommand::Complete { id, user_id } => {
+            set_goal_status(db.as_ref(), id, "completed", &user_id).await
+        }
+        GoalCommand::Abandon { id, user_id } => {
+            set_goal_status(db.as_ref(), id, "abandoned", &user_id).await
+        }
     }
 }
 

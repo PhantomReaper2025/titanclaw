@@ -229,6 +229,8 @@ pub async fn start_server(
         )
         .route("/api/goals/{id}", get(goals_detail_handler))
         .route("/api/goals/{id}/status", post(goals_status_update_handler))
+        .route("/api/goals/{id}/complete", post(goals_complete_handler))
+        .route("/api/goals/{id}/abandon", post(goals_abandon_handler))
         .route(
             "/api/goals/{id}/policy-decisions",
             get(goal_policy_decisions_list_handler),
@@ -240,6 +242,8 @@ pub async fn start_server(
         )
         .route("/api/plans/{id}", get(plans_detail_handler))
         .route("/api/plans/{id}/status", post(plans_status_update_handler))
+        .route("/api/plans/{id}/complete", post(plans_complete_handler))
+        .route("/api/plans/{id}/supersede", post(plans_supersede_handler))
         .route("/api/plans/{id}/replan", post(plans_replan_handler))
         .route(
             "/api/plans/{id}/executions",
@@ -3230,6 +3234,35 @@ async fn goals_detail_handler(
     Ok(Json(serde_json::json!({ "goal": goal })))
 }
 
+async fn update_owned_goal_status_and_load(
+    state: &GatewayState,
+    store: &dyn Database,
+    goal_id: Uuid,
+    status: GoalStatus,
+) -> Result<Goal, (StatusCode, String)> {
+    let goal = store
+        .get_goal(goal_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .filter(|g| g.owner_user_id == state.user_id)
+        .ok_or((StatusCode::NOT_FOUND, "Goal not found".to_string()))?;
+
+    store
+        .update_goal_status(goal.id, status)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    store
+        .get_goal(goal.id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .filter(|g| g.owner_user_id == state.user_id)
+        .ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Goal disappeared after update".to_string(),
+        ))
+}
+
 async fn goals_status_update_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
@@ -3242,29 +3275,50 @@ async fn goals_status_update_handler(
 
     let goal_id = Uuid::parse_str(&id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid goal ID".to_string()))?;
+    let updated =
+        update_owned_goal_status_and_load(state.as_ref(), store.as_ref(), goal_id, body.status)
+            .await?;
 
-    let goal = store
-        .get_goal(goal_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .filter(|g| g.owner_user_id == state.user_id)
-        .ok_or((StatusCode::NOT_FOUND, "Goal not found".to_string()))?;
+    Ok(Json(serde_json::json!({ "goal": updated })))
+}
 
-    store
-        .update_goal_status(goal.id, body.status)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+async fn goals_complete_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let goal_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid goal ID".to_string()))?;
+    let updated = update_owned_goal_status_and_load(
+        state.as_ref(),
+        store.as_ref(),
+        goal_id,
+        GoalStatus::Completed,
+    )
+    .await?;
+    Ok(Json(serde_json::json!({ "goal": updated })))
+}
 
-    let updated = store
-        .get_goal(goal.id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .filter(|g| g.owner_user_id == state.user_id)
-        .ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Goal disappeared after update".to_string(),
-        ))?;
-
+async fn goals_abandon_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let goal_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid goal ID".to_string()))?;
+    let updated = update_owned_goal_status_and_load(
+        state.as_ref(),
+        store.as_ref(),
+        goal_id,
+        GoalStatus::Abandoned,
+    )
+    .await?;
     Ok(Json(serde_json::json!({ "goal": updated })))
 }
 
@@ -3462,19 +3516,12 @@ async fn plans_detail_handler(
     Ok(Json(serde_json::json!({ "plan": plan })))
 }
 
-async fn plans_status_update_handler(
-    State(state): State<Arc<GatewayState>>,
-    Path(id): Path<String>,
-    Json(body): Json<PlanStatusUpdateRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let store = state.store.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
-    ))?;
-
-    let plan_id = Uuid::parse_str(&id)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plan ID".to_string()))?;
-
+async fn update_owned_plan_status_and_load(
+    state: &GatewayState,
+    store: &dyn Database,
+    plan_id: Uuid,
+    status: PlanStatus,
+) -> Result<Plan, (StatusCode, String)> {
     let plan = store
         .get_plan(plan_id)
         .await
@@ -3492,19 +3539,76 @@ async fn plans_status_update_handler(
     }
 
     store
-        .update_plan_status(plan.id, body.status)
+        .update_plan_status(plan.id, status)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let updated = store
+    store
         .get_plan(plan.id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
             "Plan disappeared after update".to_string(),
-        ))?;
+        ))
+}
 
+async fn plans_status_update_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(body): Json<PlanStatusUpdateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let plan_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plan ID".to_string()))?;
+    let updated =
+        update_owned_plan_status_and_load(state.as_ref(), store.as_ref(), plan_id, body.status)
+            .await?;
+
+    Ok(Json(serde_json::json!({ "plan": updated })))
+}
+
+async fn plans_complete_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let plan_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plan ID".to_string()))?;
+    let updated = update_owned_plan_status_and_load(
+        state.as_ref(),
+        store.as_ref(),
+        plan_id,
+        PlanStatus::Completed,
+    )
+    .await?;
+    Ok(Json(serde_json::json!({ "plan": updated })))
+}
+
+async fn plans_supersede_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let plan_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plan ID".to_string()))?;
+    let updated = update_owned_plan_status_and_load(
+        state.as_ref(),
+        store.as_ref(),
+        plan_id,
+        PlanStatus::Superseded,
+    )
+    .await?;
     Ok(Json(serde_json::json!({ "plan": updated })))
 }
 

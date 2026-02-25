@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - User-scoped autonomy telemetry inspection endpoints (`GET /api/plans/{id}/executions`, `GET /api/goals/{id}/policy-decisions`) to inspect persisted runtime execution attempts and policy decisions from worker/dispatcher instrumentation.
 - Atomic plan-step replacement support for replans: `POST /api/plans/{id}/steps/replace` and `titanclaw plan-step replace`, backed by transactional `replace_plan_steps_for_plan` implementations in PostgreSQL and libSQL.
 - Plan revisioning actions: `POST /api/plans/{id}/replan` and `titanclaw plan replan` create the next plan revision from an existing plan with optional metadata overrides, optional superseding of the source plan, and optional source-step copying into the new revision.
+- Goal/plan lifecycle convenience actions: web aliases (`POST /api/goals/{id}/complete`, `/abandon`, `POST /api/plans/{id}/complete`, `/supersede`) and matching CLI aliases (`titanclaw goal complete|abandon`, `titanclaw plan complete|supersede`) on top of the existing status-update APIs.
 
 ### Changed
 
