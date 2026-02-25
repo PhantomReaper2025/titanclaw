@@ -9,6 +9,9 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::agent::policy_engine::{
+    ApprovalPolicyOutcome, evaluate_dispatcher_tool_approval, evaluate_worker_tool_approval,
+};
 use crate::agent::task::{Task, TaskContext, TaskOutput};
 use crate::agent::worker::{Worker, WorkerDeps};
 use crate::config::AgentConfig;
@@ -588,7 +591,9 @@ impl Scheduler {
             .into());
         }
 
-        if tool.requires_approval() {
+        if let ApprovalPolicyOutcome::RequireApproval { .. } =
+            evaluate_worker_tool_approval(tool.as_ref())
+        {
             return Err(crate::error::ToolError::AuthRequired {
                 name: tool_name.to_string(),
             }
@@ -782,7 +787,9 @@ async fn decide_offload(
         return OffloadDecision::LocalOnly;
     };
 
-    if tool.requires_approval() || tool.requires_approval_for(params) {
+    if let ApprovalPolicyOutcome::RequireApproval { .. } =
+        evaluate_dispatcher_tool_approval(tool.as_ref(), params, false)
+    {
         return OffloadDecision::LocalOnly;
     }
 

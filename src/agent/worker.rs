@@ -95,6 +95,88 @@ fn classify_replan_reason_for_step_error(err: &Error) -> Option<ReplanReason> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct StepEvidenceClassification {
+    kind: AutonomyEvidenceKind,
+    check_kind: &'static str,
+    command_hint: Option<&'static str>,
+}
+
+fn classify_step_evidence(
+    tool_name: &str,
+    parameters: &serde_json::Value,
+    reasoning: &str,
+) -> StepEvidenceClassification {
+    let tool_name_lower = tool_name.to_ascii_lowercase();
+    let reasoning_lower = reasoning.to_ascii_lowercase();
+    let command_lower = parameters
+        .get("command")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let looks_like_test = tool_name_lower.contains("test")
+        || command_lower.contains("cargo test")
+        || command_lower.contains("pytest")
+        || command_lower.contains("npm test")
+        || command_lower.contains("pnpm test")
+        || command_lower.contains("yarn test")
+        || reasoning_lower.contains("test");
+    if looks_like_test {
+        return StepEvidenceClassification {
+            kind: AutonomyEvidenceKind::TestRun,
+            check_kind: "test",
+            command_hint: (!command_lower.is_empty()).then_some("command"),
+        };
+    }
+
+    let looks_like_lint = tool_name_lower.contains("lint")
+        || command_lower.contains("cargo clippy")
+        || command_lower.contains("cargo check")
+        || command_lower.contains("eslint")
+        || command_lower.contains("ruff")
+        || command_lower.contains("golangci-lint")
+        || reasoning_lower.contains("lint")
+        || reasoning_lower.contains("compile check");
+    if looks_like_lint {
+        return StepEvidenceClassification {
+            kind: AutonomyEvidenceKind::TestRun,
+            check_kind: "lint_or_check",
+            command_hint: (!command_lower.is_empty()).then_some("command"),
+        };
+    }
+
+    let looks_like_diff = tool_name_lower.contains("diff")
+        || command_lower.contains("git diff")
+        || command_lower.contains("diff --")
+        || reasoning_lower.contains("diff")
+        || reasoning_lower.contains("patch");
+    if looks_like_diff {
+        return StepEvidenceClassification {
+            kind: AutonomyEvidenceKind::FileDiff,
+            check_kind: "diff",
+            command_hint: (!command_lower.is_empty()).then_some("command"),
+        };
+    }
+
+    if tool_name_lower.contains("shell")
+        || tool_name_lower.contains("command")
+        || tool_name_lower.contains("exec")
+    {
+        return StepEvidenceClassification {
+            kind: AutonomyEvidenceKind::CommandOutput,
+            check_kind: "command_output",
+            command_hint: (!command_lower.is_empty()).then_some("command"),
+        };
+    }
+
+    StepEvidenceClassification {
+        kind: AutonomyEvidenceKind::ToolResult,
+        check_kind: "tool_result",
+        command_hint: None,
+    }
+}
+
 fn persist_worker_policy_decision_best_effort(
     deps: &WorkerDeps,
     job_ctx: &JobContext,
@@ -1469,20 +1551,8 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     )
                 }
             };
-            let tool_name_lower = action.tool_name.to_ascii_lowercase();
-            let evidence_kind = if tool_name_lower.contains("test")
-                || tool_name_lower.contains("lint")
-                || tool_name_lower.contains("check")
-            {
-                AutonomyEvidenceKind::TestRun
-            } else if tool_name_lower.contains("shell")
-                || tool_name_lower.contains("command")
-                || tool_name_lower.contains("exec")
-            {
-                AutonomyEvidenceKind::CommandOutput
-            } else {
-                AutonomyEvidenceKind::ToolResult
-            };
+            let evidence_class =
+                classify_step_evidence(&action.tool_name, &action.parameters, &action.reasoning);
             let step_payload = serde_json::json!({
                 "sequence_index": i,
                 "tool_name": action.tool_name,
@@ -1492,10 +1562,13 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 "failure_class": failure_class,
                 "result_preview": result_preview,
                 "error_preview": error_preview,
+                "verifier_evidence_kind": evidence_class.kind,
+                "verifier_check_kind": evidence_class.check_kind,
+                "command": action.parameters.get("command").and_then(|v| v.as_str()),
             });
             step_outcomes.push(step_payload.clone());
             step_evidence.push(AutonomyEvidence {
-                kind: evidence_kind,
+                kind: evidence_class.kind,
                 source: format!("worker.plan_step.{}", i),
                 summary: format!(
                     "{} {} ({})",
@@ -1511,7 +1584,18 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 .take(240)
                 .collect(),
                 confidence: if step_succeeded { 0.95 } else { 0.8 },
-                payload: step_payload,
+                payload: {
+                    let mut payload = step_payload;
+                    if let Some(command_hint) = evidence_class.command_hint {
+                        if let Some(map) = payload.as_object_mut() {
+                            map.insert(
+                                "verifier_command_hint".to_string(),
+                                serde_json::json!(command_hint),
+                            );
+                        }
+                    }
+                    payload
+                },
                 created_at: started_at,
             });
 
@@ -1849,11 +1933,32 @@ impl From<TaskOutput> for Result<String, Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    use crate::agent::{
+        Goal, GoalRiskClass, GoalSource, GoalStatus, Plan, PlanStatus, PlanStep, PlanStepKind,
+        PlanStepStatus, PlannerKind,
+    };
+    use crate::config::SafetyConfig;
+    use crate::context::{ContextManager, JobState};
     use crate::error::{Error, ToolError};
-    use crate::llm::ToolSelection;
+    use crate::hooks::HookRegistry;
+    use crate::llm::{ActionPlan, Reasoning, ReasoningContext, ToolSelection};
+    use crate::safety::SafetyLayer;
+    use crate::testing::{StubLlm, TestHarnessBuilder};
+    use crate::tools::{Tool, ToolOutput, ToolRegistry};
     use crate::util::llm_signals_completion;
 
-    use super::{ReplanReason, classify_replan_reason_for_step_error};
+    use super::{
+        PersistedPlanRun, PlanExecutionOutcome, ReplanReason, Worker, WorkerDeps,
+        classify_replan_reason_for_step_error, classify_step_evidence,
+    };
 
     #[test]
     fn test_tool_selection_preserves_call_id() {
@@ -1954,5 +2059,228 @@ mod tests {
             classify_replan_reason_for_step_error(&err),
             Some(ReplanReason::ToolUnavailable)
         );
+    }
+
+    #[test]
+    fn test_classify_step_evidence_detects_diff_and_test_commands() {
+        let diff = classify_step_evidence(
+            "shell",
+            &serde_json::json!({"command":"git diff --stat"}),
+            "Inspect diff",
+        );
+        assert_eq!(diff.kind, crate::agent::EvidenceKind::FileDiff);
+
+        let test = classify_step_evidence(
+            "shell",
+            &serde_json::json!({"command":"cargo test -q"}),
+            "Run tests",
+        );
+        assert_eq!(test.kind, crate::agent::EvidenceKind::TestRun);
+    }
+
+    struct NoopTool;
+
+    #[async_trait]
+    impl Tool for NoopTool {
+        fn name(&self) -> &str {
+            "noop_tool"
+        }
+
+        fn description(&self) -> &str {
+            "No-op test tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type":"object",
+                "properties": {},
+                "additionalProperties": true
+            })
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &crate::context::JobContext,
+        ) -> Result<ToolOutput, crate::tools::ToolError> {
+            Ok(ToolOutput::success(
+                serde_json::json!({"ok": true}),
+                Duration::from_millis(1),
+            ))
+        }
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_execute_plan_verifier_block_returns_replan_request_and_persists_verification() {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(NoopTool)).await;
+        let llm: Arc<dyn crate::llm::LlmProvider> = Arc::new(StubLlm::new("The job is complete."));
+        let harness = TestHarnessBuilder::new()
+            .with_tools(Arc::clone(&tools))
+            .with_llm(Arc::clone(&llm))
+            .build()
+            .await;
+
+        let context_manager = Arc::new(ContextManager::new(4));
+        let job_id = context_manager
+            .create_job_for_user("user-1", "High-risk job", "Need explicit evidence")
+            .await
+            .expect("create job");
+        context_manager
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(JobState::InProgress, Some("test setup".to_string()))
+            })
+            .await
+            .expect("update context")
+            .expect("transition to in_progress");
+
+        let worker = Worker::new(
+            job_id,
+            WorkerDeps {
+                context_manager: Arc::clone(&context_manager),
+                llm: Arc::clone(&llm),
+                safety: harness.deps.safety.clone(),
+                tools: Arc::clone(&tools),
+                store: Some(harness.db.clone()),
+                hooks: Arc::new(HookRegistry::new()),
+                timeout: Duration::from_secs(10),
+                use_planning: true,
+                autonomy_policy_engine_v1: true,
+                autonomy_verifier_v1: true,
+                autonomy_replanner_v1: true,
+            },
+        );
+
+        let now = Utc::now();
+        let goal_id = Uuid::new_v4();
+        let plan_id = Uuid::new_v4();
+        let step_id = Uuid::new_v4();
+
+        harness
+            .db
+            .create_goal(&Goal {
+                id: goal_id,
+                owner_user_id: "user-1".to_string(),
+                channel: Some("worker".to_string()),
+                thread_id: None,
+                title: "High-risk job".to_string(),
+                intent: "Demonstrate verifier block".to_string(),
+                priority: 0,
+                status: GoalStatus::Active,
+                risk_class: GoalRiskClass::High,
+                acceptance_criteria: serde_json::json!({"tests":"must pass before completion"}),
+                constraints: serde_json::json!({}),
+                source: GoalSource::UserRequest,
+                created_at: now,
+                updated_at: now,
+                completed_at: None,
+            })
+            .await
+            .expect("create goal");
+
+        harness
+            .db
+            .create_plan(&Plan {
+                id: plan_id,
+                goal_id,
+                revision: 1,
+                status: PlanStatus::Running,
+                planner_kind: PlannerKind::ReasoningV1,
+                source_action_plan: None,
+                assumptions: serde_json::json!({}),
+                confidence: 0.9,
+                estimated_cost: None,
+                estimated_time_secs: Some(5),
+                summary: Some("plan".to_string()),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("create plan");
+
+        harness
+            .db
+            .create_plan_steps(&[PlanStep {
+                id: step_id,
+                plan_id,
+                sequence_num: 1,
+                kind: PlanStepKind::ToolCall,
+                status: PlanStepStatus::Pending,
+                title: "noop_tool".to_string(),
+                description: "Run noop".to_string(),
+                tool_candidates: serde_json::json!([{"tool_name":"noop_tool"}]),
+                inputs: serde_json::json!({}),
+                preconditions: serde_json::json!([]),
+                postconditions: serde_json::json!([]),
+                rollback: None,
+                policy_requirements: serde_json::json!({}),
+                started_at: None,
+                completed_at: None,
+                created_at: now,
+                updated_at: now,
+            }])
+            .await
+            .expect("create step");
+
+        let action_plan: ActionPlan = serde_json::from_value(serde_json::json!({
+            "goal": "Demonstrate verifier block",
+            "actions": [{
+                "tool_name": "noop_tool",
+                "parameters": {},
+                "reasoning": "Run a no-op step",
+                "expected_outcome": "No-op result"
+            }],
+            "estimated_cost": null,
+            "estimated_time_secs": 5,
+            "confidence": 0.9
+        }))
+        .expect("action plan");
+
+        let reasoning = Reasoning::new(
+            Arc::clone(&llm),
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 100_000,
+                injection_check_enabled: false,
+            })),
+        );
+        let mut reason_ctx = ReasoningContext::new();
+        let (_tx, mut rx) = mpsc::channel(4);
+        let persisted = PersistedPlanRun {
+            goal_id,
+            plan_id,
+            step_ids: vec![step_id],
+        };
+
+        let outcome = worker
+            .execute_plan(
+                &mut rx,
+                &reasoning,
+                &mut reason_ctx,
+                &action_plan,
+                Some(&persisted),
+            )
+            .await
+            .expect("execute plan");
+
+        match outcome {
+            PlanExecutionOutcome::ReplanRequested { reason, detail } => {
+                assert_eq!(reason, ReplanReason::VerifierInsufficientEvidence);
+                assert!(detail.contains("Verifier blocked completion"));
+            }
+            _ => panic!("expected replan request"),
+        }
+
+        let verifications = harness
+            .db
+            .list_plan_verifications_for_plan(plan_id)
+            .await
+            .expect("list verifications");
+        assert_eq!(verifications.len(), 1);
+        assert_eq!(
+            verifications[0].status,
+            crate::agent::PlanVerificationStatus::Inconclusive
+        );
+        assert_eq!(verifications[0].completion_claimed, true);
     }
 }

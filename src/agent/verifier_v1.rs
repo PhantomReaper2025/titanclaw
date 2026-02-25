@@ -41,6 +41,38 @@ pub(super) struct VerificationResult {
 
 pub(super) struct VerifierV1;
 
+#[derive(Debug, Clone, Copy, Default)]
+struct EvidenceStats {
+    test_runs: usize,
+    file_diffs: usize,
+    command_outputs: usize,
+    lint_or_check_runs: usize,
+}
+
+fn collect_evidence_stats(evidence: &[Evidence]) -> EvidenceStats {
+    let mut stats = EvidenceStats::default();
+    for ev in evidence {
+        match ev.kind {
+            EvidenceKind::TestRun => {
+                stats.test_runs += 1;
+                if ev
+                    .payload
+                    .get("verifier_check_kind")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == "lint_or_check")
+                    .unwrap_or(false)
+                {
+                    stats.lint_or_check_runs += 1;
+                }
+            }
+            EvidenceKind::FileDiff => stats.file_diffs += 1,
+            EvidenceKind::CommandOutput => stats.command_outputs += 1,
+            _ => {}
+        }
+    }
+    stats
+}
+
 impl VerifierV1 {
     pub(super) fn verify_completion(mut req: VerificationRequest) -> VerificationResult {
         let mut failure_reasons = Vec::new();
@@ -70,6 +102,11 @@ impl VerifierV1 {
             req.risk_class,
             GoalRiskClass::High | GoalRiskClass::Critical
         );
+        let evidence_stats = collect_evidence_stats(&req.base_evidence);
+        let has_validation_evidence =
+            evidence_stats.test_runs > 0 || evidence_stats.lint_or_check_runs > 0;
+        let has_change_evidence = evidence_stats.file_diffs > 0;
+        let strong_high_risk_evidence = has_validation_evidence || has_change_evidence;
 
         let (status, allow_completion, next_action) = if !req.completion_claimed {
             (
@@ -88,7 +125,11 @@ impl VerifierV1 {
                     VerificationNextAction::Replan
                 },
             )
-        } else if high_risk && has_acceptance_criteria && req.failed_steps == 0 {
+        } else if high_risk
+            && has_acceptance_criteria
+            && req.failed_steps == 0
+            && !strong_high_risk_evidence
+        {
             // Soft gate for v1: require stronger evidence on high-impact work with explicit criteria.
             failure_reasons.push("high_risk_requires_more_evidence".to_string());
             (
@@ -114,6 +155,15 @@ impl VerifierV1 {
             "completion_claimed": req.completion_claimed,
             "risk_class": req.risk_class,
             "has_acceptance_criteria": has_acceptance_criteria,
+            "evidence_stats": {
+                "test_runs": evidence_stats.test_runs,
+                "lint_or_check_runs": evidence_stats.lint_or_check_runs,
+                "file_diffs": evidence_stats.file_diffs,
+                "command_outputs": evidence_stats.command_outputs,
+            },
+            "has_validation_evidence": has_validation_evidence,
+            "has_change_evidence": has_change_evidence,
+            "strong_high_risk_evidence": strong_high_risk_evidence,
             "step_outcomes": req.step_outcomes,
             "failure_reasons": failure_reasons,
         });
@@ -178,6 +228,8 @@ impl VerifierV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use serde_json::json;
 
     fn base_request() -> VerificationRequest {
         VerificationRequest {
@@ -235,5 +287,30 @@ mod tests {
         assert_eq!(out.status, PlanVerificationStatus::Inconclusive);
         assert!(!out.allow_completion);
         assert_eq!(out.next_action, VerificationNextAction::Replan);
+    }
+
+    #[test]
+    fn test_verifier_allows_high_risk_with_acceptance_criteria_when_test_evidence_present() {
+        let mut req = base_request();
+        req.risk_class = GoalRiskClass::High;
+        req.acceptance_criteria = json!({"tests":"must pass"});
+        req.base_evidence.push(Evidence {
+            kind: EvidenceKind::TestRun,
+            source: "worker.plan_step.0".to_string(),
+            summary: "cargo test passed".to_string(),
+            confidence: 0.95,
+            payload: json!({"verifier_check_kind":"test","status":"succeeded"}),
+            created_at: Utc::now(),
+        });
+
+        let out = VerifierV1::verify_completion(req);
+        assert_eq!(out.status, PlanVerificationStatus::Passed);
+        assert!(out.allow_completion);
+        assert_eq!(out.next_action, VerificationNextAction::Complete);
+        assert_eq!(out.checks["evidence_stats"]["test_runs"].as_u64(), Some(1));
+        assert_eq!(
+            out.checks["strong_high_risk_evidence"].as_bool(),
+            Some(true)
+        );
     }
 }

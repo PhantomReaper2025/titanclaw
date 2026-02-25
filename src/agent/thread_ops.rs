@@ -18,7 +18,8 @@ use crate::agent::compaction::ContextCompactor;
 use crate::agent::context_monitor::CompactionStrategy;
 use crate::agent::dispatcher::{AgenticLoopResult, detect_auth_awaiting, parse_auth_result};
 use crate::agent::policy_engine::{
-    HookToolPolicyOutcome, evaluate_tool_call_hook, map_policy_decision_kind,
+    ApprovalPolicyOutcome, HookToolPolicyOutcome, evaluate_dispatcher_tool_approval,
+    evaluate_tool_call_hook, map_policy_decision_kind,
 };
 use crate::agent::session::{Session, Thread, ThreadState};
 use crate::agent::submission::SubmissionResult;
@@ -359,14 +360,18 @@ impl Agent {
                         );
                         let params = serde_json::json!({ "input": content });
                         let mut reflex_allowed = true;
-                        if let Some(tool) = self.tools().get(&tool_name).await
-                            && tool.requires_approval()
-                        {
+                        if let Some(tool) = self.tools().get(&tool_name).await {
                             let is_auto_approved = {
                                 let sess = session.lock().await;
                                 sess.is_tool_auto_approved(&tool_name)
                             };
-                            if !is_auto_approved || tool.requires_approval_for(&params) {
+                            if let ApprovalPolicyOutcome::RequireApproval { .. } =
+                                evaluate_dispatcher_tool_approval(
+                                    tool.as_ref(),
+                                    &params,
+                                    is_auto_approved,
+                                )
+                            {
                                 tracing::info!(
                                     tool = %tool_name,
                                     "Reflex fast-path requires approval, falling back to agentic loop"
@@ -1623,6 +1628,140 @@ impl Agent {
         } else {
             Ok(SubmissionResult::error("Checkpoint not found."))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    use super::*;
+    use crate::channels::{ChannelManager, IncomingMessage};
+    use crate::config::AgentConfig;
+    use crate::hooks::{Hook, HookContext, HookEvent, HookFailureMode, HookOutcome, HookPoint};
+    use crate::llm::ChatMessage;
+    use crate::settings::Settings;
+    use crate::testing::TestHarnessBuilder;
+
+    struct RejectToolCallHook;
+
+    #[async_trait]
+    impl Hook for RejectToolCallHook {
+        fn name(&self) -> &str {
+            "reject_tool_call"
+        }
+
+        fn hook_points(&self) -> &[HookPoint] {
+            static POINTS: [HookPoint; 1] = [HookPoint::BeforeToolCall];
+            &POINTS
+        }
+
+        fn failure_mode(&self) -> HookFailureMode {
+            HookFailureMode::FailClosed
+        }
+
+        fn timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        async fn execute(
+            &self,
+            event: &HookEvent,
+            _ctx: &HookContext,
+        ) -> Result<HookOutcome, crate::hooks::HookError> {
+            match event {
+                HookEvent::ToolCall { .. } => Ok(HookOutcome::reject("blocked in test hook")),
+                _ => Ok(HookOutcome::ok()),
+            }
+        }
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_process_approval_rechecks_hook_and_blocks_execution() {
+        let harness = TestHarnessBuilder::new().build().await;
+        harness
+            .deps
+            .hooks
+            .register(Arc::new(RejectToolCallHook))
+            .await;
+
+        let mut config = AgentConfig::resolve(&Settings::default()).expect("config");
+        config.autonomy_policy_engine_v1 = true;
+
+        let agent = Agent::new(
+            config,
+            harness.deps,
+            ChannelManager::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let message = IncomingMessage::new("test", "user-1", "approve")
+            .with_metadata(json!({"source":"test"}));
+        let session = agent.session_manager.get_or_create_session("user-1").await;
+
+        let (thread_id, request_id) = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("Please run shell");
+            thread.record_tool_call("call-1", "shell", json!({"command":"echo hi"}));
+            let request_id = Uuid::new_v4();
+            thread.await_approval(crate::agent::PendingApproval {
+                request_id,
+                tool_name: "shell".to_string(),
+                parameters: json!({"command":"echo hi"}),
+                description: "Run shell".to_string(),
+                tool_call_id: "call-1".to_string(),
+                context_messages: vec![ChatMessage::user("Please run shell")],
+            });
+            (thread.id, request_id)
+        };
+
+        let out = agent
+            .process_approval(
+                &message,
+                session.clone(),
+                thread_id,
+                Some(request_id),
+                true,
+                false,
+            )
+            .await
+            .expect("process approval");
+
+        match out {
+            crate::agent::submission::SubmissionResult::Response { content } => {
+                assert!(content.contains("policy hook blocked execution"));
+            }
+            other => panic!("unexpected submission result: {:?}", other),
+        }
+
+        let sess = session.lock().await;
+        let thread = sess.threads.get(&thread_id).expect("thread");
+        assert_eq!(thread.state, ThreadState::Idle);
+        assert!(thread.pending_approval.is_none());
+        let turn = thread.last_turn().expect("turn");
+        assert!(
+            turn.response
+                .as_deref()
+                .unwrap_or_default()
+                .contains("policy hook blocked execution")
+        );
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert!(
+            turn.tool_calls[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("blocked by hook after approval")
+        );
     }
 }
 

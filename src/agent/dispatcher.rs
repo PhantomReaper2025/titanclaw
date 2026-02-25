@@ -529,14 +529,16 @@ impl Agent {
                                             return;
                                         };
 
-                                        if tool.requires_approval() {
-                                            let is_auto_approved = {
-                                                let sess = session_for_pipe.lock().await;
-                                                sess.is_tool_auto_approved("shell")
-                                            };
-                                            if !is_auto_approved
-                                                || tool.requires_approval_for(&args)
-                                            {
+                                        let is_auto_approved = {
+                                            let sess = session_for_pipe.lock().await;
+                                            sess.is_tool_auto_approved("shell")
+                                        };
+                                        match evaluate_dispatcher_tool_approval(
+                                            tool.as_ref(),
+                                            &args,
+                                            is_auto_approved,
+                                        ) {
+                                            ApprovalPolicyOutcome::RequireApproval { .. } => {
                                                 let _ = channels
                                                     .send_status(
                                                         &channel_name,
@@ -549,6 +551,8 @@ impl Agent {
                                                     .await;
                                                 return;
                                             }
+                                            ApprovalPolicyOutcome::NoApprovalRequired
+                                            | ApprovalPolicyOutcome::AllowAutoApproved { .. } => {}
                                         }
 
                                         let validation =
@@ -697,14 +701,16 @@ impl Agent {
                                             return;
                                         };
 
-                                        if tool.requires_approval() {
-                                            let is_auto_approved = {
-                                                let sess = session_for_pipe.lock().await;
-                                                sess.is_tool_auto_approved("shell")
-                                            };
-                                            if !is_auto_approved
-                                                || tool.requires_approval_for(&args)
-                                            {
+                                        let is_auto_approved = {
+                                            let sess = session_for_pipe.lock().await;
+                                            sess.is_tool_auto_approved("shell")
+                                        };
+                                        match evaluate_dispatcher_tool_approval(
+                                            tool.as_ref(),
+                                            &args,
+                                            is_auto_approved,
+                                        ) {
+                                            ApprovalPolicyOutcome::RequireApproval { .. } => {
                                                 let _ = channels
                                                     .send_status(
                                                         &channel_name,
@@ -717,6 +723,8 @@ impl Agent {
                                                     .await;
                                                 return;
                                             }
+                                            ApprovalPolicyOutcome::NoApprovalRequired
+                                            | ApprovalPolicyOutcome::AllowAutoApproved { .. } => {}
                                         }
 
                                         let validation =
