@@ -2943,8 +2943,16 @@ async fn skills_remove_handler(
 // --- Autonomy handlers (v1 inspection + create + status updates) ---
 
 #[derive(Deserialize)]
+struct GoalsListQuery {
+    status: Option<GoalStatus>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
 struct PlansListQuery {
     goal_id: String,
+    status: Option<PlanStatus>,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3204,6 +3212,7 @@ async fn goals_create_handler(
 
 async fn goals_list_handler(
     State(state): State<Arc<GatewayState>>,
+    Query(query): Query<GoalsListQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -3216,8 +3225,17 @@ async fn goals_list_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     goals.retain(|g| g.owner_user_id == state.user_id);
+    if let Some(status) = query.status {
+        goals.retain(|g| g.status == status);
+    }
     goals.sort_by_key(|g| g.updated_at);
     goals.reverse();
+    if let Some(limit) = query.limit {
+        if limit == 0 {
+            return Err((StatusCode::BAD_REQUEST, "limit must be >= 1".to_string()));
+        }
+        goals.truncate(limit);
+    }
 
     Ok(Json(serde_json::json!({ "goals": goals })))
 }
@@ -3462,8 +3480,17 @@ async fn plans_list_handler(
         .list_plans_for_goal(goal.id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Some(status) = query.status {
+        plans.retain(|p| p.status == status);
+    }
     plans.sort_by_key(|p| (p.revision, p.updated_at));
     plans.reverse();
+    if let Some(limit) = query.limit {
+        if limit == 0 {
+            return Err((StatusCode::BAD_REQUEST, "limit must be >= 1".to_string()));
+        }
+        plans.truncate(limit);
+    }
 
     Ok(Json(serde_json::json!({ "plans": plans })))
 }
@@ -4984,5 +5011,181 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
         assert_eq!(err.1, "Goal not found");
+    }
+
+    #[tokio::test]
+    async fn test_goals_list_handler_filters_by_status_and_limit_for_owner() {
+        let (_dir, store) = make_test_store().await;
+        let state = make_test_gateway_state("alice", store.clone());
+
+        let now = chrono::Utc::now();
+        let alice_active_old = Goal {
+            id: Uuid::new_v4(),
+            owner_user_id: "alice".to_string(),
+            channel: Some("web".to_string()),
+            thread_id: None,
+            title: "old active".to_string(),
+            intent: "intent".to_string(),
+            priority: 1,
+            status: GoalStatus::Active,
+            risk_class: GoalRiskClass::Low,
+            acceptance_criteria: json!({}),
+            constraints: json!({}),
+            source: GoalSource::UserRequest,
+            created_at: now - chrono::TimeDelta::minutes(10),
+            updated_at: now - chrono::TimeDelta::minutes(10),
+            completed_at: None,
+        };
+        let alice_active_new = Goal {
+            id: Uuid::new_v4(),
+            owner_user_id: "alice".to_string(),
+            channel: Some("web".to_string()),
+            thread_id: None,
+            title: "new active".to_string(),
+            intent: "intent".to_string(),
+            priority: 2,
+            status: GoalStatus::Active,
+            risk_class: GoalRiskClass::Low,
+            acceptance_criteria: json!({}),
+            constraints: json!({}),
+            source: GoalSource::UserRequest,
+            created_at: now - chrono::TimeDelta::minutes(2),
+            updated_at: now - chrono::TimeDelta::minutes(1),
+            completed_at: None,
+        };
+        let alice_completed = Goal {
+            id: Uuid::new_v4(),
+            owner_user_id: "alice".to_string(),
+            channel: Some("web".to_string()),
+            thread_id: None,
+            title: "done".to_string(),
+            intent: "intent".to_string(),
+            priority: 3,
+            status: GoalStatus::Completed,
+            risk_class: GoalRiskClass::Low,
+            acceptance_criteria: json!({}),
+            constraints: json!({}),
+            source: GoalSource::UserRequest,
+            created_at: now - chrono::TimeDelta::minutes(5),
+            updated_at: now - chrono::TimeDelta::minutes(4),
+            completed_at: Some(now - chrono::TimeDelta::minutes(4)),
+        };
+        let bob_active = Goal {
+            id: Uuid::new_v4(),
+            owner_user_id: "bob".to_string(),
+            channel: Some("web".to_string()),
+            thread_id: None,
+            title: "bob active".to_string(),
+            intent: "intent".to_string(),
+            priority: 4,
+            status: GoalStatus::Active,
+            risk_class: GoalRiskClass::Low,
+            acceptance_criteria: json!({}),
+            constraints: json!({}),
+            source: GoalSource::UserRequest,
+            created_at: now - chrono::TimeDelta::minutes(3),
+            updated_at: now - chrono::TimeDelta::minutes(3),
+            completed_at: None,
+        };
+
+        for goal in [
+            &alice_active_old,
+            &alice_active_new,
+            &alice_completed,
+            &bob_active,
+        ] {
+            store.create_goal(goal).await.expect("seed goal");
+        }
+
+        let Json(body) = goals_list_handler(
+            State(state),
+            Query(GoalsListQuery {
+                status: Some(GoalStatus::Active),
+                limit: Some(1),
+            }),
+        )
+        .await
+        .expect("list filtered goals");
+
+        let goals = body["goals"].as_array().expect("goals array");
+        assert_eq!(goals.len(), 1);
+        assert_eq!(goals[0]["owner_user_id"], json!("alice"));
+        assert_eq!(goals[0]["status"], json!("active"));
+        assert_eq!(goals[0]["id"], json!(alice_active_new.id));
+    }
+
+    #[tokio::test]
+    async fn test_plans_list_handler_filters_by_status_and_limit() {
+        let (_dir, store) = make_test_store().await;
+        let state = make_test_gateway_state("alice", store.clone());
+        let (_goal, seed_plan) = seed_goal_and_plan(store.as_ref(), "alice").await;
+
+        let now = chrono::Utc::now();
+        let ready_plan = Plan {
+            id: Uuid::new_v4(),
+            goal_id: seed_plan.goal_id,
+            revision: 2,
+            status: PlanStatus::Ready,
+            planner_kind: PlannerKind::ReasoningV1,
+            source_action_plan: None,
+            assumptions: json!({}),
+            confidence: 0.8,
+            estimated_cost: None,
+            estimated_time_secs: None,
+            summary: Some("ready".to_string()),
+            created_at: now - chrono::TimeDelta::minutes(2),
+            updated_at: now - chrono::TimeDelta::minutes(2),
+        };
+        let running_plan = Plan {
+            id: Uuid::new_v4(),
+            goal_id: seed_plan.goal_id,
+            revision: 3,
+            status: PlanStatus::Running,
+            planner_kind: PlannerKind::Hybrid,
+            source_action_plan: None,
+            assumptions: json!({}),
+            confidence: 0.7,
+            estimated_cost: None,
+            estimated_time_secs: None,
+            summary: Some("running".to_string()),
+            created_at: now - chrono::TimeDelta::minutes(1),
+            updated_at: now - chrono::TimeDelta::minutes(1),
+        };
+        let ready_plan_newer = Plan {
+            id: Uuid::new_v4(),
+            goal_id: seed_plan.goal_id,
+            revision: 4,
+            status: PlanStatus::Ready,
+            planner_kind: PlannerKind::RuleBased,
+            source_action_plan: None,
+            assumptions: json!({}),
+            confidence: 0.9,
+            estimated_cost: None,
+            estimated_time_secs: None,
+            summary: Some("ready newer".to_string()),
+            created_at: now,
+            updated_at: now,
+        };
+
+        for plan in [&ready_plan, &running_plan, &ready_plan_newer] {
+            store.create_plan(plan).await.expect("seed plan");
+        }
+
+        let Json(body) = plans_list_handler(
+            State(state),
+            Query(PlansListQuery {
+                goal_id: seed_plan.goal_id.to_string(),
+                status: Some(PlanStatus::Ready),
+                limit: Some(1),
+            }),
+        )
+        .await
+        .expect("list filtered plans");
+
+        let plans = body["plans"].as_array().expect("plans array");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0]["status"], json!("ready"));
+        assert_eq!(plans[0]["id"], json!(ready_plan_newer.id));
+        assert_eq!(plans[0]["revision"], json!(4));
     }
 }

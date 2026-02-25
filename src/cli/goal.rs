@@ -44,6 +44,14 @@ pub enum GoalCommand {
         /// Owner user ID to filter by
         #[arg(long, default_value = DEFAULT_USER_ID)]
         user_id: String,
+
+        /// Optional status filter (proposed|active|blocked|waiting|completed|abandoned)
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Max number of goals to print (most recent first)
+        #[arg(long)]
+        limit: Option<usize>,
     },
 
     /// Show one goal as JSON
@@ -126,7 +134,11 @@ pub async fn run_goal_command(cmd: GoalCommand) -> anyhow::Result<()> {
             )
             .await
         }
-        GoalCommand::List { user_id } => list_goals(db.as_ref(), &user_id).await,
+        GoalCommand::List {
+            user_id,
+            status,
+            limit,
+        } => list_goals(db.as_ref(), &user_id, status.as_deref(), limit).await,
         GoalCommand::Show { id, user_id } => show_goal(db.as_ref(), id, &user_id).await,
         GoalCommand::SetStatus {
             id,
@@ -209,16 +221,35 @@ async fn create_goal(
     Ok(())
 }
 
-async fn list_goals(db: &dyn crate::db::Database, user_id: &str) -> anyhow::Result<()> {
+async fn list_goals(
+    db: &dyn crate::db::Database,
+    user_id: &str,
+    status_filter: Option<&str>,
+    limit: Option<usize>,
+) -> anyhow::Result<()> {
     let mut goals = db
         .list_goals()
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))
         .with_context(|| "failed to list goals")?;
 
+    let status_filter = match status_filter {
+        Some(raw) => Some(parse_goal_status(raw)?),
+        None => None,
+    };
+
     goals.retain(|g| g.owner_user_id == user_id);
+    if let Some(status) = status_filter {
+        goals.retain(|g| g.status == status);
+    }
     goals.sort_by_key(|g| (g.updated_at, g.created_at));
     goals.reverse();
+    if let Some(limit) = limit {
+        if limit == 0 {
+            anyhow::bail!("limit must be >= 1");
+        }
+        goals.truncate(limit);
+    }
 
     println!("Goals (user: {})", user_id);
     if goals.is_empty() {

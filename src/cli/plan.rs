@@ -54,6 +54,14 @@ pub enum PlanCommand {
         /// Owner user ID (used to validate goal ownership)
         #[arg(long, default_value = DEFAULT_USER_ID)]
         user_id: String,
+
+        /// Optional status filter (draft|ready|running|paused|failed|completed|superseded)
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Max number of plans to print (highest revision first)
+        #[arg(long)]
+        limit: Option<usize>,
     },
 
     /// Show one plan as JSON
@@ -175,7 +183,12 @@ pub async fn run_plan_command(cmd: PlanCommand) -> anyhow::Result<()> {
             )
             .await
         }
-        PlanCommand::List { goal_id, user_id } => list_plans(db.as_ref(), goal_id, &user_id).await,
+        PlanCommand::List {
+            goal_id,
+            user_id,
+            status,
+            limit,
+        } => list_plans(db.as_ref(), goal_id, &user_id, status.as_deref(), limit).await,
         PlanCommand::Show { id, user_id } => show_plan(db.as_ref(), id, &user_id).await,
         PlanCommand::SetStatus {
             id,
@@ -335,6 +348,8 @@ async fn list_plans(
     db: &dyn crate::db::Database,
     goal_id: Uuid,
     user_id: &str,
+    status_filter: Option<&str>,
+    limit: Option<usize>,
 ) -> anyhow::Result<()> {
     let goal = db
         .get_goal(goal_id)
@@ -351,8 +366,21 @@ async fn list_plans(
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))
         .with_context(|| format!("failed to list plans for goal {}", goal_id))?;
+    let status_filter = match status_filter {
+        Some(raw) => Some(parse_plan_status(raw)?),
+        None => None,
+    };
+    if let Some(status) = status_filter {
+        plans.retain(|p| p.status == status);
+    }
     plans.sort_by_key(|p| (p.revision, p.updated_at));
     plans.reverse();
+    if let Some(limit) = limit {
+        if limit == 0 {
+            anyhow::bail!("limit must be >= 1");
+        }
+        plans.truncate(limit);
+    }
 
     println!("Plans (goal: {}, user: {})", goal_id, user_id);
     if plans.is_empty() {
