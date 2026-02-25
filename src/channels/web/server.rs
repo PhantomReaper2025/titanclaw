@@ -4408,7 +4408,102 @@ struct GatewayStatusResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Database;
     use serde_json::json;
+
+    async fn make_test_store() -> (tempfile::TempDir, Arc<dyn Database>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("gateway_autonomy_endpoint_tests.db");
+        let backend = crate::db::libsql::LibSqlBackend::new_local(&db_path)
+            .await
+            .expect("create test libsql backend");
+        backend.run_migrations().await.expect("run migrations");
+        let store: Arc<dyn Database> = Arc::new(backend);
+        (dir, store)
+    }
+
+    fn make_test_gateway_state(user_id: &str, store: Arc<dyn Database>) -> Arc<GatewayState> {
+        Arc::new(GatewayState {
+            msg_tx: tokio::sync::RwLock::new(None),
+            sse: SseManager::new(),
+            workspace: None,
+            session_manager: None,
+            log_broadcaster: None,
+            extension_manager: None,
+            tool_registry: None,
+            store: Some(store),
+            job_manager: None,
+            prompt_queue: None,
+            user_id: user_id.to_string(),
+            shutdown_tx: tokio::sync::RwLock::new(None),
+            ws_tracker: None,
+            llm_provider: None,
+            skill_registry: None,
+            skill_catalog: None,
+            kernel_orchestrator: None,
+            chat_rate_limiter: RateLimiter::new(30, 60),
+        })
+    }
+
+    async fn seed_goal_and_plan(store: &dyn Database, owner_user_id: &str) -> (Goal, Plan) {
+        let now = chrono::Utc::now();
+        let goal = Goal {
+            id: Uuid::new_v4(),
+            owner_user_id: owner_user_id.to_string(),
+            channel: Some("web".to_string()),
+            thread_id: None,
+            title: "Test Goal".to_string(),
+            intent: "Test intent".to_string(),
+            priority: 0,
+            status: GoalStatus::Active,
+            risk_class: GoalRiskClass::Low,
+            acceptance_criteria: json!({}),
+            constraints: json!({}),
+            source: GoalSource::UserRequest,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        store.create_goal(&goal).await.expect("create goal");
+
+        let plan = Plan {
+            id: Uuid::new_v4(),
+            goal_id: goal.id,
+            revision: 1,
+            status: PlanStatus::Draft,
+            planner_kind: PlannerKind::ReasoningV1,
+            source_action_plan: None,
+            assumptions: json!({}),
+            confidence: 0.6,
+            estimated_cost: None,
+            estimated_time_secs: None,
+            summary: Some("Seed plan".to_string()),
+            created_at: now,
+            updated_at: now,
+        };
+        store.create_plan(&plan).await.expect("create plan");
+
+        (goal, plan)
+    }
+
+    fn sample_step_input(
+        sequence_num: i32,
+        kind: PlanStepKind,
+        title: &str,
+    ) -> PlanStepCreateInput {
+        PlanStepCreateInput {
+            sequence_num,
+            kind,
+            title: title.to_string(),
+            description: format!("{title} description"),
+            tool_candidates: json!({}),
+            inputs: json!({}),
+            preconditions: json!({}),
+            postconditions: json!({}),
+            rollback: None,
+            policy_requirements: json!({}),
+        }
+    }
 
     #[test]
     fn test_build_turns_from_db_messages_complete() {
@@ -4575,5 +4670,155 @@ mod tests {
         assert_eq!(step.postconditions, json!({}));
         assert_eq!(step.rollback, Some(json!(null)));
         assert_eq!(step.policy_requirements, json!({}));
+    }
+
+    #[tokio::test]
+    async fn test_plans_replan_handler_with_inline_steps_creates_new_revision_and_steps() {
+        let (_dir, store) = make_test_store().await;
+        let state = make_test_gateway_state("alice", store.clone());
+        let (_goal, source_plan) = seed_goal_and_plan(store.as_ref(), "alice").await;
+
+        let Json(body) = plans_replan_handler(
+            State(state),
+            Path(source_plan.id.to_string()),
+            Json(PlanReplanRequest {
+                status: None,
+                planner_kind: None,
+                source_action_plan: None,
+                assumptions: None,
+                confidence: Some(0.9),
+                estimated_cost: None,
+                estimated_time_secs: None,
+                summary: Some("replanned with provided steps".to_string()),
+                supersede_current: Some(false),
+                copy_steps: Some(false),
+                steps: Some(vec![
+                    sample_step_input(1, PlanStepKind::ToolCall, "Patch code"),
+                    sample_step_input(2, PlanStepKind::Verification, "Run checks"),
+                ]),
+            }),
+        )
+        .await
+        .expect("replan should succeed");
+
+        assert_eq!(body["previous_plan_id"], json!(source_plan.id));
+        assert_eq!(body["previous_plan_superseded"], json!(false));
+        assert_eq!(body["copied_steps"], json!(0));
+        assert_eq!(body["provided_steps"], json!(2));
+
+        let new_plan_id = body["plan"]["id"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .expect("new plan id in response");
+        assert_ne!(new_plan_id, source_plan.id);
+        assert_eq!(body["plan"]["revision"], json!(2));
+
+        let mut steps = store
+            .list_plan_steps_for_plan(new_plan_id)
+            .await
+            .expect("list new plan steps");
+        steps.sort_by_key(|s| s.sequence_num);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].status, PlanStepStatus::Pending);
+        assert_eq!(steps[0].title, "Patch code");
+        assert_eq!(steps[1].kind, PlanStepKind::Verification);
+
+        let source_after = store
+            .get_plan(source_plan.id)
+            .await
+            .expect("reload source plan")
+            .expect("source plan exists");
+        assert_eq!(source_after.status, PlanStatus::Draft);
+    }
+
+    #[tokio::test]
+    async fn test_plans_replan_handler_rejects_copy_steps_and_inline_steps_together() {
+        let (_dir, store) = make_test_store().await;
+        let state = make_test_gateway_state("alice", store.clone());
+        let (_goal, source_plan) = seed_goal_and_plan(store.as_ref(), "alice").await;
+
+        let err = plans_replan_handler(
+            State(state),
+            Path(source_plan.id.to_string()),
+            Json(PlanReplanRequest {
+                status: None,
+                planner_kind: None,
+                source_action_plan: None,
+                assumptions: None,
+                confidence: None,
+                estimated_cost: None,
+                estimated_time_secs: None,
+                summary: None,
+                supersede_current: None,
+                copy_steps: Some(true),
+                steps: Some(vec![sample_step_input(
+                    1,
+                    PlanStepKind::ToolCall,
+                    "Conflict",
+                )]),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("either copy_steps=true or steps payload"));
+    }
+
+    #[tokio::test]
+    async fn test_plans_replan_handler_enforces_plan_ownership() {
+        let (_dir, store) = make_test_store().await;
+        let alice_state = make_test_gateway_state("alice", store.clone());
+        let bob_state = make_test_gateway_state("bob", store.clone());
+        let (_goal, source_plan) = seed_goal_and_plan(store.as_ref(), "alice").await;
+
+        let _ = alice_state; // seeded ownership context parity; only bob request is tested here.
+
+        let err = plans_replan_handler(
+            State(bob_state),
+            Path(source_plan.id.to_string()),
+            Json(PlanReplanRequest {
+                status: None,
+                planner_kind: None,
+                source_action_plan: None,
+                assumptions: None,
+                confidence: None,
+                estimated_cost: None,
+                estimated_time_secs: None,
+                summary: None,
+                supersede_current: None,
+                copy_steps: Some(false),
+                steps: Some(vec![sample_step_input(1, PlanStepKind::ToolCall, "Denied")]),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1, "Plan not found");
+    }
+
+    #[tokio::test]
+    async fn test_plan_steps_replace_handler_enforces_plan_ownership() {
+        let (_dir, store) = make_test_store().await;
+        let bob_state = make_test_gateway_state("bob", store.clone());
+        let (_goal, plan) = seed_goal_and_plan(store.as_ref(), "alice").await;
+
+        let err = plan_steps_replace_handler(
+            State(bob_state),
+            Path(plan.id.to_string()),
+            Json(PlanStepsCreateRequest {
+                steps: vec![sample_step_input(
+                    1,
+                    PlanStepKind::ToolCall,
+                    "Unauthorized replace",
+                )],
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1, "Plan not found");
     }
 }
