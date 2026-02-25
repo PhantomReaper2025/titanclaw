@@ -22,9 +22,9 @@
 - Internal autonomy control-plane v1 persistence is now scaffolded across both PostgreSQL and libSQL backends (goals/plans/plan steps/execution attempts/policy decisions/incidents), with worker/dispatcher runtime paths best-effort writing records for planned worker runs and chat tool policy/execution events.
 - Job records now persist optional autonomy linkage IDs (`autonomy_goal_id`, `autonomy_plan_id`, `autonomy_plan_step_id`) across PostgreSQL and libSQL so worker/dispatcher autonomy records can remain correlated after DB reloads/restarts.
 - Web gateway exposes user-scoped autonomy goal/plan APIs for creation, inspection, and status updates, and now includes plan-step APIs (`GET/POST /api/plans/{id}/steps`, `POST /api/plans/{id}/steps/replace`, `GET /api/plan-steps/{id}`, `POST /api/plan-steps/{id}/status`) for structured step management and atomic step replacement during replans.
-- Web gateway now also supports `POST /api/plans/{id}/replan` to create the next plan revision with optional metadata overrides and optional superseding of the source plan.
+- Web gateway now also supports `POST /api/plans/{id}/replan` to create the next plan revision with optional metadata overrides, optional superseding of the source plan, and optional source-step copying into the new revision.
 - Web gateway now also exposes user-scoped telemetry inspection for persisted autonomy execution attempts and policy decisions (`GET /api/plans/{id}/executions`, `GET /api/goals/{id}/policy-decisions`) to validate runtime instrumentation.
-- CLI exposes `titanclaw goal`, `titanclaw plan`, and `titanclaw plan-step` subcommands (including `plan replan` and `plan-step replace`) for direct inspection and manual management of autonomy records in local/single-user workflows.
+- CLI exposes `titanclaw goal`, `titanclaw plan`, and `titanclaw plan-step` subcommands (including `plan replan --copy-steps` and `plan-step replace`) for direct inspection and manual management of autonomy records in local/single-user workflows.
 
 ## UX and Operations Identity
 

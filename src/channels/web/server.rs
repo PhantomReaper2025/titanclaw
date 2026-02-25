@@ -2988,6 +2988,7 @@ struct PlanReplanRequest {
     estimated_time_secs: Option<u64>,
     summary: Option<String>,
     supersede_current: Option<bool>,
+    copy_steps: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3574,6 +3575,49 @@ async fn plans_replan_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let copied_steps = if body.copy_steps.unwrap_or(false) {
+        let source_steps = store
+            .list_plan_steps_for_plan(previous.id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        if source_steps.is_empty() {
+            0usize
+        } else {
+            let now = chrono::Utc::now();
+            let copied: Vec<PlanStep> = source_steps
+                .into_iter()
+                .map(|step| PlanStep {
+                    id: Uuid::new_v4(),
+                    plan_id: new_plan.id,
+                    sequence_num: step.sequence_num,
+                    kind: step.kind,
+                    status: PlanStepStatus::Pending,
+                    title: step.title,
+                    description: step.description,
+                    tool_candidates: step.tool_candidates,
+                    inputs: step.inputs,
+                    preconditions: step.preconditions,
+                    postconditions: step.postconditions,
+                    rollback: step.rollback,
+                    policy_requirements: step.policy_requirements,
+                    started_at: None,
+                    completed_at: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .collect();
+
+            store
+                .create_plan_steps(&copied)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            copied.len()
+        }
+    } else {
+        0usize
+    };
+
     let supersede_previous = body.supersede_current.unwrap_or(true);
     if supersede_previous {
         store
@@ -3585,7 +3629,8 @@ async fn plans_replan_handler(
     Ok(Json(serde_json::json!({
         "plan": new_plan,
         "previous_plan_id": previous.id,
-        "previous_plan_superseded": supersede_previous
+        "previous_plan_superseded": supersede_previous,
+        "copied_steps": copied_steps
     })))
 }
 

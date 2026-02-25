@@ -64,9 +64,9 @@ When behavior changes, keep these docs aligned in the same branch:
   - worker planned executions and dispatcher approval/tool-attempt paths now best-effort persist internal autonomy records (tracing emitters and approval UX remain unchanged)
   - `agent_jobs` now persists optional autonomy linkage IDs (`autonomy_goal_id`, `autonomy_plan_id`, `autonomy_plan_step_id`) so worker/dispatcher correlation survives DB save/load and restarts (PostgreSQL + libSQL, `V17` + libSQL schema mirror update)
   - web gateway now exposes user-scoped autonomy goal/plan APIs for create + inspection + status updates, plus plan-step APIs for list/create/detail/status and atomic replace (`/api/plans/{id}/steps`, `/api/plans/{id}/steps/replace`, `/api/plan-steps/{id}`, `/api/plan-steps/{id}/status`)
-  - web gateway now also exposes `POST /api/plans/{id}/replan` to create a next plan revision (optionally superseding the source plan)
+  - web gateway now also exposes `POST /api/plans/{id}/replan` to create a next plan revision (optionally superseding the source plan and optionally copying source steps)
   - web gateway also exposes user-scoped autonomy telemetry inspection endpoints for persisted execution attempts and policy decisions (`GET /api/plans/{id}/executions`, `GET /api/goals/{id}/policy-decisions`)
-  - CLI now exposes `titanclaw goal`, `titanclaw plan`, and `titanclaw plan-step` subcommands for user-scoped create/list/show/set-status workflows plus `plan replan` and atomic step replacement (`plan-step replace`) against the autonomy persistence layer
+  - CLI now exposes `titanclaw goal`, `titanclaw plan`, and `titanclaw plan-step` subcommands for user-scoped create/list/show/set-status workflows plus `plan replan` (with optional `--copy-steps`) and atomic step replacement (`plan-step replace`) against the autonomy persistence layer
 - Web gateway auth/render hardening:
   - SSE query-token auth accepts URL-encoded tokens
   - WebSocket Origin validation parses loopback hosts correctly (including IPv6)

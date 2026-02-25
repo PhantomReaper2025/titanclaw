@@ -7,7 +7,7 @@ use chrono::Utc;
 use clap::Subcommand;
 use uuid::Uuid;
 
-use crate::agent::{Plan, PlanStatus, PlannerKind};
+use crate::agent::{Plan, PlanStatus, PlanStep, PlanStepStatus, PlannerKind};
 const DEFAULT_USER_ID: &str = "default";
 
 #[derive(Subcommand, Debug, Clone)]
@@ -113,6 +113,10 @@ pub enum PlanCommand {
         /// Keep the source plan status unchanged (do not mark superseded)
         #[arg(long)]
         no_supersede_current: bool,
+
+        /// Copy source plan steps into the new revision (reset to pending)
+        #[arg(long)]
+        copy_steps: bool,
     },
 }
 
@@ -158,6 +162,7 @@ pub async fn run_plan_command(cmd: PlanCommand) -> anyhow::Result<()> {
             estimated_time_secs,
             estimated_cost,
             no_supersede_current,
+            copy_steps,
         } => {
             replan_plan(
                 db.as_ref(),
@@ -170,6 +175,7 @@ pub async fn run_plan_command(cmd: PlanCommand) -> anyhow::Result<()> {
                 estimated_time_secs,
                 estimated_cost,
                 !no_supersede_current,
+                copy_steps,
             )
             .await
         }
@@ -387,6 +393,7 @@ async fn replan_plan(
     estimated_time_secs: Option<u64>,
     estimated_cost: Option<f64>,
     supersede_current: bool,
+    copy_steps: bool,
 ) -> anyhow::Result<()> {
     if let Some(confidence) = confidence
         && !(0.0..=1.0).contains(&confidence)
@@ -462,6 +469,55 @@ async fn replan_plan(
         .map_err(|e| anyhow::anyhow!("{}", e))
         .with_context(|| format!("failed to create replanned revision for {}", source_plan_id))?;
 
+    let copied_steps = if copy_steps {
+        let source_steps = db
+            .list_plan_steps_for_plan(source_plan.id)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
+            .with_context(|| format!("failed to list source plan steps for {}", source_plan.id))?;
+
+        if source_steps.is_empty() {
+            0usize
+        } else {
+            let now = Utc::now();
+            let copied: Vec<PlanStep> = source_steps
+                .into_iter()
+                .map(|step| PlanStep {
+                    id: Uuid::new_v4(),
+                    plan_id: new_plan.id,
+                    sequence_num: step.sequence_num,
+                    kind: step.kind,
+                    status: PlanStepStatus::Pending,
+                    title: step.title,
+                    description: step.description,
+                    tool_candidates: step.tool_candidates,
+                    inputs: step.inputs,
+                    preconditions: step.preconditions,
+                    postconditions: step.postconditions,
+                    rollback: step.rollback,
+                    policy_requirements: step.policy_requirements,
+                    started_at: None,
+                    completed_at: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .collect();
+
+            db.create_plan_steps(&copied)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))
+                .with_context(|| {
+                    format!(
+                        "failed to copy source plan steps into new plan {}",
+                        new_plan.id
+                    )
+                })?;
+            copied.len()
+        }
+    } else {
+        0usize
+    };
+
     if supersede_current {
         db.update_plan_status(source_plan.id, PlanStatus::Superseded)
             .await
@@ -470,8 +526,15 @@ async fn replan_plan(
     }
 
     println!(
-        "Created replanned plan {} (rev {}) from {}",
-        new_plan.id, new_plan.revision, source_plan.id
+        "Created replanned plan {} (rev {}) from {}{}",
+        new_plan.id,
+        new_plan.revision,
+        source_plan.id,
+        if copy_steps {
+            format!(" with {} copied step(s)", copied_steps)
+        } else {
+            String::new()
+        }
     );
     println!("{}", serde_json::to_string_pretty(&new_plan)?);
     Ok(())

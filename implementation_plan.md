@@ -36,7 +36,7 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 | Embeddings input length guard semantics | ✅ | Embedding providers now validate approximate character length (not byte length), apply checks consistently to both single and batch embedding calls, and return clearer `TextTooLong` values for non-ASCII inputs. |
 | WhatsApp unsupported media handling | ✅ | Non-text WhatsApp messages are no longer silently dropped; the channel emits an explicit placeholder message to the agent and logs a warning so users can be informed to resend as text. |
 | PostgreSQL AST graph query gap (documented) | ✅ | AST graph query remains Database/libSQL-only; runtime error message and docs now explicitly state the PostgreSQL-backed workspace limitation. |
-| Autonomy Control Plane v1 groundwork (types + persistence schema) | 🚧 | Added versioned autonomy domain types (`src/agent/autonomy.rs`), implemented Postgres/libSQL autonomy store CRUD for goals/plans/steps/execution/policy records plus plan-step read helpers and atomic plan-step replacement, added schema migrations/scaffolding (`V11`-`V17` + libSQL mirror), wired best-effort worker/dispatcher persistence so planned worker runs and chat tool approvals/execution attempts now emit DB-backed autonomy records, persisted `agent_jobs` autonomy link fields for restart-safe correlation, exposed user-scoped gateway goal/plan create + inspection + status update APIs, plan-step list/create/detail/status/replace APIs, plan revisioning (`POST /api/plans/{id}/replan`), and telemetry inspection APIs (`GET /api/plans/{id}/executions`, `GET /api/goals/{id}/policy-decisions`), and added CLI `goal`/`plan`/`plan-step` create-list-show-set-status plus `plan replan` / `plan-step replace` commands for local inspection/manual management. |
+| Autonomy Control Plane v1 groundwork (types + persistence schema) | 🚧 | Added versioned autonomy domain types (`src/agent/autonomy.rs`), implemented Postgres/libSQL autonomy store CRUD for goals/plans/steps/execution/policy records plus plan-step read helpers and atomic plan-step replacement, added schema migrations/scaffolding (`V11`-`V17` + libSQL mirror), wired best-effort worker/dispatcher persistence so planned worker runs and chat tool approvals/execution attempts now emit DB-backed autonomy records, persisted `agent_jobs` autonomy link fields for restart-safe correlation, exposed user-scoped gateway goal/plan create + inspection + status update APIs, plan-step list/create/detail/status/replace APIs, plan revisioning (`POST /api/plans/{id}/replan`, with optional source-step copying), and telemetry inspection APIs (`GET /api/plans/{id}/executions`, `GET /api/goals/{id}/policy-decisions`), and added CLI `goal`/`plan`/`plan-step` create-list-show-set-status plus `plan replan --copy-steps` / `plan-step replace` commands for local inspection/manual management. |
 
 ## Execution TODO (Live)
 
@@ -65,13 +65,13 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 - [x] Gateway goal/plan status update endpoints (`POST /api/goals/{id}/status`, `POST /api/plans/{id}/status`, user-scoped)
 - [x] Gateway plan-step endpoints (list/create/detail/status) with user-scoped ownership checks
 - [x] Gateway atomic plan-step replace endpoint for replans (`POST /api/plans/{id}/steps/replace`)
-- [x] Gateway plan replan endpoint (`POST /api/plans/{id}/replan`) for next-revision creation and optional supersede of source plan
+- [x] Gateway plan replan endpoint (`POST /api/plans/{id}/replan`) for next-revision creation with optional supersede and optional source-step copy
 - [x] Gateway telemetry inspection endpoints for autonomy execution attempts / policy decisions (user-scoped)
 - [x] CLI autonomy goal/plan commands (`goal|plan create/list/show`) with DB-backed persistence access
 - [x] CLI autonomy goal/plan status updates (`goal set-status`, `plan set-status`) with user-scoped ownership validation
 - [x] CLI plan-step commands (`plan-step create/list/show/set-status`) with user-scoped ownership validation via plan->goal
 - [x] CLI plan-step bulk replace (`plan-step replace`) with atomic DB-backed step replacement
-- [x] CLI plan replan command (`plan replan`) for next-revision creation with optional supersede of source plan
+- [x] CLI plan replan command (`plan replan`) for next-revision creation with optional supersede and optional `--copy-steps`
 
 ## Proposed Changes
 
