@@ -59,6 +59,14 @@ pub enum PlanCommand {
         #[arg(long)]
         status: Option<String>,
 
+        /// Sort order (revision_desc|revision_asc|updated_desc|updated_asc)
+        #[arg(long)]
+        sort: Option<String>,
+
+        /// Number of matching rows to skip after sorting
+        #[arg(long)]
+        offset: Option<usize>,
+
         /// Max number of plans to print (highest revision first)
         #[arg(long)]
         limit: Option<usize>,
@@ -197,8 +205,21 @@ pub async fn run_plan_command(cmd: PlanCommand) -> anyhow::Result<()> {
             goal_id,
             user_id,
             status,
+            sort,
+            offset,
             limit,
-        } => list_plans(db.as_ref(), goal_id, &user_id, status.as_deref(), limit).await,
+        } => {
+            list_plans(
+                db.as_ref(),
+                goal_id,
+                &user_id,
+                status.as_deref(),
+                sort.as_deref(),
+                offset,
+                limit,
+            )
+            .await
+        }
         PlanCommand::Show { id, user_id } => show_plan(db.as_ref(), id, &user_id).await,
         PlanCommand::SetStatus {
             id,
@@ -362,6 +383,8 @@ async fn list_plans(
     goal_id: Uuid,
     user_id: &str,
     status_filter: Option<&str>,
+    sort_raw: Option<&str>,
+    offset: Option<usize>,
     limit: Option<usize>,
 ) -> anyhow::Result<()> {
     let goal = db
@@ -383,11 +406,16 @@ async fn list_plans(
         Some(raw) => Some(parse_plan_status(raw)?),
         None => None,
     };
+    let sort = parse_plan_list_sort(sort_raw)?;
     if let Some(status) = status_filter {
         plans.retain(|p| p.status == status);
     }
-    plans.sort_by_key(|p| (p.revision, p.updated_at));
-    plans.reverse();
+    apply_plan_list_sort(&mut plans, sort);
+    if let Some(offset) = offset
+        && offset > 0
+    {
+        plans = plans.into_iter().skip(offset).collect();
+    }
     if let Some(limit) = limit {
         if limit == 0 {
             anyhow::bail!("limit must be >= 1");
@@ -800,6 +828,52 @@ fn parse_planner_kind(s: &str) -> anyhow::Result<PlannerKind> {
             "invalid planner kind '{}'; expected reasoning_v1|rule_based|hybrid",
             s
         ),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PlanListSort {
+    RevisionDesc,
+    RevisionAsc,
+    UpdatedDesc,
+    UpdatedAsc,
+}
+
+fn parse_plan_list_sort(raw: Option<&str>) -> anyhow::Result<PlanListSort> {
+    match raw
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+        .unwrap_or("revision_desc")
+    {
+        "revision_desc" => Ok(PlanListSort::RevisionDesc),
+        "revision_asc" => Ok(PlanListSort::RevisionAsc),
+        "updated_desc" => Ok(PlanListSort::UpdatedDesc),
+        "updated_asc" => Ok(PlanListSort::UpdatedAsc),
+        other => anyhow::bail!(
+            "invalid plan list sort '{}'; expected revision_desc|revision_asc|updated_desc|updated_asc",
+            other
+        ),
+    }
+}
+
+fn apply_plan_list_sort(plans: &mut [Plan], sort: PlanListSort) {
+    match sort {
+        PlanListSort::RevisionDesc => plans.sort_by_key(|p| {
+            (
+                std::cmp::Reverse(p.revision),
+                std::cmp::Reverse(p.updated_at),
+                std::cmp::Reverse(p.id),
+            )
+        }),
+        PlanListSort::RevisionAsc => plans.sort_by_key(|p| (p.revision, p.updated_at, p.id)),
+        PlanListSort::UpdatedDesc => plans.sort_by_key(|p| {
+            (
+                std::cmp::Reverse(p.updated_at),
+                std::cmp::Reverse(p.revision),
+                std::cmp::Reverse(p.id),
+            )
+        }),
+        PlanListSort::UpdatedAsc => plans.sort_by_key(|p| (p.updated_at, p.revision, p.id)),
     }
 }
 

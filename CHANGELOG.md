@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replan now also supports inline step payloads in one call: `POST /api/plans/{id}/replan` accepts `steps`, and `titanclaw plan replan` accepts `--steps-file` / `--steps-json` (mutually exclusive with step-copy mode).
 - Goal/plan lifecycle convenience actions: web aliases (`POST /api/goals/{id}/cancel`, `/complete`, `/abandon`, `POST /api/plans/{id}/cancel`, `/complete`, `/supersede`) and matching CLI aliases (`titanclaw goal cancel|complete|abandon`, `titanclaw plan cancel|complete|supersede`) on top of the existing status-update APIs.
 - Goal reprioritization support: `POST /api/goals/{id}/priority` and `titanclaw goal set-priority` with user-scoped ownership checks (PostgreSQL + libSQL).
-- Goal/plan list filtering support: web list endpoints accept optional `status` and `limit` query params, and CLI `goal list` / `plan list` now support `--status` and `--limit`.
+- Goal/plan list filtering/sorting/pagination support: web list endpoints accept optional `status`, `sort`, `offset`, and `limit` query params, and CLI `goal list` / `plan list` now support `--status`, `--sort`, `--offset`, and `--limit`.
 
 ### Changed
 

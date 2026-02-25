@@ -2947,6 +2947,8 @@ async fn skills_remove_handler(
 #[derive(Deserialize)]
 struct GoalsListQuery {
     status: Option<GoalStatus>,
+    sort: Option<String>,
+    offset: Option<usize>,
     limit: Option<usize>,
 }
 
@@ -2954,7 +2956,110 @@ struct GoalsListQuery {
 struct PlansListQuery {
     goal_id: String,
     status: Option<PlanStatus>,
+    sort: Option<String>,
+    offset: Option<usize>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GoalListSort {
+    UpdatedDesc,
+    UpdatedAsc,
+    PriorityDesc,
+    PriorityAsc,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PlanListSort {
+    RevisionDesc,
+    RevisionAsc,
+    UpdatedDesc,
+    UpdatedAsc,
+}
+
+fn parse_goal_list_sort(raw: Option<&str>) -> Result<GoalListSort, (StatusCode, String)> {
+    match raw
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+        .unwrap_or("updated_desc")
+    {
+        "updated_desc" => Ok(GoalListSort::UpdatedDesc),
+        "updated_asc" => Ok(GoalListSort::UpdatedAsc),
+        "priority_desc" => Ok(GoalListSort::PriorityDesc),
+        "priority_asc" => Ok(GoalListSort::PriorityAsc),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid goal sort '{}'; expected updated_desc|updated_asc|priority_desc|priority_asc",
+                other
+            ),
+        )),
+    }
+}
+
+fn apply_goal_list_sort(goals: &mut [Goal], sort: GoalListSort) {
+    match sort {
+        GoalListSort::UpdatedDesc => goals.sort_by_key(|g| {
+            (
+                std::cmp::Reverse(g.updated_at),
+                std::cmp::Reverse(g.created_at),
+                std::cmp::Reverse(g.id),
+            )
+        }),
+        GoalListSort::UpdatedAsc => goals.sort_by_key(|g| (g.updated_at, g.created_at, g.id)),
+        GoalListSort::PriorityDesc => goals.sort_by_key(|g| {
+            (
+                std::cmp::Reverse(g.priority),
+                std::cmp::Reverse(g.updated_at),
+                std::cmp::Reverse(g.created_at),
+                std::cmp::Reverse(g.id),
+            )
+        }),
+        GoalListSort::PriorityAsc => {
+            goals.sort_by_key(|g| (g.priority, g.updated_at, g.created_at, g.id))
+        }
+    }
+}
+
+fn parse_plan_list_sort(raw: Option<&str>) -> Result<PlanListSort, (StatusCode, String)> {
+    match raw
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+        .unwrap_or("revision_desc")
+    {
+        "revision_desc" => Ok(PlanListSort::RevisionDesc),
+        "revision_asc" => Ok(PlanListSort::RevisionAsc),
+        "updated_desc" => Ok(PlanListSort::UpdatedDesc),
+        "updated_asc" => Ok(PlanListSort::UpdatedAsc),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid plan sort '{}'; expected revision_desc|revision_asc|updated_desc|updated_asc",
+                other
+            ),
+        )),
+    }
+}
+
+fn apply_plan_list_sort(plans: &mut [Plan], sort: PlanListSort) {
+    match sort {
+        PlanListSort::RevisionDesc => plans.sort_by_key(|p| {
+            (
+                std::cmp::Reverse(p.revision),
+                std::cmp::Reverse(p.updated_at),
+                std::cmp::Reverse(p.id),
+            )
+        }),
+        PlanListSort::RevisionAsc => plans.sort_by_key(|p| (p.revision, p.updated_at, p.id)),
+        PlanListSort::UpdatedDesc => plans.sort_by_key(|p| {
+            (
+                std::cmp::Reverse(p.updated_at),
+                std::cmp::Reverse(p.revision),
+                std::cmp::Reverse(p.id),
+            )
+        }),
+        PlanListSort::UpdatedAsc => plans.sort_by_key(|p| (p.updated_at, p.revision, p.id)),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3220,6 +3325,7 @@ async fn goals_list_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
     ))?;
+    let sort = parse_goal_list_sort(query.sort.as_deref())?;
 
     let mut goals = store
         .list_goals()
@@ -3230,8 +3336,12 @@ async fn goals_list_handler(
     if let Some(status) = query.status {
         goals.retain(|g| g.status == status);
     }
-    goals.sort_by_key(|g| g.updated_at);
-    goals.reverse();
+    apply_goal_list_sort(&mut goals, sort);
+    if let Some(offset) = query.offset {
+        if offset > 0 {
+            goals = goals.into_iter().skip(offset).collect();
+        }
+    }
     if let Some(limit) = query.limit {
         if limit == 0 {
             return Err((StatusCode::BAD_REQUEST, "limit must be >= 1".to_string()));
@@ -3487,6 +3597,7 @@ async fn plans_list_handler(
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
     ))?;
+    let sort = parse_plan_list_sort(query.sort.as_deref())?;
 
     let goal_id = Uuid::parse_str(&query.goal_id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid goal ID".to_string()))?;
@@ -3505,8 +3616,12 @@ async fn plans_list_handler(
     if let Some(status) = query.status {
         plans.retain(|p| p.status == status);
     }
-    plans.sort_by_key(|p| (p.revision, p.updated_at));
-    plans.reverse();
+    apply_plan_list_sort(&mut plans, sort);
+    if let Some(offset) = query.offset {
+        if offset > 0 {
+            plans = plans.into_iter().skip(offset).collect();
+        }
+    }
     if let Some(limit) = query.limit {
         if limit == 0 {
             return Err((StatusCode::BAD_REQUEST, "limit must be >= 1".to_string()));
@@ -5169,6 +5284,8 @@ mod tests {
             State(state),
             Query(GoalsListQuery {
                 status: Some(GoalStatus::Active),
+                sort: None,
+                offset: None,
                 limit: Some(1),
             }),
         )
@@ -5244,6 +5361,8 @@ mod tests {
             Query(PlansListQuery {
                 goal_id: seed_plan.goal_id.to_string(),
                 status: Some(PlanStatus::Ready),
+                sort: None,
+                offset: None,
                 limit: Some(1),
             }),
         )
@@ -5255,5 +5374,153 @@ mod tests {
         assert_eq!(plans[0]["status"], json!("ready"));
         assert_eq!(plans[0]["id"], json!(ready_plan_newer.id));
         assert_eq!(plans[0]["revision"], json!(4));
+    }
+
+    #[tokio::test]
+    async fn test_goal_and_plan_list_handlers_support_sort_offset_and_reject_invalid_sort() {
+        let (_dir, store) = make_test_store().await;
+        let state = make_test_gateway_state("alice", store.clone());
+        let now = chrono::Utc::now();
+
+        let goal1 = Goal {
+            id: Uuid::new_v4(),
+            owner_user_id: "alice".to_string(),
+            channel: Some("web".to_string()),
+            thread_id: None,
+            title: "prio 5".to_string(),
+            intent: "intent".to_string(),
+            priority: 5,
+            status: GoalStatus::Active,
+            risk_class: GoalRiskClass::Low,
+            acceptance_criteria: json!({}),
+            constraints: json!({}),
+            source: GoalSource::UserRequest,
+            created_at: now - chrono::TimeDelta::minutes(3),
+            updated_at: now - chrono::TimeDelta::minutes(3),
+            completed_at: None,
+        };
+        let goal2 = Goal {
+            id: Uuid::new_v4(),
+            owner_user_id: "alice".to_string(),
+            channel: Some("web".to_string()),
+            thread_id: None,
+            title: "prio 9".to_string(),
+            intent: "intent".to_string(),
+            priority: 9,
+            status: GoalStatus::Active,
+            risk_class: GoalRiskClass::Low,
+            acceptance_criteria: json!({}),
+            constraints: json!({}),
+            source: GoalSource::UserRequest,
+            created_at: now - chrono::TimeDelta::minutes(2),
+            updated_at: now - chrono::TimeDelta::minutes(2),
+            completed_at: None,
+        };
+        let goal3 = Goal {
+            id: Uuid::new_v4(),
+            owner_user_id: "alice".to_string(),
+            channel: Some("web".to_string()),
+            thread_id: None,
+            title: "prio 7".to_string(),
+            intent: "intent".to_string(),
+            priority: 7,
+            status: GoalStatus::Active,
+            risk_class: GoalRiskClass::Low,
+            acceptance_criteria: json!({}),
+            constraints: json!({}),
+            source: GoalSource::UserRequest,
+            created_at: now - chrono::TimeDelta::minutes(1),
+            updated_at: now - chrono::TimeDelta::minutes(1),
+            completed_at: None,
+        };
+        for goal in [&goal1, &goal2, &goal3] {
+            store.create_goal(goal).await.expect("seed goal");
+        }
+
+        let Json(goals_body) = goals_list_handler(
+            State(state.clone()),
+            Query(GoalsListQuery {
+                status: Some(GoalStatus::Active),
+                sort: Some("priority_desc".to_string()),
+                offset: Some(1),
+                limit: Some(1),
+            }),
+        )
+        .await
+        .expect("sorted/offset goals list");
+        let goals = goals_body["goals"].as_array().expect("goals array");
+        assert_eq!(goals.len(), 1);
+        assert_eq!(goals[0]["id"], json!(goal3.id));
+
+        let goals_sort_err = goals_list_handler(
+            State(state.clone()),
+            Query(GoalsListQuery {
+                status: None,
+                sort: Some("bad_sort".to_string()),
+                offset: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(goals_sort_err.0, StatusCode::BAD_REQUEST);
+        assert!(goals_sort_err.1.contains("invalid goal sort"));
+
+        let (goal_seed, base_plan) = seed_goal_and_plan(store.as_ref(), "alice").await;
+        let _ = goal_seed;
+        for (revision, status, minutes_ago) in [
+            (2, PlanStatus::Ready, 5),
+            (3, PlanStatus::Ready, 4),
+            (4, PlanStatus::Ready, 3),
+            (5, PlanStatus::Running, 2),
+        ] {
+            let plan = Plan {
+                id: Uuid::new_v4(),
+                goal_id: base_plan.goal_id,
+                revision,
+                status,
+                planner_kind: PlannerKind::ReasoningV1,
+                source_action_plan: None,
+                assumptions: json!({}),
+                confidence: 0.5,
+                estimated_cost: None,
+                estimated_time_secs: None,
+                summary: Some(format!("plan {}", revision)),
+                created_at: now - chrono::TimeDelta::minutes(minutes_ago),
+                updated_at: now - chrono::TimeDelta::minutes(minutes_ago),
+            };
+            store.create_plan(&plan).await.expect("seed plan");
+        }
+
+        let Json(plans_body) = plans_list_handler(
+            State(state.clone()),
+            Query(PlansListQuery {
+                goal_id: base_plan.goal_id.to_string(),
+                status: Some(PlanStatus::Ready),
+                sort: Some("revision_asc".to_string()),
+                offset: Some(1),
+                limit: Some(1),
+            }),
+        )
+        .await
+        .expect("sorted/offset plans list");
+        let plans = plans_body["plans"].as_array().expect("plans array");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0]["revision"], json!(3));
+
+        let plans_sort_err = plans_list_handler(
+            State(state),
+            Query(PlansListQuery {
+                goal_id: base_plan.goal_id.to_string(),
+                status: None,
+                sort: Some("bad_sort".to_string()),
+                offset: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(plans_sort_err.0, StatusCode::BAD_REQUEST);
+        assert!(plans_sort_err.1.contains("invalid plan sort"));
     }
 }

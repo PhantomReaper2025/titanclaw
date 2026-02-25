@@ -49,6 +49,14 @@ pub enum GoalCommand {
         #[arg(long)]
         status: Option<String>,
 
+        /// Sort order (updated_desc|updated_asc|priority_desc|priority_asc)
+        #[arg(long)]
+        sort: Option<String>,
+
+        /// Number of matching rows to skip after sorting
+        #[arg(long)]
+        offset: Option<usize>,
+
         /// Max number of goals to print (most recent first)
         #[arg(long)]
         limit: Option<usize>,
@@ -147,8 +155,20 @@ pub async fn run_goal_command(cmd: GoalCommand) -> anyhow::Result<()> {
         GoalCommand::List {
             user_id,
             status,
+            sort,
+            offset,
             limit,
-        } => list_goals(db.as_ref(), &user_id, status.as_deref(), limit).await,
+        } => {
+            list_goals(
+                db.as_ref(),
+                &user_id,
+                status.as_deref(),
+                sort.as_deref(),
+                offset,
+                limit,
+            )
+            .await
+        }
         GoalCommand::Show { id, user_id } => show_goal(db.as_ref(), id, &user_id).await,
         GoalCommand::SetStatus {
             id,
@@ -238,6 +258,8 @@ async fn list_goals(
     db: &dyn crate::db::Database,
     user_id: &str,
     status_filter: Option<&str>,
+    sort_raw: Option<&str>,
+    offset: Option<usize>,
     limit: Option<usize>,
 ) -> anyhow::Result<()> {
     let mut goals = db
@@ -250,13 +272,18 @@ async fn list_goals(
         Some(raw) => Some(parse_goal_status(raw)?),
         None => None,
     };
+    let sort = parse_goal_list_sort(sort_raw)?;
 
     goals.retain(|g| g.owner_user_id == user_id);
     if let Some(status) = status_filter {
         goals.retain(|g| g.status == status);
     }
-    goals.sort_by_key(|g| (g.updated_at, g.created_at));
-    goals.reverse();
+    apply_goal_list_sort(&mut goals, sort);
+    if let Some(offset) = offset
+        && offset > 0
+    {
+        goals = goals.into_iter().skip(offset).collect();
+    }
     if let Some(limit) = limit {
         if limit == 0 {
             anyhow::bail!("limit must be >= 1");
@@ -384,6 +411,55 @@ fn parse_goal_status(s: &str) -> anyhow::Result<GoalStatus> {
             "invalid goal status '{}'; expected proposed|active|blocked|waiting|completed|abandoned",
             s
         ),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GoalListSort {
+    UpdatedDesc,
+    UpdatedAsc,
+    PriorityDesc,
+    PriorityAsc,
+}
+
+fn parse_goal_list_sort(raw: Option<&str>) -> anyhow::Result<GoalListSort> {
+    match raw
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+        .unwrap_or("updated_desc")
+    {
+        "updated_desc" => Ok(GoalListSort::UpdatedDesc),
+        "updated_asc" => Ok(GoalListSort::UpdatedAsc),
+        "priority_desc" => Ok(GoalListSort::PriorityDesc),
+        "priority_asc" => Ok(GoalListSort::PriorityAsc),
+        other => anyhow::bail!(
+            "invalid goal list sort '{}'; expected updated_desc|updated_asc|priority_desc|priority_asc",
+            other
+        ),
+    }
+}
+
+fn apply_goal_list_sort(goals: &mut [Goal], sort: GoalListSort) {
+    match sort {
+        GoalListSort::UpdatedDesc => goals.sort_by_key(|g| {
+            (
+                std::cmp::Reverse(g.updated_at),
+                std::cmp::Reverse(g.created_at),
+                std::cmp::Reverse(g.id),
+            )
+        }),
+        GoalListSort::UpdatedAsc => goals.sort_by_key(|g| (g.updated_at, g.created_at, g.id)),
+        GoalListSort::PriorityDesc => goals.sort_by_key(|g| {
+            (
+                std::cmp::Reverse(g.priority),
+                std::cmp::Reverse(g.updated_at),
+                std::cmp::Reverse(g.created_at),
+                std::cmp::Reverse(g.id),
+            )
+        }),
+        GoalListSort::PriorityAsc => {
+            goals.sort_by_key(|g| (g.priority, g.updated_at, g.created_at, g.id))
+        }
     }
 }
 
