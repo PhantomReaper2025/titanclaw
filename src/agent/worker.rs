@@ -2117,6 +2117,42 @@ mod tests {
         }
     }
 
+    struct ApprovalTool;
+
+    #[async_trait]
+    impl Tool for ApprovalTool {
+        fn name(&self) -> &str {
+            "approval_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Tool that should be blocked by worker policy preflight"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type":"object",
+                "properties": {},
+                "additionalProperties": true
+            })
+        }
+
+        fn requires_approval(&self) -> bool {
+            true
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &crate::context::JobContext,
+        ) -> Result<ToolOutput, crate::tools::ToolError> {
+            Ok(ToolOutput::success(
+                serde_json::json!({"unexpected": "executed"}),
+                Duration::from_millis(1),
+            ))
+        }
+    }
+
     enum ScriptedLlmResponse {
         Complete(String),
         CompleteWithTools(String),
@@ -2549,5 +2585,120 @@ mod tests {
         assert_eq!(scripted_llm.complete_calls(), 2);
         assert_eq!(scripted_llm.complete_with_tools_calls(), 1);
         assert_eq!(scripted_llm.remaining(), 0);
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_execute_tool_inner_policy_denial_persists_autonomy_policy_record() {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(ApprovalTool)).await;
+        let llm: Arc<dyn LlmProvider> = Arc::new(StubLlm::new("unused"));
+        let harness = TestHarnessBuilder::new()
+            .with_tools(Arc::clone(&tools))
+            .with_llm(Arc::clone(&llm))
+            .build()
+            .await;
+
+        let context_manager = Arc::new(ContextManager::new(4));
+        let job_id = context_manager
+            .create_job_for_user("user-1", "Policy preflight test", "Should require approval")
+            .await
+            .expect("create job");
+
+        let goal_id = Uuid::new_v4();
+        let now = Utc::now();
+        harness
+            .db
+            .create_goal(&Goal {
+                id: goal_id,
+                owner_user_id: "user-1".to_string(),
+                channel: Some("worker".to_string()),
+                thread_id: None,
+                title: "Policy preflight test".to_string(),
+                intent: "Assert worker policy preflight persistence".to_string(),
+                priority: 0,
+                status: GoalStatus::Active,
+                risk_class: GoalRiskClass::Medium,
+                acceptance_criteria: serde_json::json!({}),
+                constraints: serde_json::json!({}),
+                source: GoalSource::UserRequest,
+                created_at: now,
+                updated_at: now,
+                completed_at: None,
+            })
+            .await
+            .expect("create goal");
+
+        context_manager
+            .update_context(job_id, |ctx| -> Result<(), String> {
+                ctx.transition_to(JobState::InProgress, Some("test setup".to_string()))?;
+                ctx.set_autonomy_links(Some(goal_id), None);
+                Ok(())
+            })
+            .await
+            .expect("update context")
+            .expect("context setup");
+
+        let deps = WorkerDeps {
+            context_manager: Arc::clone(&context_manager),
+            llm: Arc::clone(&llm),
+            safety: harness.deps.safety.clone(),
+            tools: Arc::clone(&tools),
+            store: Some(harness.db.clone()),
+            hooks: Arc::new(HookRegistry::new()),
+            timeout: Duration::from_secs(10),
+            use_planning: true,
+            autonomy_policy_engine_v1: true,
+            autonomy_verifier_v1: true,
+            autonomy_replanner_v1: true,
+        };
+
+        let err =
+            Worker::execute_tool_inner(&deps, job_id, "approval_tool", &serde_json::json!({}))
+                .await
+                .expect_err("approval tool should be blocked before execution");
+        match err {
+            Error::Tool(ToolError::AuthRequired { name }) => assert_eq!(name, "approval_tool"),
+            other => panic!("expected AuthRequired, got {other}"),
+        }
+
+        let record = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = harness
+                    .db
+                    .list_policy_decisions_for_goal(goal_id)
+                    .await
+                    .expect("list policy decisions");
+                if let Some(row) = rows
+                    .iter()
+                    .find(|r| r.tool_name.as_deref() == Some("approval_tool"))
+                    .cloned()
+                {
+                    break row;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("policy decision persistence timeout");
+
+        assert_eq!(
+            record.decision,
+            crate::agent::PolicyDecisionKind::RequireApproval
+        );
+        assert_eq!(record.action_kind, "tool_call_preflight");
+        assert_eq!(record.goal_id, Some(goal_id));
+        assert_eq!(record.plan_id, None);
+        assert_eq!(record.user_id, "user-1");
+        assert_eq!(record.channel, "worker");
+        assert_eq!(record.tool_name.as_deref(), Some("approval_tool"));
+        assert!(record.requires_approval);
+        assert_eq!(record.auto_approved, Some(false));
+        assert!(
+            record
+                .reason_codes
+                .iter()
+                .any(|c| c == "tool_requires_approval")
+        );
     }
 }
