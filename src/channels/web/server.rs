@@ -4821,4 +4821,77 @@ mod tests {
         assert_eq!(err.0, StatusCode::NOT_FOUND);
         assert_eq!(err.1, "Plan not found");
     }
+
+    #[tokio::test]
+    async fn test_goals_complete_and_abandon_handlers_update_owned_goal_status() {
+        let (_dir, store) = make_test_store().await;
+        let state = make_test_gateway_state("alice", store.clone());
+        let (goal, _plan) = seed_goal_and_plan(store.as_ref(), "alice").await;
+
+        let Json(complete_body) =
+            goals_complete_handler(State(state.clone()), Path(goal.id.to_string()))
+                .await
+                .expect("complete goal");
+        assert_eq!(complete_body["goal"]["status"], json!("completed"));
+
+        let after_complete = store
+            .get_goal(goal.id)
+            .await
+            .expect("reload goal")
+            .expect("goal exists");
+        assert_eq!(after_complete.status, GoalStatus::Completed);
+        assert!(after_complete.completed_at.is_some());
+
+        let Json(abandon_body) = goals_abandon_handler(State(state), Path(goal.id.to_string()))
+            .await
+            .expect("abandon goal");
+        assert_eq!(abandon_body["goal"]["status"], json!("abandoned"));
+
+        let after_abandon = store
+            .get_goal(goal.id)
+            .await
+            .expect("reload goal")
+            .expect("goal exists");
+        assert_eq!(after_abandon.status, GoalStatus::Abandoned);
+    }
+
+    #[tokio::test]
+    async fn test_plan_lifecycle_alias_handlers_update_status_and_enforce_ownership() {
+        let (_dir, store) = make_test_store().await;
+        let alice_state = make_test_gateway_state("alice", store.clone());
+        let bob_state = make_test_gateway_state("bob", store.clone());
+        let (_goal, plan) = seed_goal_and_plan(store.as_ref(), "alice").await;
+
+        let Json(complete_body) =
+            plans_complete_handler(State(alice_state.clone()), Path(plan.id.to_string()))
+                .await
+                .expect("complete plan");
+        assert_eq!(complete_body["plan"]["status"], json!("completed"));
+
+        let after_complete = store
+            .get_plan(plan.id)
+            .await
+            .expect("reload plan")
+            .expect("plan exists");
+        assert_eq!(after_complete.status, PlanStatus::Completed);
+
+        let Json(supersede_body) =
+            plans_supersede_handler(State(alice_state), Path(plan.id.to_string()))
+                .await
+                .expect("supersede plan");
+        assert_eq!(supersede_body["plan"]["status"], json!("superseded"));
+
+        let after_supersede = store
+            .get_plan(plan.id)
+            .await
+            .expect("reload plan")
+            .expect("plan exists");
+        assert_eq!(after_supersede.status, PlanStatus::Superseded);
+
+        let err = plans_complete_handler(State(bob_state), Path(plan.id.to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1, "Plan not found");
+    }
 }
