@@ -551,3 +551,121 @@ fn truncate(s: &str, max: usize) -> String {
     out.push_str("...");
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_parse_replace_steps_payload_accepts_wrapper() {
+        let raw = r#"{
+            "steps": [
+                {
+                    "sequence_num": 1,
+                    "kind": "tool_call",
+                    "title": "Run",
+                    "description": "Execute",
+                    "tool_candidates": null,
+                    "inputs": {"cmd": "echo hi"},
+                    "preconditions": null,
+                    "postconditions": null,
+                    "rollback": null,
+                    "policy_requirements": null
+                }
+            ]
+        }"#;
+
+        let parsed = parse_replace_steps_payload(raw).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].sequence_num, 1);
+        assert_eq!(parsed[0].kind, "tool_call");
+        assert_eq!(parsed[0].inputs, json!({"cmd":"echo hi"}));
+    }
+
+    #[test]
+    fn test_parse_replace_steps_payload_accepts_array() {
+        let raw = r#"[
+            {
+                "sequence_num": 2,
+                "kind": "verification",
+                "title": "Verify",
+                "description": "Check result"
+            }
+        ]"#;
+
+        let parsed = parse_replace_steps_payload(raw).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].sequence_num, 2);
+        assert_eq!(parsed[0].kind, "verification");
+        assert_eq!(parsed[0].tool_candidates, Value::Null);
+    }
+
+    #[test]
+    fn test_parse_replace_steps_payload_invalid() {
+        let err = parse_replace_steps_payload("{not json")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid replace payload JSON"));
+    }
+
+    #[test]
+    fn test_json_helpers_normalize_and_parse() {
+        assert_eq!(normalize_json_value(Value::Null), json!({}));
+        assert_eq!(normalize_json_value(json!([1, 2])), json!([1, 2]));
+
+        assert_eq!(parse_json_arg_or_default("x", None).unwrap(), json!({}));
+        assert_eq!(
+            parse_json_arg_or_default("x", Some("{\"a\":1}".to_string())).unwrap(),
+            json!({"a":1})
+        );
+        let err = parse_json_arg_or_default("x", Some("{".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid x JSON"));
+
+        assert_eq!(parse_optional_json_arg("y", None).unwrap(), None);
+        assert_eq!(
+            parse_optional_json_arg("y", Some("null".to_string())).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_optional_json_arg("y", Some("[1]".to_string())).unwrap(),
+            Some(json!([1]))
+        );
+    }
+
+    #[test]
+    fn test_parse_plan_step_kind_and_status_normalize_case() {
+        assert_eq!(
+            parse_plan_step_kind("  TOOL_Call ").unwrap(),
+            PlanStepKind::ToolCall
+        );
+        assert_eq!(
+            parse_plan_step_kind("Evidence_Gather").unwrap(),
+            PlanStepKind::EvidenceGather
+        );
+        assert_eq!(
+            parse_plan_step_status(" Running ").unwrap(),
+            PlanStepStatus::Running
+        );
+        assert_eq!(
+            parse_plan_step_status("succeeded").unwrap(),
+            PlanStepStatus::Succeeded
+        );
+
+        let kind_err = parse_plan_step_kind("bad_kind").unwrap_err().to_string();
+        assert!(kind_err.contains("invalid plan-step kind"));
+        let status_err = parse_plan_step_status("bad_status")
+            .unwrap_err()
+            .to_string();
+        assert!(status_err.contains("invalid plan-step status"));
+    }
+
+    #[test]
+    fn test_truncate_behavior() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("exact", 5), "exact");
+        assert_eq!(truncate("abcdefghij", 8), "abcde...");
+    }
+}

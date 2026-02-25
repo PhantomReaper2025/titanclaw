@@ -4227,6 +4227,7 @@ struct GatewayStatusResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_build_turns_from_db_messages_complete() {
@@ -4313,5 +4314,85 @@ mod tests {
         assert!(!is_allowed_local_ws_origin("http://localhost.evil.com"));
         assert!(!is_allowed_local_ws_origin("not-a-url"));
         assert!(!is_allowed_local_ws_origin("https://example.com"));
+    }
+
+    #[test]
+    fn test_build_plan_steps_from_inputs_rejects_empty_when_not_allowed() {
+        let err = build_plan_steps_from_inputs(Uuid::nil(), vec![], false).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("At least one plan step"));
+    }
+
+    #[test]
+    fn test_build_plan_steps_from_inputs_allows_empty_for_replace() {
+        let steps = build_plan_steps_from_inputs(Uuid::nil(), vec![], true).unwrap();
+        assert!(steps.is_empty());
+    }
+
+    #[test]
+    fn test_build_plan_steps_from_inputs_rejects_invalid_steps() {
+        let inputs = vec![
+            PlanStepCreateInput {
+                sequence_num: 1,
+                kind: PlanStepKind::ToolCall,
+                title: "First".to_string(),
+                description: "Desc".to_string(),
+                tool_candidates: json!({}),
+                inputs: json!({}),
+                preconditions: json!({}),
+                postconditions: json!({}),
+                rollback: None,
+                policy_requirements: json!({}),
+            },
+            PlanStepCreateInput {
+                sequence_num: 1,
+                kind: PlanStepKind::Verification,
+                title: "Second".to_string(),
+                description: "Desc".to_string(),
+                tool_candidates: json!({}),
+                inputs: json!({}),
+                preconditions: json!({}),
+                postconditions: json!({}),
+                rollback: None,
+                policy_requirements: json!({}),
+            },
+        ];
+
+        let err = build_plan_steps_from_inputs(Uuid::nil(), inputs, false).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("duplicate sequence_num"));
+    }
+
+    #[test]
+    fn test_build_plan_steps_from_inputs_normalizes_and_trims() {
+        let plan_id = Uuid::new_v4();
+        let inputs = vec![PlanStepCreateInput {
+            sequence_num: 7,
+            kind: PlanStepKind::EvidenceGather,
+            title: "  Gather facts  ".to_string(),
+            description: "  Collect evidence  ".to_string(),
+            tool_candidates: serde_json::Value::Null,
+            inputs: json!({"q":"status"}),
+            preconditions: serde_json::Value::Null,
+            postconditions: serde_json::Value::Null,
+            rollback: Some(json!(null)),
+            policy_requirements: serde_json::Value::Null,
+        }];
+
+        let steps = build_plan_steps_from_inputs(plan_id, inputs, false).unwrap();
+        assert_eq!(steps.len(), 1);
+        let step = &steps[0];
+        assert_eq!(step.plan_id, plan_id);
+        assert_eq!(step.sequence_num, 7);
+        assert_eq!(step.kind, PlanStepKind::EvidenceGather);
+        assert_eq!(step.status, PlanStepStatus::Pending);
+        assert_eq!(step.title, "Gather facts");
+        assert_eq!(step.description, "Collect evidence");
+        assert_eq!(step.tool_candidates, json!({}));
+        assert_eq!(step.inputs, json!({"q":"status"}));
+        assert_eq!(step.preconditions, json!({}));
+        assert_eq!(step.postconditions, json!({}));
+        assert_eq!(step.rollback, Some(json!(null)));
+        assert_eq!(step.policy_requirements, json!({}));
     }
 }
