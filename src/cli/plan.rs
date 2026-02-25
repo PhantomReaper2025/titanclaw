@@ -775,3 +775,107 @@ fn truncate(s: &str, max: usize) -> String {
     out.push_str("...");
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_parse_replan_steps_payload_accepts_wrapper_and_array() {
+        let wrapped = r#"{
+            "steps": [
+                {
+                    "sequence_num": 1,
+                    "kind": "tool_call",
+                    "title": "Patch",
+                    "description": "Apply patch"
+                }
+            ]
+        }"#;
+        let from_wrapper = parse_replan_steps_payload(wrapped).unwrap();
+        assert_eq!(from_wrapper.len(), 1);
+        assert_eq!(from_wrapper[0].sequence_num, 1);
+        assert_eq!(from_wrapper[0].kind, "tool_call");
+
+        let array = r#"[
+            {
+                "sequence_num": 2,
+                "kind": "verification",
+                "title": "Verify",
+                "description": "Run checks"
+            }
+        ]"#;
+        let from_array = parse_replan_steps_payload(array).unwrap();
+        assert_eq!(from_array.len(), 1);
+        assert_eq!(from_array[0].sequence_num, 2);
+        assert_eq!(from_array[0].kind, "verification");
+    }
+
+    #[test]
+    fn test_build_replan_steps_from_inputs_validates_and_normalizes() {
+        let plan_id = Uuid::new_v4();
+        let inputs = vec![ReplanPlanStepInput {
+            sequence_num: 3,
+            kind: "evidence_gather".to_string(),
+            title: "  Gather evidence ".to_string(),
+            description: "  Inspect logs ".to_string(),
+            tool_candidates: Value::Null,
+            inputs: json!({"q":"error"}),
+            preconditions: Value::Null,
+            postconditions: Value::Null,
+            rollback: Some(json!(null)),
+            policy_requirements: Value::Null,
+        }];
+
+        let steps = build_replan_steps_from_inputs(plan_id, inputs).unwrap();
+        assert_eq!(steps.len(), 1);
+        let step = &steps[0];
+        assert_eq!(step.plan_id, plan_id);
+        assert_eq!(step.sequence_num, 3);
+        assert_eq!(step.kind, PlanStepKind::EvidenceGather);
+        assert_eq!(step.status, PlanStepStatus::Pending);
+        assert_eq!(step.title, "Gather evidence");
+        assert_eq!(step.description, "Inspect logs");
+        assert_eq!(step.tool_candidates, json!({}));
+        assert_eq!(step.inputs, json!({"q":"error"}));
+        assert_eq!(step.preconditions, json!({}));
+        assert_eq!(step.postconditions, json!({}));
+        assert_eq!(step.rollback, None);
+        assert_eq!(step.policy_requirements, json!({}));
+    }
+
+    #[test]
+    fn test_build_replan_steps_from_inputs_rejects_duplicate_sequence_numbers() {
+        let plan_id = Uuid::new_v4();
+        let inputs = vec![
+            ReplanPlanStepInput {
+                sequence_num: 1,
+                kind: "tool_call".to_string(),
+                title: "One".to_string(),
+                description: "First".to_string(),
+                tool_candidates: json!({}),
+                inputs: json!({}),
+                preconditions: json!({}),
+                postconditions: json!({}),
+                rollback: None,
+                policy_requirements: json!({}),
+            },
+            ReplanPlanStepInput {
+                sequence_num: 1,
+                kind: "verification".to_string(),
+                title: "Two".to_string(),
+                description: "Second".to_string(),
+                tool_candidates: json!({}),
+                inputs: json!({}),
+                preconditions: json!({}),
+                postconditions: json!({}),
+                rollback: None,
+                policy_requirements: json!({}),
+            },
+        ];
+
+        let err = build_replan_steps_from_inputs(plan_id, inputs).unwrap_err();
+        assert!(err.to_string().contains("duplicate sequence_num"));
+    }
+}
