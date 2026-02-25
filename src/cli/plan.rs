@@ -10,7 +10,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::agent::{
-    Plan, PlanStatus, PlanStep, PlanStepKind, PlanStepStatus, PlanVerification, PlannerKind,
+    Plan, PlanStatus, PlanStep, PlanStepKind, PlanStepStatus, PlanVerification,
+    PlanVerificationStatus, PlannerKind,
 };
 const DEFAULT_USER_ID: &str = "default";
 
@@ -92,6 +93,18 @@ pub enum PlanCommand {
         /// Owner user ID (used to validate goal ownership)
         #[arg(long, default_value = DEFAULT_USER_ID)]
         user_id: String,
+
+        /// Optional status filter (passed|failed|inconclusive)
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Sort order (created_desc|created_asc)
+        #[arg(long)]
+        sort: Option<String>,
+
+        /// Number of matching rows to skip after sorting
+        #[arg(long)]
+        offset: Option<usize>,
 
         /// Max number of verification records to print (newest first)
         #[arg(long)]
@@ -237,8 +250,24 @@ pub async fn run_plan_command(cmd: PlanCommand) -> anyhow::Result<()> {
             .await
         }
         PlanCommand::Show { id, user_id } => show_plan(db.as_ref(), id, &user_id).await,
-        PlanCommand::Verifications { id, user_id, limit } => {
-            list_plan_verifications(db.as_ref(), id, &user_id, limit).await
+        PlanCommand::Verifications {
+            id,
+            user_id,
+            status,
+            sort,
+            offset,
+            limit,
+        } => {
+            list_plan_verifications(
+                db.as_ref(),
+                id,
+                &user_id,
+                status.as_deref(),
+                sort.as_deref(),
+                offset,
+                limit,
+            )
+            .await
         }
         PlanCommand::SetStatus {
             id,
@@ -496,6 +525,9 @@ async fn list_plan_verifications(
     db: &dyn crate::db::Database,
     plan_id: Uuid,
     user_id: &str,
+    status_raw: Option<&str>,
+    sort_raw: Option<&str>,
+    offset: Option<usize>,
     limit: Option<usize>,
 ) -> anyhow::Result<()> {
     if let Some(limit) = limit
@@ -526,8 +558,20 @@ async fn list_plan_verifications(
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))
         .with_context(|| format!("failed to list verifications for plan {}", plan_id))?;
-    verifications.sort_by_key(|v| (v.created_at, v.id));
-    verifications.reverse();
+    let status_filter = match status_raw {
+        Some(raw) => Some(parse_plan_verification_status(raw)?),
+        None => None,
+    };
+    let sort = parse_plan_verification_list_sort(sort_raw)?;
+    if let Some(status) = status_filter {
+        verifications.retain(|v| v.status == status);
+    }
+    apply_plan_verification_list_sort(&mut verifications, sort);
+    if let Some(offset) = offset
+        && offset > 0
+    {
+        verifications = verifications.into_iter().skip(offset).collect();
+    }
 
     if let Some(limit) = limit {
         verifications.truncate(limit);
@@ -889,6 +933,18 @@ fn parse_plan_status(s: &str) -> anyhow::Result<PlanStatus> {
     }
 }
 
+fn parse_plan_verification_status(s: &str) -> anyhow::Result<PlanVerificationStatus> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "passed" => Ok(PlanVerificationStatus::Passed),
+        "failed" => Ok(PlanVerificationStatus::Failed),
+        "inconclusive" => Ok(PlanVerificationStatus::Inconclusive),
+        _ => anyhow::bail!(
+            "invalid plan verification status '{}'; expected passed|failed|inconclusive",
+            s
+        ),
+    }
+}
+
 fn parse_planner_kind(s: &str) -> anyhow::Result<PlannerKind> {
     match s.trim().to_ascii_lowercase().as_str() {
         "reasoning_v1" => Ok(PlannerKind::ReasoningV1),
@@ -907,6 +963,12 @@ enum PlanListSort {
     RevisionAsc,
     UpdatedDesc,
     UpdatedAsc,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PlanVerificationListSort {
+    CreatedDesc,
+    CreatedAsc,
 }
 
 fn parse_plan_list_sort(raw: Option<&str>) -> anyhow::Result<PlanListSort> {
@@ -944,6 +1006,34 @@ fn apply_plan_list_sort(plans: &mut [Plan], sort: PlanListSort) {
             )
         }),
         PlanListSort::UpdatedAsc => plans.sort_by_key(|p| (p.updated_at, p.revision, p.id)),
+    }
+}
+
+fn parse_plan_verification_list_sort(
+    raw: Option<&str>,
+) -> anyhow::Result<PlanVerificationListSort> {
+    match raw
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+        .unwrap_or("created_desc")
+    {
+        "created_desc" => Ok(PlanVerificationListSort::CreatedDesc),
+        "created_asc" => Ok(PlanVerificationListSort::CreatedAsc),
+        other => anyhow::bail!(
+            "invalid plan verification sort '{}'; expected created_desc|created_asc",
+            other
+        ),
+    }
+}
+
+fn apply_plan_verification_list_sort(
+    verifications: &mut [PlanVerification],
+    sort: PlanVerificationListSort,
+) {
+    match sort {
+        PlanVerificationListSort::CreatedDesc => verifications
+            .sort_by_key(|v| (std::cmp::Reverse(v.created_at), std::cmp::Reverse(v.id))),
+        PlanVerificationListSort::CreatedAsc => verifications.sort_by_key(|v| (v.created_at, v.id)),
     }
 }
 
@@ -1080,15 +1170,31 @@ mod tests {
             &plan_id.to_string(),
             "--user-id",
             "alice",
+            "--status",
+            "passed",
+            "--sort",
+            "created_asc",
+            "--offset",
+            "2",
             "--limit",
             "5",
         ])
         .expect("parse plan verifications command");
 
         match cli.cmd {
-            PlanCommand::Verifications { id, user_id, limit } => {
+            PlanCommand::Verifications {
+                id,
+                user_id,
+                status,
+                sort,
+                offset,
+                limit,
+            } => {
                 assert_eq!(id, plan_id);
                 assert_eq!(user_id, "alice");
+                assert_eq!(status.as_deref(), Some("passed"));
+                assert_eq!(sort.as_deref(), Some("created_asc"));
+                assert_eq!(offset, Some(2));
                 assert_eq!(limit, Some(5));
             }
             other => panic!("unexpected command parsed: {other:?}"),

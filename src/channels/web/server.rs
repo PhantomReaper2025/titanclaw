@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use crate::agent::{
     Goal, GoalRiskClass, GoalSource, GoalStatus, Plan, PlanStatus, PlanStep, PlanStepKind,
-    PlanStepStatus, PlannerKind, SessionManager,
+    PlanStepStatus, PlanVerificationStatus, PlannerKind, SessionManager,
 };
 use crate::channels::IncomingMessage;
 use crate::channels::web::auth::{AuthState, auth_middleware};
@@ -2965,6 +2965,22 @@ struct PlansListQuery {
     limit: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct GoalPlansListQuery {
+    status: Option<PlanStatus>,
+    sort: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct PlanVerificationsListQuery {
+    status: Option<PlanVerificationStatus>,
+    sort: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum GoalListSort {
     UpdatedDesc,
@@ -2979,6 +2995,12 @@ enum PlanListSort {
     RevisionAsc,
     UpdatedDesc,
     UpdatedAsc,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PlanVerificationListSort {
+    CreatedDesc,
+    CreatedAsc,
 }
 
 fn parse_goal_list_sort(raw: Option<&str>) -> Result<GoalListSort, (StatusCode, String)> {
@@ -3063,6 +3085,37 @@ fn apply_plan_list_sort(plans: &mut [Plan], sort: PlanListSort) {
             )
         }),
         PlanListSort::UpdatedAsc => plans.sort_by_key(|p| (p.updated_at, p.revision, p.id)),
+    }
+}
+
+fn parse_plan_verification_list_sort(
+    raw: Option<&str>,
+) -> Result<PlanVerificationListSort, (StatusCode, String)> {
+    match raw
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+        .unwrap_or("created_desc")
+    {
+        "created_desc" => Ok(PlanVerificationListSort::CreatedDesc),
+        "created_asc" => Ok(PlanVerificationListSort::CreatedAsc),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid plan verification sort '{}'; expected created_desc|created_asc",
+                other
+            ),
+        )),
+    }
+}
+
+fn apply_plan_verification_list_sort(
+    verifications: &mut [crate::agent::PlanVerification],
+    sort: PlanVerificationListSort,
+) {
+    match sort {
+        PlanVerificationListSort::CreatedDesc => verifications
+            .sort_by_key(|v| (std::cmp::Reverse(v.created_at), std::cmp::Reverse(v.id))),
+        PlanVerificationListSort::CreatedAsc => verifications.sort_by_key(|v| (v.created_at, v.id)),
     }
 }
 
@@ -3564,11 +3617,13 @@ async fn goal_policy_decisions_list_handler(
 async fn goal_plans_list_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
+    Query(query): Query<GoalPlansListQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
     ))?;
+    let sort = parse_plan_list_sort(query.sort.as_deref())?;
 
     let goal_id = Uuid::parse_str(&id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid goal ID".to_string()))?;
@@ -3584,8 +3639,21 @@ async fn goal_plans_list_handler(
         .list_plans_for_goal(goal.id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    plans.sort_by_key(|p| (p.revision, p.updated_at));
-    plans.reverse();
+    if let Some(status) = query.status {
+        plans.retain(|p| p.status == status);
+    }
+    apply_plan_list_sort(&mut plans, sort);
+    if let Some(offset) = query.offset
+        && offset > 0
+    {
+        plans = plans.into_iter().skip(offset).collect();
+    }
+    if let Some(limit) = query.limit {
+        if limit == 0 {
+            return Err((StatusCode::BAD_REQUEST, "limit must be >= 1".to_string()));
+        }
+        plans.truncate(limit);
+    }
 
     Ok(Json(serde_json::json!({
         "goal_id": goal.id,
@@ -4045,11 +4113,13 @@ async fn plan_execution_attempts_list_handler(
 async fn plan_verifications_list_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
+    Query(query): Query<PlanVerificationsListQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
     ))?;
+    let sort = parse_plan_verification_list_sort(query.sort.as_deref())?;
 
     let plan_id = Uuid::parse_str(&id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plan ID".to_string()))?;
@@ -4060,8 +4130,21 @@ async fn plan_verifications_list_handler(
         .list_plan_verifications_for_plan(plan.id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    verifications.sort_by_key(|v| (v.created_at, v.id));
-    verifications.reverse();
+    if let Some(status) = query.status {
+        verifications.retain(|v| v.status == status);
+    }
+    apply_plan_verification_list_sort(&mut verifications, sort);
+    if let Some(offset) = query.offset
+        && offset > 0
+    {
+        verifications = verifications.into_iter().skip(offset).collect();
+    }
+    if let Some(limit) = query.limit {
+        if limit == 0 {
+            return Err((StatusCode::BAD_REQUEST, "limit must be >= 1".to_string()));
+        }
+        verifications.truncate(limit);
+    }
 
     Ok(Json(serde_json::json!({
         "plan_id": plan.id,
@@ -4680,7 +4763,7 @@ struct GatewayStatusResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{PlanVerification, PlanVerificationStatus};
+    use crate::agent::PlanVerification;
     use crate::db::Database;
     use serde_json::json;
 
@@ -5096,7 +5179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_plan_verifications_list_handler_orders_desc_and_enforces_ownership() {
+    async fn test_plan_verifications_list_handler_supports_filters_sort_offset_and_ownership() {
         let (_dir, store) = make_test_store().await;
         let alice_state = make_test_gateway_state("alice", store.clone());
         let bob_state = make_test_gateway_state("bob", store.clone());
@@ -5144,10 +5227,18 @@ mod tests {
             .await
             .expect("seed newer verification");
 
-        let Json(body) =
-            plan_verifications_list_handler(State(alice_state), Path(plan.id.to_string()))
-                .await
-                .expect("list verifications");
+        let Json(body) = plan_verifications_list_handler(
+            State(alice_state.clone()),
+            Path(plan.id.to_string()),
+            Query(PlanVerificationsListQuery {
+                status: None,
+                sort: None,
+                offset: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("list verifications");
         assert_eq!(body["plan_id"], json!(plan.id));
         let verifications = body["plan_verifications"]
             .as_array()
@@ -5157,11 +5248,141 @@ mod tests {
         assert_eq!(verifications[1]["id"], json!(older.id));
         assert_eq!(verifications[0]["status"], json!("passed"));
 
-        let err = plan_verifications_list_handler(State(bob_state), Path(plan.id.to_string()))
-            .await
-            .unwrap_err();
+        let Json(filtered_body) = plan_verifications_list_handler(
+            State(alice_state.clone()),
+            Path(plan.id.to_string()),
+            Query(PlanVerificationsListQuery {
+                status: Some(PlanVerificationStatus::Passed),
+                sort: Some("created_asc".to_string()),
+                offset: Some(0),
+                limit: Some(1),
+            }),
+        )
+        .await
+        .expect("filtered verifications");
+        let filtered = filtered_body["plan_verifications"]
+            .as_array()
+            .expect("filtered verifications array");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["id"], json!(newer.id));
+
+        let sort_err = plan_verifications_list_handler(
+            State(alice_state),
+            Path(plan.id.to_string()),
+            Query(PlanVerificationsListQuery {
+                status: None,
+                sort: Some("bad_sort".to_string()),
+                offset: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(sort_err.0, StatusCode::BAD_REQUEST);
+        assert!(sort_err.1.contains("invalid plan verification sort"));
+
+        let err = plan_verifications_list_handler(
+            State(bob_state),
+            Path(plan.id.to_string()),
+            Query(PlanVerificationsListQuery {
+                status: None,
+                sort: None,
+                offset: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
         assert_eq!(err.1, "Plan not found");
+    }
+
+    #[tokio::test]
+    async fn test_goal_plans_list_handler_supports_status_sort_offset_limit() {
+        let (_dir, store) = make_test_store().await;
+        let state = make_test_gateway_state("alice", store.clone());
+        let (_goal, seed_plan) = seed_goal_and_plan(store.as_ref(), "alice").await;
+        let now = chrono::Utc::now();
+
+        let draft_old = Plan {
+            id: Uuid::new_v4(),
+            goal_id: seed_plan.goal_id,
+            revision: 2,
+            status: PlanStatus::Draft,
+            planner_kind: PlannerKind::ReasoningV1,
+            source_action_plan: None,
+            assumptions: json!({}),
+            confidence: 0.5,
+            estimated_cost: None,
+            estimated_time_secs: None,
+            summary: Some("draft old".to_string()),
+            created_at: now - chrono::TimeDelta::minutes(3),
+            updated_at: now - chrono::TimeDelta::minutes(3),
+        };
+        let ready_mid = Plan {
+            id: Uuid::new_v4(),
+            goal_id: seed_plan.goal_id,
+            revision: 3,
+            status: PlanStatus::Ready,
+            planner_kind: PlannerKind::RuleBased,
+            source_action_plan: None,
+            assumptions: json!({}),
+            confidence: 0.7,
+            estimated_cost: None,
+            estimated_time_secs: None,
+            summary: Some("ready mid".to_string()),
+            created_at: now - chrono::TimeDelta::minutes(2),
+            updated_at: now - chrono::TimeDelta::minutes(2),
+        };
+        let ready_new = Plan {
+            id: Uuid::new_v4(),
+            goal_id: seed_plan.goal_id,
+            revision: 4,
+            status: PlanStatus::Ready,
+            planner_kind: PlannerKind::Hybrid,
+            source_action_plan: None,
+            assumptions: json!({}),
+            confidence: 0.9,
+            estimated_cost: None,
+            estimated_time_secs: None,
+            summary: Some("ready new".to_string()),
+            created_at: now - chrono::TimeDelta::minutes(1),
+            updated_at: now - chrono::TimeDelta::minutes(1),
+        };
+        for plan in [&draft_old, &ready_mid, &ready_new] {
+            store.create_plan(plan).await.expect("seed goal plans");
+        }
+
+        let Json(body) = goal_plans_list_handler(
+            State(state.clone()),
+            Path(seed_plan.goal_id.to_string()),
+            Query(GoalPlansListQuery {
+                status: Some(PlanStatus::Ready),
+                sort: Some("revision_desc".to_string()),
+                offset: Some(1),
+                limit: Some(1),
+            }),
+        )
+        .await
+        .expect("goal plans filtered list");
+        let plans = body["plans"].as_array().expect("plans array");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0]["id"], json!(ready_mid.id));
+
+        let err = goal_plans_list_handler(
+            State(state),
+            Path(seed_plan.goal_id.to_string()),
+            Query(GoalPlansListQuery {
+                status: None,
+                sort: Some("bad_sort".to_string()),
+                offset: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("invalid plan sort"));
     }
 
     #[tokio::test]
