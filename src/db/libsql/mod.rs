@@ -518,6 +518,26 @@ impl GoalStore for LibSqlBackend {
 
         Ok(())
     }
+
+    async fn update_goal_priority(&self, id: Uuid, priority: i32) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let now = fmt_ts(&Utc::now());
+
+        conn.execute(
+            r#"
+            UPDATE autonomy_goals
+            SET
+                priority = ?2,
+                updated_at = ?3
+            WHERE id = ?1
+            "#,
+            params![id.to_string(), priority as i64, now.as_str()],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(())
+    }
 }
 
 #[async_trait]

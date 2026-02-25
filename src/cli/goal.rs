@@ -69,6 +69,19 @@ pub enum GoalCommand {
         user_id: String,
     },
 
+    /// Update goal priority
+    SetPriority {
+        /// Goal ID
+        id: Uuid,
+
+        /// New priority score (higher = more important)
+        priority: i32,
+
+        /// Owner user ID to validate access
+        #[arg(long, default_value = DEFAULT_USER_ID)]
+        user_id: String,
+    },
+
     /// Mark a goal as completed
     Complete {
         /// Goal ID
@@ -120,6 +133,11 @@ pub async fn run_goal_command(cmd: GoalCommand) -> anyhow::Result<()> {
             status,
             user_id,
         } => set_goal_status(db.as_ref(), id, &status, &user_id).await,
+        GoalCommand::SetPriority {
+            id,
+            priority,
+            user_id,
+        } => set_goal_priority(db.as_ref(), id, priority, &user_id).await,
         GoalCommand::Complete { id, user_id } => {
             set_goal_status(db.as_ref(), id, "completed", &user_id).await
         }
@@ -263,6 +281,40 @@ async fn set_goal_status(
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))
         .with_context(|| format!("failed to update goal {}", id))?;
+
+    let updated = db
+        .get_goal(id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to reload goal {}", id))?
+        .ok_or_else(|| anyhow::anyhow!("goal disappeared after update: {}", id))?;
+
+    println!("Updated goal {}", id);
+    println!("{}", serde_json::to_string_pretty(&updated)?);
+    Ok(())
+}
+
+async fn set_goal_priority(
+    db: &dyn crate::db::Database,
+    id: Uuid,
+    priority: i32,
+    user_id: &str,
+) -> anyhow::Result<()> {
+    let goal = db
+        .get_goal(id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to load goal {}", id))?
+        .ok_or_else(|| anyhow::anyhow!("goal not found: {}", id))?;
+
+    if goal.owner_user_id != user_id {
+        anyhow::bail!("goal {} not found for user {}", id, user_id);
+    }
+
+    db.update_goal_priority(id, priority)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to update goal priority {}", id))?;
 
     let updated = db
         .get_goal(id)

@@ -505,6 +505,12 @@ pub trait GoalStore: Send + Sync {
             "autonomy goal store not implemented for backend".to_string(),
         ))
     }
+
+    async fn update_goal_priority(&self, _id: Uuid, _priority: i32) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy goal store not implemented for backend".to_string(),
+        ))
+    }
 }
 
 #[async_trait]

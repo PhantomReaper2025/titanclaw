@@ -229,6 +229,10 @@ pub async fn start_server(
         )
         .route("/api/goals/{id}", get(goals_detail_handler))
         .route("/api/goals/{id}/status", post(goals_status_update_handler))
+        .route(
+            "/api/goals/{id}/priority",
+            post(goals_priority_update_handler),
+        )
         .route("/api/goals/{id}/complete", post(goals_complete_handler))
         .route("/api/goals/{id}/abandon", post(goals_abandon_handler))
         .route(
@@ -2977,6 +2981,11 @@ struct GoalStatusUpdateRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct GoalPriorityUpdateRequest {
+    priority: i32,
+}
+
+#[derive(Debug, Deserialize)]
 struct PlanStatusUpdateRequest {
     status: PlanStatus,
 }
@@ -3278,6 +3287,54 @@ async fn goals_status_update_handler(
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid goal ID".to_string()))?;
     let updated =
         update_owned_goal_status_and_load(state.as_ref(), store.as_ref(), goal_id, body.status)
+            .await?;
+
+    Ok(Json(serde_json::json!({ "goal": updated })))
+}
+
+async fn update_owned_goal_priority_and_load(
+    state: &GatewayState,
+    store: &dyn Database,
+    goal_id: Uuid,
+    priority: i32,
+) -> Result<Goal, (StatusCode, String)> {
+    let goal = store
+        .get_goal(goal_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .filter(|g| g.owner_user_id == state.user_id)
+        .ok_or((StatusCode::NOT_FOUND, "Goal not found".to_string()))?;
+
+    store
+        .update_goal_priority(goal.id, priority)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    store
+        .get_goal(goal.id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .filter(|g| g.owner_user_id == state.user_id)
+        .ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Goal disappeared after update".to_string(),
+        ))
+}
+
+async fn goals_priority_update_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(body): Json<GoalPriorityUpdateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let goal_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid goal ID".to_string()))?;
+    let updated =
+        update_owned_goal_priority_and_load(state.as_ref(), store.as_ref(), goal_id, body.priority)
             .await?;
 
     Ok(Json(serde_json::json!({ "goal": updated })))
@@ -4893,5 +4950,39 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
         assert_eq!(err.1, "Plan not found");
+    }
+
+    #[tokio::test]
+    async fn test_goals_priority_update_handler_updates_owned_goal_and_blocks_other_users() {
+        let (_dir, store) = make_test_store().await;
+        let alice_state = make_test_gateway_state("alice", store.clone());
+        let bob_state = make_test_gateway_state("bob", store.clone());
+        let (goal, _plan) = seed_goal_and_plan(store.as_ref(), "alice").await;
+
+        let Json(body) = goals_priority_update_handler(
+            State(alice_state),
+            Path(goal.id.to_string()),
+            Json(GoalPriorityUpdateRequest { priority: 42 }),
+        )
+        .await
+        .expect("reprioritize goal");
+        assert_eq!(body["goal"]["priority"], json!(42));
+
+        let reloaded = store
+            .get_goal(goal.id)
+            .await
+            .expect("reload goal")
+            .expect("goal exists");
+        assert_eq!(reloaded.priority, 42);
+
+        let err = goals_priority_update_handler(
+            State(bob_state),
+            Path(goal.id.to_string()),
+            Json(GoalPriorityUpdateRequest { priority: 7 }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1, "Goal not found");
     }
 }

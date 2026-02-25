@@ -147,6 +147,21 @@ impl GoalStore for PgBackend {
         .await?;
         Ok(())
     }
+
+    async fn update_goal_priority(&self, id: Uuid, priority: i32) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            r#"
+            UPDATE autonomy_goals
+            SET priority = $2,
+                updated_at = NOW()
+            WHERE id = $1
+            "#,
+            &[&id, &priority],
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
