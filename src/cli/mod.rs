@@ -19,6 +19,7 @@ pub mod memory;
 pub mod oauth_defaults;
 mod pairing;
 mod plan;
+mod plan_step;
 mod service;
 pub mod status;
 mod tool;
@@ -33,6 +34,7 @@ pub use memory::run_memory_command;
 pub use memory::run_memory_command_with_db;
 pub use pairing::{PairingCommand, run_pairing_command, run_pairing_command_with_store};
 pub use plan::{PlanCommand, run_plan_command};
+pub use plan_step::{PlanStepCommand, run_plan_step_command};
 pub use service::{ServiceCommand, run_service_command};
 pub use status::run_status_command;
 pub use tool::{ToolCommand, run_tool_command};
@@ -113,6 +115,10 @@ pub enum Command {
     /// Manage autonomous plans
     #[command(subcommand)]
     Plan(PlanCommand),
+
+    /// Manage autonomous plan steps
+    #[command(subcommand)]
+    PlanStep(PlanStepCommand),
 
     /// Manage OS service (launchd / systemd)
     #[command(subcommand)]

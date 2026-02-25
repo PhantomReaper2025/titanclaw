@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - User-scoped web gateway goal/plan status update endpoints (`POST /api/goals/{id}/status`, `POST /api/plans/{id}/status`) with ownership checks and DB-backed status transitions.
 - CLI status update commands for autonomy goals/plans (`titanclaw goal set-status`, `titanclaw plan set-status`) with enum validation and user-scoped ownership checks.
 - User-scoped plan-step web APIs for autonomy plan structure management (`GET/POST /api/plans/{id}/steps`, `GET /api/plan-steps/{id}`, `POST /api/plan-steps/{id}/status`) backed by new `PlanStore` step read helpers in both PostgreSQL and libSQL backends.
+- CLI plan-step commands (`titanclaw plan-step create|list|show|set-status`) for local plan-step creation, inspection, and status updates with user-scoped ownership validation.
 
 ### Changed
 

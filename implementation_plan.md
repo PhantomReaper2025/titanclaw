@@ -36,7 +36,7 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 | Embeddings input length guard semantics | ✅ | Embedding providers now validate approximate character length (not byte length), apply checks consistently to both single and batch embedding calls, and return clearer `TextTooLong` values for non-ASCII inputs. |
 | WhatsApp unsupported media handling | ✅ | Non-text WhatsApp messages are no longer silently dropped; the channel emits an explicit placeholder message to the agent and logs a warning so users can be informed to resend as text. |
 | PostgreSQL AST graph query gap (documented) | ✅ | AST graph query remains Database/libSQL-only; runtime error message and docs now explicitly state the PostgreSQL-backed workspace limitation. |
-| Autonomy Control Plane v1 groundwork (types + persistence schema) | 🚧 | Added versioned autonomy domain types (`src/agent/autonomy.rs`), implemented Postgres/libSQL autonomy store CRUD for goals/plans/steps/execution/policy records plus plan-step read helpers, added schema migrations/scaffolding (`V11`-`V17` + libSQL mirror), wired best-effort worker/dispatcher persistence so planned worker runs and chat tool approvals/execution attempts now emit DB-backed autonomy records, persisted `agent_jobs` autonomy link fields for restart-safe correlation, exposed user-scoped gateway goal/plan create + inspection + status update APIs and plan-step list/create/detail/status APIs (`GET/POST /api/plans/{id}/steps`, `GET /api/plan-steps/{id}`, `POST /api/plan-steps/{id}/status`), and added CLI `goal`/`plan` create-list-show-set-status commands for local inspection/manual management. |
+| Autonomy Control Plane v1 groundwork (types + persistence schema) | 🚧 | Added versioned autonomy domain types (`src/agent/autonomy.rs`), implemented Postgres/libSQL autonomy store CRUD for goals/plans/steps/execution/policy records plus plan-step read helpers, added schema migrations/scaffolding (`V11`-`V17` + libSQL mirror), wired best-effort worker/dispatcher persistence so planned worker runs and chat tool approvals/execution attempts now emit DB-backed autonomy records, persisted `agent_jobs` autonomy link fields for restart-safe correlation, exposed user-scoped gateway goal/plan create + inspection + status update APIs and plan-step list/create/detail/status APIs (`GET/POST /api/plans/{id}/steps`, `GET /api/plan-steps/{id}`, `POST /api/plan-steps/{id}/status`), and added CLI `goal`/`plan`/`plan-step` create-list-show-set-status commands for local inspection/manual management. |
 
 ## Execution TODO (Live)
 
@@ -66,6 +66,7 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 - [x] Gateway plan-step endpoints (list/create/detail/status) with user-scoped ownership checks
 - [x] CLI autonomy goal/plan commands (`goal|plan create/list/show`) with DB-backed persistence access
 - [x] CLI autonomy goal/plan status updates (`goal set-status`, `plan set-status`) with user-scoped ownership validation
+- [x] CLI plan-step commands (`plan-step create/list/show/set-status`) with user-scoped ownership validation via plan->goal
 
 ## Proposed Changes
 

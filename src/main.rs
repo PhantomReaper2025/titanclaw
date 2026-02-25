@@ -18,7 +18,7 @@ use ironclaw::{
     },
     cli::{
         Cli, Command, run_goal_command, run_mcp_command, run_pairing_command, run_plan_command,
-        run_service_command, run_status_command, run_tool_command,
+        run_plan_step_command, run_service_command, run_status_command, run_tool_command,
     },
     config::Config,
     context::ContextManager,
@@ -172,6 +172,15 @@ async fn main() -> anyhow::Result<()> {
                 .init();
 
             return run_plan_command(plan_cmd.clone()).await;
+        }
+        Some(Command::PlanStep(plan_step_cmd)) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+                )
+                .init();
+
+            return run_plan_step_command(plan_step_cmd.clone()).await;
         }
         Some(Command::Service(service_cmd)) => {
             tracing_subscriber::fmt()
