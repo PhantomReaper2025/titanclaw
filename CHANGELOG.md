@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - User-scoped web gateway create endpoints for autonomy goals/plans (`POST /api/goals`, `POST /api/plans`) with server-generated IDs/timestamps and goal-ownership checks before plan creation.
 - CLI autonomy commands for goals/plans (`titanclaw goal|plan create/list/show`) with DB-backed create/read access and user-scoped ownership validation through goal records.
 - User-scoped web gateway goal/plan status update endpoints (`POST /api/goals/{id}/status`, `POST /api/plans/{id}/status`) with ownership checks and DB-backed status transitions.
+- CLI status update commands for autonomy goals/plans (`titanclaw goal set-status`, `titanclaw plan set-status`) with enum validation and user-scoped ownership checks.
 
 ### Changed
 

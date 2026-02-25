@@ -55,6 +55,19 @@ pub enum GoalCommand {
         #[arg(long, default_value = DEFAULT_USER_ID)]
         user_id: String,
     },
+
+    /// Update goal status
+    SetStatus {
+        /// Goal ID
+        id: Uuid,
+
+        /// New status (proposed|active|blocked|waiting|completed|abandoned)
+        status: String,
+
+        /// Owner user ID to validate access
+        #[arg(long, default_value = DEFAULT_USER_ID)]
+        user_id: String,
+    },
 }
 
 pub async fn run_goal_command(cmd: GoalCommand) -> anyhow::Result<()> {
@@ -82,6 +95,11 @@ pub async fn run_goal_command(cmd: GoalCommand) -> anyhow::Result<()> {
         }
         GoalCommand::List { user_id } => list_goals(db.as_ref(), &user_id).await,
         GoalCommand::Show { id, user_id } => show_goal(db.as_ref(), id, &user_id).await,
+        GoalCommand::SetStatus {
+            id,
+            status,
+            user_id,
+        } => set_goal_status(db.as_ref(), id, &status, &user_id).await,
     }
 }
 
@@ -195,6 +213,56 @@ async fn show_goal(db: &dyn crate::db::Database, id: Uuid, user_id: &str) -> any
 
     println!("{}", serde_json::to_string_pretty(&goal)?);
     Ok(())
+}
+
+async fn set_goal_status(
+    db: &dyn crate::db::Database,
+    id: Uuid,
+    status_raw: &str,
+    user_id: &str,
+) -> anyhow::Result<()> {
+    let goal = db
+        .get_goal(id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to load goal {}", id))?
+        .ok_or_else(|| anyhow::anyhow!("goal not found: {}", id))?;
+
+    if goal.owner_user_id != user_id {
+        anyhow::bail!("goal {} not found for user {}", id, user_id);
+    }
+
+    let status = parse_goal_status(status_raw)?;
+    db.update_goal_status(id, status)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to update goal {}", id))?;
+
+    let updated = db
+        .get_goal(id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to reload goal {}", id))?
+        .ok_or_else(|| anyhow::anyhow!("goal disappeared after update: {}", id))?;
+
+    println!("Updated goal {}", id);
+    println!("{}", serde_json::to_string_pretty(&updated)?);
+    Ok(())
+}
+
+fn parse_goal_status(s: &str) -> anyhow::Result<GoalStatus> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "proposed" => Ok(GoalStatus::Proposed),
+        "active" => Ok(GoalStatus::Active),
+        "blocked" => Ok(GoalStatus::Blocked),
+        "waiting" => Ok(GoalStatus::Waiting),
+        "completed" => Ok(GoalStatus::Completed),
+        "abandoned" => Ok(GoalStatus::Abandoned),
+        _ => anyhow::bail!(
+            "invalid goal status '{}'; expected proposed|active|blocked|waiting|completed|abandoned",
+            s
+        ),
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {

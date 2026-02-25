@@ -64,7 +64,7 @@ When behavior changes, keep these docs aligned in the same branch:
   - worker planned executions and dispatcher approval/tool-attempt paths now best-effort persist internal autonomy records (tracing emitters and approval UX remain unchanged)
   - `agent_jobs` now persists optional autonomy linkage IDs (`autonomy_goal_id`, `autonomy_plan_id`, `autonomy_plan_step_id`) so worker/dispatcher correlation survives DB save/load and restarts (PostgreSQL + libSQL, `V17` + libSQL schema mirror update)
   - web gateway now exposes user-scoped autonomy goal/plan APIs for create + inspection + status updates (`POST /api/goals`, `POST /api/plans`, `POST /api/goals/{id}/status`, `POST /api/plans/{id}/status`, plus `GET /api/goals*` / `GET /api/plans*`)
-  - CLI now exposes `titanclaw goal` and `titanclaw plan` subcommands for user-scoped create/list/show workflows against the autonomy persistence layer
+  - CLI now exposes `titanclaw goal` and `titanclaw plan` subcommands for user-scoped create/list/show/set-status workflows against the autonomy persistence layer
 - Web gateway auth/render hardening:
   - SSE query-token auth accepts URL-encoded tokens
   - WebSocket Origin validation parses loopback hosts correctly (including IPv6)

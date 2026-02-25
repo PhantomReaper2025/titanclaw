@@ -63,6 +63,19 @@ pub enum PlanCommand {
         #[arg(long, default_value = DEFAULT_USER_ID)]
         user_id: String,
     },
+
+    /// Update plan status
+    SetStatus {
+        /// Plan ID
+        id: Uuid,
+
+        /// New status (draft|ready|running|paused|failed|completed|superseded)
+        status: String,
+
+        /// Owner user ID (used to validate goal ownership)
+        #[arg(long, default_value = DEFAULT_USER_ID)]
+        user_id: String,
+    },
 }
 
 pub async fn run_plan_command(cmd: PlanCommand) -> anyhow::Result<()> {
@@ -92,6 +105,11 @@ pub async fn run_plan_command(cmd: PlanCommand) -> anyhow::Result<()> {
         }
         PlanCommand::List { goal_id, user_id } => list_plans(db.as_ref(), goal_id, &user_id).await,
         PlanCommand::Show { id, user_id } => show_plan(db.as_ref(), id, &user_id).await,
+        PlanCommand::SetStatus {
+            id,
+            status,
+            user_id,
+        } => set_plan_status(db.as_ref(), id, &status, &user_id).await,
     }
 }
 
@@ -251,6 +269,63 @@ async fn show_plan(
 
     println!("{}", serde_json::to_string_pretty(&plan)?);
     Ok(())
+}
+
+async fn set_plan_status(
+    db: &dyn crate::db::Database,
+    plan_id: Uuid,
+    status_raw: &str,
+    user_id: &str,
+) -> anyhow::Result<()> {
+    let plan = db
+        .get_plan(plan_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to load plan {}", plan_id))?
+        .ok_or_else(|| anyhow::anyhow!("plan not found: {}", plan_id))?;
+
+    let goal = db
+        .get_goal(plan.goal_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to load goal {}", plan.goal_id))?
+        .ok_or_else(|| anyhow::anyhow!("goal {} for plan {} not found", plan.goal_id, plan.id))?;
+    if goal.owner_user_id != user_id {
+        anyhow::bail!("plan {} not found for user {}", plan_id, user_id);
+    }
+
+    let status = parse_plan_status(status_raw)?;
+    db.update_plan_status(plan_id, status)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to update plan {}", plan_id))?;
+
+    let updated = db
+        .get_plan(plan_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to reload plan {}", plan_id))?
+        .ok_or_else(|| anyhow::anyhow!("plan disappeared after update: {}", plan_id))?;
+
+    println!("Updated plan {}", plan_id);
+    println!("{}", serde_json::to_string_pretty(&updated)?);
+    Ok(())
+}
+
+fn parse_plan_status(s: &str) -> anyhow::Result<PlanStatus> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "draft" => Ok(PlanStatus::Draft),
+        "ready" => Ok(PlanStatus::Ready),
+        "running" => Ok(PlanStatus::Running),
+        "paused" => Ok(PlanStatus::Paused),
+        "failed" => Ok(PlanStatus::Failed),
+        "completed" => Ok(PlanStatus::Completed),
+        "superseded" => Ok(PlanStatus::Superseded),
+        _ => anyhow::bail!(
+            "invalid plan status '{}'; expected draft|ready|running|paused|failed|completed|superseded",
+            s
+        ),
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
