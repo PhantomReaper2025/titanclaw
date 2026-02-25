@@ -1,13 +1,15 @@
 //! Autonomy plan CLI commands.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use chrono::Utc;
 use clap::Subcommand;
+use serde::Deserialize;
+use serde_json::Value;
 use uuid::Uuid;
 
-use crate::agent::{Plan, PlanStatus, PlanStep, PlanStepStatus, PlannerKind};
+use crate::agent::{Plan, PlanStatus, PlanStep, PlanStepKind, PlanStepStatus, PlannerKind};
 const DEFAULT_USER_ID: &str = "default";
 
 #[derive(Subcommand, Debug, Clone)]
@@ -135,8 +137,16 @@ pub enum PlanCommand {
         no_supersede_current: bool,
 
         /// Copy source plan steps into the new revision (reset to pending)
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["steps_file", "steps_json"])]
         copy_steps: bool,
+
+        /// JSON file containing replan step payload ({ "steps": [...] } or [...])
+        #[arg(long, conflicts_with = "steps_json")]
+        steps_file: Option<PathBuf>,
+
+        /// Inline JSON replan step payload ({ "steps": [...] } or [...])
+        #[arg(long, conflicts_with = "steps_file")]
+        steps_json: Option<String>,
     },
 }
 
@@ -189,6 +199,8 @@ pub async fn run_plan_command(cmd: PlanCommand) -> anyhow::Result<()> {
             estimated_cost,
             no_supersede_current,
             copy_steps,
+            steps_file,
+            steps_json,
         } => {
             replan_plan(
                 db.as_ref(),
@@ -202,6 +214,8 @@ pub async fn run_plan_command(cmd: PlanCommand) -> anyhow::Result<()> {
                 estimated_cost,
                 !no_supersede_current,
                 copy_steps,
+                steps_file,
+                steps_json,
             )
             .await
         }
@@ -219,6 +233,30 @@ async fn connect_db() -> anyhow::Result<Arc<dyn crate::db::Database>> {
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     Ok(db)
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplanPlanStepInput {
+    sequence_num: i32,
+    kind: String,
+    title: String,
+    description: String,
+    #[serde(default)]
+    tool_candidates: Value,
+    #[serde(default)]
+    inputs: Value,
+    #[serde(default)]
+    preconditions: Value,
+    #[serde(default)]
+    postconditions: Value,
+    rollback: Option<Value>,
+    #[serde(default)]
+    policy_requirements: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplanPlanStepsWrapper {
+    steps: Vec<ReplanPlanStepInput>,
 }
 
 async fn create_plan(
@@ -420,11 +458,16 @@ async fn replan_plan(
     estimated_cost: Option<f64>,
     supersede_current: bool,
     copy_steps: bool,
+    steps_file: Option<PathBuf>,
+    steps_json: Option<String>,
 ) -> anyhow::Result<()> {
     if let Some(confidence) = confidence
         && !(0.0..=1.0).contains(&confidence)
     {
         anyhow::bail!("confidence must be between 0.0 and 1.0");
+    }
+    if copy_steps && (steps_file.is_some() || steps_json.is_some()) {
+        anyhow::bail!("provide either --copy-steps or --steps-file/--steps-json, not both");
     }
 
     let source_plan = db
@@ -495,6 +538,48 @@ async fn replan_plan(
         .map_err(|e| anyhow::anyhow!("{}", e))
         .with_context(|| format!("failed to create replanned revision for {}", source_plan_id))?;
 
+    let provided_steps = match (steps_file, steps_json) {
+        (None, None) => None,
+        (Some(path), None) => {
+            let raw = tokio::fs::read_to_string(&path)
+                .await
+                .with_context(|| format!("failed to read steps file {}", path.display()))?;
+            let steps =
+                build_replan_steps_from_inputs(new_plan.id, parse_replan_steps_payload(&raw)?)?;
+            if !steps.is_empty() {
+                db.create_plan_steps(&steps)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))
+                    .with_context(|| {
+                        format!(
+                            "failed to create provided plan steps for new plan {}",
+                            new_plan.id
+                        )
+                    })?;
+            }
+            Some(steps.len())
+        }
+        (None, Some(raw)) => {
+            let steps =
+                build_replan_steps_from_inputs(new_plan.id, parse_replan_steps_payload(&raw)?)?;
+            if !steps.is_empty() {
+                db.create_plan_steps(&steps)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))
+                    .with_context(|| {
+                        format!(
+                            "failed to create provided plan steps for new plan {}",
+                            new_plan.id
+                        )
+                    })?;
+            }
+            Some(steps.len())
+        }
+        (Some(_), Some(_)) => {
+            anyhow::bail!("exactly one of --steps-file or --steps-json may be set")
+        }
+    };
+
     let copied_steps = if copy_steps {
         let source_steps = db
             .list_plan_steps_for_plan(source_plan.id)
@@ -552,7 +637,7 @@ async fn replan_plan(
     }
 
     println!(
-        "Created replanned plan {} (rev {}) from {}{}",
+        "Created replanned plan {} (rev {}) from {}{}{}",
         new_plan.id,
         new_plan.revision,
         source_plan.id,
@@ -560,10 +645,93 @@ async fn replan_plan(
             format!(" with {} copied step(s)", copied_steps)
         } else {
             String::new()
+        },
+        if let Some(count) = provided_steps {
+            format!(" with {} provided step(s)", count)
+        } else {
+            String::new()
         }
     );
     println!("{}", serde_json::to_string_pretty(&new_plan)?);
     Ok(())
+}
+
+fn parse_replan_steps_payload(raw: &str) -> anyhow::Result<Vec<ReplanPlanStepInput>> {
+    if let Ok(wrapper) = serde_json::from_str::<ReplanPlanStepsWrapper>(raw) {
+        return Ok(wrapper.steps);
+    }
+    serde_json::from_str::<Vec<ReplanPlanStepInput>>(raw)
+        .map_err(|e| anyhow::anyhow!("invalid replan step payload JSON: {}", e))
+}
+
+fn build_replan_steps_from_inputs(
+    plan_id: Uuid,
+    inputs: Vec<ReplanPlanStepInput>,
+) -> anyhow::Result<Vec<PlanStep>> {
+    let mut seen = std::collections::HashSet::new();
+    let now = Utc::now();
+    let mut steps = Vec::with_capacity(inputs.len());
+
+    for input in inputs {
+        if input.sequence_num <= 0 {
+            anyhow::bail!("sequence_num must be a positive integer");
+        }
+        if !seen.insert(input.sequence_num) {
+            anyhow::bail!("duplicate sequence_num {}", input.sequence_num);
+        }
+
+        let title = input.title.trim();
+        let description = input.description.trim();
+        if title.is_empty() {
+            anyhow::bail!("step title is required");
+        }
+        if description.is_empty() {
+            anyhow::bail!("step description is required");
+        }
+
+        steps.push(PlanStep {
+            id: Uuid::new_v4(),
+            plan_id,
+            sequence_num: input.sequence_num,
+            kind: parse_plan_step_kind(&input.kind)?,
+            status: PlanStepStatus::Pending,
+            title: title.to_string(),
+            description: description.to_string(),
+            tool_candidates: normalize_json_value(input.tool_candidates),
+            inputs: normalize_json_value(input.inputs),
+            preconditions: normalize_json_value(input.preconditions),
+            postconditions: normalize_json_value(input.postconditions),
+            rollback: input.rollback.filter(|v| !v.is_null()),
+            policy_requirements: normalize_json_value(input.policy_requirements),
+            started_at: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+
+    Ok(steps)
+}
+
+fn normalize_json_value(value: Value) -> Value {
+    if value.is_null() {
+        serde_json::json!({})
+    } else {
+        value
+    }
+}
+
+fn parse_plan_step_kind(s: &str) -> anyhow::Result<PlanStepKind> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "tool_call" => Ok(PlanStepKind::ToolCall),
+        "evidence_gather" => Ok(PlanStepKind::EvidenceGather),
+        "verification" => Ok(PlanStepKind::Verification),
+        "ask_user" => Ok(PlanStepKind::AskUser),
+        _ => anyhow::bail!(
+            "invalid plan-step kind '{}'; expected tool_call|evidence_gather|verification|ask_user",
+            s
+        ),
+    }
 }
 
 fn parse_plan_status(s: &str) -> anyhow::Result<PlanStatus> {

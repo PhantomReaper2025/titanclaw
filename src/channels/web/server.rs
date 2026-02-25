@@ -2993,6 +2993,7 @@ struct PlanReplanRequest {
     summary: Option<String>,
     supersede_current: Option<bool>,
     copy_steps: Option<bool>,
+    steps: Option<Vec<PlanStepCreateInput>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3625,12 +3626,33 @@ async fn plans_replan_handler(
     let plan_id = Uuid::parse_str(&id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plan ID".to_string()))?;
 
-    if let Some(confidence) = body.confidence
+    let PlanReplanRequest {
+        status,
+        planner_kind,
+        source_action_plan,
+        assumptions,
+        confidence,
+        estimated_cost,
+        estimated_time_secs,
+        summary,
+        supersede_current,
+        copy_steps,
+        steps,
+    } = body;
+
+    if let Some(confidence) = confidence
         && !(0.0..=1.0).contains(&confidence)
     {
         return Err((
             StatusCode::BAD_REQUEST,
             "confidence must be between 0.0 and 1.0".to_string(),
+        ));
+    }
+    let copy_steps = copy_steps.unwrap_or(false);
+    if copy_steps && steps.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Provide either copy_steps=true or steps payload, not both".to_string(),
         ));
     }
 
@@ -3642,7 +3664,7 @@ async fn plans_replan_handler(
     let next_revision = existing.iter().map(|p| p.revision).max().unwrap_or(0) + 1;
 
     let now = chrono::Utc::now();
-    let summary = match body.summary {
+    let summary = match summary {
         Some(s) => {
             let trimmed = s.trim();
             if trimmed.is_empty() {
@@ -3658,17 +3680,13 @@ async fn plans_replan_handler(
         id: Uuid::new_v4(),
         goal_id: previous.goal_id,
         revision: next_revision,
-        status: body.status.unwrap_or(PlanStatus::Draft),
-        planner_kind: body.planner_kind.unwrap_or(previous.planner_kind),
-        source_action_plan: body
-            .source_action_plan
-            .or_else(|| previous.source_action_plan.clone()),
-        assumptions: body
-            .assumptions
-            .unwrap_or_else(|| previous.assumptions.clone()),
-        confidence: body.confidence.unwrap_or(previous.confidence),
-        estimated_cost: body.estimated_cost.or(previous.estimated_cost),
-        estimated_time_secs: body.estimated_time_secs.or(previous.estimated_time_secs),
+        status: status.unwrap_or(PlanStatus::Draft),
+        planner_kind: planner_kind.unwrap_or(previous.planner_kind),
+        source_action_plan: source_action_plan.or_else(|| previous.source_action_plan.clone()),
+        assumptions: assumptions.unwrap_or_else(|| previous.assumptions.clone()),
+        confidence: confidence.unwrap_or(previous.confidence),
+        estimated_cost: estimated_cost.or(previous.estimated_cost),
+        estimated_time_secs: estimated_time_secs.or(previous.estimated_time_secs),
         summary,
         created_at: now,
         updated_at: now,
@@ -3679,7 +3697,20 @@ async fn plans_replan_handler(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let copied_steps = if body.copy_steps.unwrap_or(false) {
+    let steps_from_payload = if let Some(step_inputs) = steps {
+        let new_steps = build_plan_steps_from_inputs(new_plan.id, step_inputs, true)?;
+        if !new_steps.is_empty() {
+            store
+                .create_plan_steps(&new_steps)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        Some(new_steps.len())
+    } else {
+        None
+    };
+
+    let copied_steps = if copy_steps {
         let source_steps = store
             .list_plan_steps_for_plan(previous.id)
             .await
@@ -3722,7 +3753,7 @@ async fn plans_replan_handler(
         0usize
     };
 
-    let supersede_previous = body.supersede_current.unwrap_or(true);
+    let supersede_previous = supersede_current.unwrap_or(true);
     if supersede_previous {
         store
             .update_plan_status(previous.id, PlanStatus::Superseded)
@@ -3734,7 +3765,8 @@ async fn plans_replan_handler(
         "plan": new_plan,
         "previous_plan_id": previous.id,
         "previous_plan_superseded": supersede_previous,
-        "copied_steps": copied_steps
+        "copied_steps": copied_steps,
+        "provided_steps": steps_from_payload.unwrap_or(0)
     })))
 }
 
