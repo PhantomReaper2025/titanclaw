@@ -27,12 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Goal/plan lifecycle convenience actions: web aliases (`POST /api/goals/{id}/cancel`, `/complete`, `/abandon`, `POST /api/plans/{id}/cancel`, `/complete`, `/supersede`) and matching CLI aliases (`titanclaw goal cancel|complete|abandon`, `titanclaw plan cancel|complete|supersede`) on top of the existing status-update APIs.
 - Goal reprioritization support: `POST /api/goals/{id}/priority` and `titanclaw goal set-priority` with user-scoped ownership checks (PostgreSQL + libSQL).
 - Goal/plan list filtering/sorting/pagination support: web list endpoints accept optional `status`, `sort`, `offset`, and `limit` query params, and CLI `goal list` / `plan list` now support `--status`, `--sort`, `--offset`, and `--limit`.
+- Internal autonomy runtime control-plane v1 modules: `PlannerV1`, shared policy-evaluation helpers, `VerifierV1`, and `ReplannerV1` scaffolding with targeted unit tests.
 
 ### Changed
 
 - Worker planning and chat tool dispatch now best-effort persist internal autonomy records: worker-generated `ActionPlan`s create/update `Goal`/`Plan`/`PlanStep` records during planned execution, and dispatcher approval/tool-attempt telemetry is additionally mirrored into DB-backed autonomy policy/execution tables without changing the existing approval UX or tracing emitters.
 - Worker planned execution completion checks now also best-effort persist DB-backed autonomy plan verification records (`autonomy_plan_verifications`, `V18` + libSQL schema mirror) for later inspection via the web gateway.
 - Worker plan verification persistence now captures richer per-step checks/evidence summaries and also records an `Inconclusive` verification on early `execute_plan()` completion-path exits (future-proofing the dormant `completed` branch).
+- Worker planned execution now routes initial planning through `PlannerV1`, performs pre-completion `VerifierV1` soft gating before final completion state transitions, and can perform bounded automatic replanning (with persisted next plan revisions when autonomy linkage is available) when steps fail or completion checks indicate remaining work.
+- Dispatcher, worker, and approval-resume tool preflight paths now share policy-evaluation helper logic for approval/hook decisions; approval resume re-checks hook policy before executing an approved tool and persists explicit approve/reject autonomy policy-decision records.
 - Job runtime context now carries optional autonomy linkage IDs (`goal_id` / `plan_id` / `plan_step_id`) in memory so worker/dispatcher paths can correlate records more consistently during execution.
 - `agent_jobs` now persists optional autonomy linkage IDs (`autonomy_goal_id`, `autonomy_plan_id`, `autonomy_plan_step_id`) across PostgreSQL/libSQL (`V17` + libSQL schema compatibility path), so autonomy correlation survives DB save/load and restart boundaries.
 

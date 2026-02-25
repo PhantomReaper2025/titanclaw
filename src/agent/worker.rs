@@ -8,8 +8,15 @@ use futures::future::join_all;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::agent::planner_v1::PlannerV1;
+use crate::agent::policy_engine::{
+    ApprovalPolicyOutcome, HookToolPolicyOutcome, evaluate_tool_call_hook,
+    evaluate_worker_tool_approval,
+};
+use crate::agent::replanner_v1::{ReplanBudgets, ReplanReason, ReplanRuntimeState, ReplannerV1};
 use crate::agent::scheduler::WorkerMessage;
 use crate::agent::task::TaskOutput;
+use crate::agent::verifier_v1::{VerificationNextAction, VerificationRequest, VerifierV1};
 use crate::agent::{
     Evidence as AutonomyEvidence, EvidenceKind as AutonomyEvidenceKind,
     ExecutionAttempt as AutonomyExecutionAttempt,
@@ -17,10 +24,11 @@ use crate::agent::{
     GoalStatus, Plan, PlanStatus, PlanStep, PlanStepKind, PlanStepStatus,
     PlanVerification as AutonomyPlanVerification,
     PlanVerificationStatus as AutonomyPlanVerificationStatus, PlannerKind,
+    PolicyDecision as AutonomyPolicyDecision, PolicyDecisionKind as AutonomyPolicyDecisionKind,
 };
-use crate::context::{ContextManager, JobState};
+use crate::context::{ContextManager, JobContext, JobState};
 use crate::db::Database;
-use crate::error::Error;
+use crate::error::{Error, ToolError};
 use crate::hooks::HookRegistry;
 use crate::llm::{
     ActionPlan, ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult, ToolSelection,
@@ -59,6 +67,71 @@ struct PersistedPlanRun {
     goal_id: Uuid,
     plan_id: Uuid,
     step_ids: Vec<Uuid>,
+}
+
+enum PlanExecutionOutcome {
+    Finished,
+    ReplanRequested {
+        reason: ReplanReason,
+        detail: String,
+    },
+}
+
+fn classify_replan_reason_for_step_error(err: &Error) -> Option<ReplanReason> {
+    match err {
+        Error::Tool(ToolError::AuthRequired { .. }) => Some(ReplanReason::PolicyDenied),
+        Error::Tool(ToolError::ExecutionFailed { reason, .. })
+            if reason.starts_with("Blocked by hook:") =>
+        {
+            Some(ReplanReason::PolicyDenied)
+        }
+        Error::Tool(ToolError::NotFound { .. }) => Some(ReplanReason::ToolUnavailable),
+        Error::Tool(ToolError::Timeout { .. }) => Some(ReplanReason::StepFailure),
+        Error::Tool(ToolError::ExecutionFailed { .. }) => Some(ReplanReason::StepFailure),
+        _ => None,
+    }
+}
+
+fn persist_worker_policy_decision_best_effort(
+    deps: &WorkerDeps,
+    job_ctx: &JobContext,
+    tool_name: &str,
+    tool_call_id: Option<&str>,
+    decision: AutonomyPolicyDecisionKind,
+    reason_codes: Vec<String>,
+    requires_approval: bool,
+    auto_approved: Option<bool>,
+    action_kind: &str,
+    evidence_required: serde_json::Value,
+) {
+    let Some(store) = deps.store.clone() else {
+        return;
+    };
+    let record = AutonomyPolicyDecision {
+        id: Uuid::new_v4(),
+        goal_id: job_ctx.autonomy_goal_id,
+        plan_id: job_ctx.autonomy_plan_id,
+        plan_step_id: job_ctx.autonomy_plan_step_id,
+        execution_attempt_id: None,
+        user_id: job_ctx.user_id.clone(),
+        channel: "worker".to_string(),
+        tool_name: Some(tool_name.to_string()),
+        tool_call_id: tool_call_id.map(ToString::to_string),
+        action_kind: action_kind.to_string(),
+        decision,
+        reason_codes,
+        risk_score: None,
+        confidence: None,
+        requires_approval,
+        auto_approved,
+        evidence_required,
+        created_at: Utc::now(),
+    };
+    tokio::spawn(async move {
+        if let Err(e) = store.record_policy_decision(&record).await {
+            tracing::warn!("Failed to persist worker autonomy policy decision: {}", e);
+        }
+    });
 }
 
 impl Worker {
@@ -168,7 +241,7 @@ impl Worker {
                 PlanStep {
                     id: step_id,
                     plan_id,
-                    sequence_num: i as i32,
+                    sequence_num: (i as i32) + 1,
                     kind: PlanStepKind::ToolCall,
                     status: PlanStepStatus::Pending,
                     title: action.tool_name.clone(),
@@ -214,6 +287,130 @@ impl Worker {
                 goal_id = %goal_id,
                 plan_id = %plan_id,
                 "Failed to attach autonomy linkage to job context: {}",
+                e
+            );
+        }
+
+        Some(PersistedPlanRun {
+            goal_id,
+            plan_id,
+            step_ids,
+        })
+    }
+
+    async fn persist_replanned_action_plan(
+        &self,
+        goal_id: Uuid,
+        supersedes_plan_id: Uuid,
+        replan_reason: ReplanReason,
+        replan_detail: &str,
+        plan: &ActionPlan,
+    ) -> Option<PersistedPlanRun> {
+        let store = self.store()?.clone();
+        let now = Utc::now();
+        let plan_id = Uuid::new_v4();
+
+        let revision = match store.list_plans_for_goal(goal_id).await {
+            Ok(plans) => plans.iter().map(|p| p.revision).max().unwrap_or(0) + 1,
+            Err(e) => {
+                tracing::warn!(
+                    job = %self.job_id,
+                    goal_id = %goal_id,
+                    "Failed to load prior plans for revisioning, defaulting to revision=2: {}",
+                    e
+                );
+                2
+            }
+        };
+
+        let db_plan = Plan {
+            id: plan_id,
+            goal_id,
+            revision,
+            status: PlanStatus::Ready,
+            planner_kind: PlannerKind::ReasoningV1,
+            source_action_plan: serde_json::to_value(plan).ok(),
+            assumptions: serde_json::json!({
+                "replan": true,
+                "supersedes_plan_id": supersedes_plan_id,
+                "replan_reason": replan_reason.code(),
+                "replan_detail": replan_detail.chars().take(500).collect::<String>(),
+            }),
+            confidence: plan.confidence,
+            estimated_cost: plan.estimated_cost,
+            estimated_time_secs: plan.estimated_time_secs,
+            summary: Some(plan.goal.clone()),
+            created_at: now,
+            updated_at: now,
+        };
+        if let Err(e) = store.create_plan(&db_plan).await {
+            tracing::warn!(
+                job = %self.job_id,
+                goal_id = %goal_id,
+                plan_id = %plan_id,
+                "Failed to persist autonomy replanned plan scaffold: {}",
+                e
+            );
+            return None;
+        }
+
+        let mut step_ids = Vec::with_capacity(plan.actions.len());
+        let steps: Vec<PlanStep> = plan
+            .actions
+            .iter()
+            .enumerate()
+            .map(|(i, action)| {
+                let step_id = Uuid::new_v4();
+                step_ids.push(step_id);
+                PlanStep {
+                    id: step_id,
+                    plan_id,
+                    sequence_num: (i as i32) + 1,
+                    kind: PlanStepKind::ToolCall,
+                    status: PlanStepStatus::Pending,
+                    title: action.tool_name.clone(),
+                    description: action.reasoning.clone(),
+                    tool_candidates: serde_json::json!([
+                        {
+                            "tool_name": action.tool_name,
+                        }
+                    ]),
+                    inputs: action.parameters.clone(),
+                    preconditions: serde_json::json!([]),
+                    postconditions: serde_json::json!([]),
+                    rollback: None,
+                    policy_requirements: serde_json::json!({}),
+                    started_at: None,
+                    completed_at: None,
+                    created_at: now,
+                    updated_at: now,
+                }
+            })
+            .collect();
+
+        if let Err(e) = store.create_plan_steps(&steps).await {
+            tracing::warn!(
+                job = %self.job_id,
+                plan_id = %plan_id,
+                "Failed to persist autonomy replanned plan steps scaffold: {}",
+                e
+            );
+            return None;
+        }
+
+        if let Err(e) = self
+            .context_manager()
+            .update_context(self.job_id, |ctx| {
+                ctx.set_autonomy_links(Some(goal_id), Some(plan_id));
+                ctx.set_autonomy_plan_step(None);
+            })
+            .await
+        {
+            tracing::warn!(
+                job = %self.job_id,
+                goal_id = %goal_id,
+                plan_id = %plan_id,
+                "Failed to attach replanned autonomy linkage to job context: {}",
                 e
             );
         }
@@ -380,6 +577,28 @@ impl Worker {
         }
     }
 
+    async fn load_goal_verifier_context(
+        &self,
+        goal_id: Uuid,
+    ) -> (GoalRiskClass, serde_json::Value) {
+        let Some(store) = self.store() else {
+            return (GoalRiskClass::Medium, serde_json::json!({}));
+        };
+        match store.get_goal(goal_id).await {
+            Ok(Some(goal)) => (goal.risk_class, goal.acceptance_criteria),
+            Ok(None) => (GoalRiskClass::Medium, serde_json::json!({})),
+            Err(e) => {
+                tracing::warn!(
+                    job = %self.job_id,
+                    goal_id = %goal_id,
+                    "Failed to load goal for verifier context: {}",
+                    e
+                );
+                (GoalRiskClass::Medium, serde_json::json!({}))
+            }
+        }
+    }
+
     /// Fire-and-forget persistence of job status.
     fn persist_status(&self, status: JobState, reason: Option<String>) {
         if let Some(store) = self.store() {
@@ -470,8 +689,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
         // Generate plan if planning is enabled
         let plan = if self.use_planning() {
-            match reasoning.plan(reason_ctx).await {
-                Ok(p) => {
+            match PlannerV1::plan_initial(reasoning, reason_ctx).await {
+                Ok(planner_out) => {
+                    let crate::agent::planner_v1::PlannerOutput {
+                        action_plan: p,
+                        plan_trace_summary,
+                    } = planner_out;
                     tracing::info!(
                         "Created plan for job {}: {} actions, {:.0}% confidence",
                         self.job_id,
@@ -480,16 +703,9 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     );
 
                     // Add plan to context as assistant message
-                    reason_ctx.messages.push(ChatMessage::assistant(format!(
-                        "I've created a plan to accomplish this goal: {}\n\nSteps:\n{}",
-                        p.goal,
-                        p.actions
-                            .iter()
-                            .enumerate()
-                            .map(|(i, a)| format!("{}. {} - {}", i + 1, a.tool_name, a.reasoning))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    )));
+                    reason_ctx
+                        .messages
+                        .push(ChatMessage::assistant(plan_trace_summary));
 
                     // Best-effort persistence of the generated plan into the new
                     // autonomy control-plane tables. Worker execution continues
@@ -530,11 +746,158 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             None
         };
 
-        // If we have a plan, execute it
-        if let Some((ref plan, ref persisted_plan)) = plan {
-            return self
-                .execute_plan(rx, reasoning, reason_ctx, plan, persisted_plan.as_ref())
-                .await;
+        // If we have a plan, execute it (with bounded automatic replanning).
+        if let Some((mut current_plan, mut current_persisted_plan)) = plan {
+            let budgets = ReplanBudgets::default();
+            let mut replan_state = ReplanRuntimeState::default();
+
+            loop {
+                match self
+                    .execute_plan(
+                        rx,
+                        reasoning,
+                        reason_ctx,
+                        &current_plan,
+                        current_persisted_plan.as_ref(),
+                    )
+                    .await?
+                {
+                    PlanExecutionOutcome::Finished => return Ok(()),
+                    PlanExecutionOutcome::ReplanRequested { reason, detail } => {
+                        let Some(previous_persisted) = current_persisted_plan.as_ref() else {
+                            self.mark_stuck(&format!(
+                                "Plan requires replan but autonomy linkage is unavailable: {}",
+                                detail
+                            ))
+                            .await?;
+                            return Ok(());
+                        };
+
+                        if !replan_state.can_replan(budgets) {
+                            tracing::warn!(
+                                job = %self.job_id,
+                                replans_attempted = replan_state.replans_attempted,
+                                replan_reason = reason.code(),
+                                "Replan budget exhausted"
+                            );
+                            self.set_plan_status_best_effort(
+                                previous_persisted.plan_id,
+                                PlanStatus::Failed,
+                            )
+                            .await;
+                            self.set_goal_status_best_effort(
+                                previous_persisted.goal_id,
+                                GoalStatus::Blocked,
+                            )
+                            .await;
+                            self.mark_stuck(&format!(
+                                "Automatic replan budget exhausted after {} attempts (last reason: {} - {})",
+                                replan_state.replans_attempted,
+                                reason.code(),
+                                detail
+                            ))
+                            .await?;
+                            return Ok(());
+                        }
+
+                        replan_state.record_replan();
+
+                        let prior_plan_status = match reason {
+                            ReplanReason::PolicyDenied => PlanStatus::Paused,
+                            _ => PlanStatus::Failed,
+                        };
+                        self.set_plan_status_best_effort(
+                            previous_persisted.plan_id,
+                            prior_plan_status,
+                        )
+                        .await;
+                        self.set_goal_status_best_effort(
+                            previous_persisted.goal_id,
+                            GoalStatus::Active,
+                        )
+                        .await;
+
+                        reason_ctx
+                            .messages
+                            .push(ChatMessage::user(ReplannerV1::replan_prompt(
+                                reason, &detail,
+                            )));
+
+                        let planner_out = match PlannerV1::plan_initial(reasoning, reason_ctx).await
+                        {
+                            Ok(out) => out,
+                            Err(e) => {
+                                self.set_goal_status_best_effort(
+                                    previous_persisted.goal_id,
+                                    GoalStatus::Blocked,
+                                )
+                                .await;
+                                self.mark_stuck(&format!(
+                                    "Automatic replanning failed after {} attempt(s): {}",
+                                    replan_state.replans_attempted, e
+                                ))
+                                .await?;
+                                return Ok(());
+                            }
+                        };
+                        let crate::agent::planner_v1::PlannerOutput {
+                            action_plan: next_plan,
+                            plan_trace_summary,
+                        } = planner_out;
+
+                        tracing::info!(
+                            job = %self.job_id,
+                            prior_plan_id = %previous_persisted.plan_id,
+                            goal_id = %previous_persisted.goal_id,
+                            replan_reason = reason.code(),
+                            replans_attempted = replan_state.replans_attempted,
+                            steps = next_plan.actions.len(),
+                            "Created replanned action plan"
+                        );
+
+                        reason_ctx
+                            .messages
+                            .push(ChatMessage::assistant(plan_trace_summary));
+
+                        let next_persisted = self
+                            .persist_replanned_action_plan(
+                                previous_persisted.goal_id,
+                                previous_persisted.plan_id,
+                                reason,
+                                &detail,
+                                &next_plan,
+                            )
+                            .await;
+
+                        if let Some(ref next_persisted) = next_persisted {
+                            self.set_plan_status_best_effort(
+                                previous_persisted.plan_id,
+                                PlanStatus::Superseded,
+                            )
+                            .await;
+                            self.set_goal_status_best_effort(
+                                next_persisted.goal_id,
+                                GoalStatus::Active,
+                            )
+                            .await;
+                            self.set_plan_status_best_effort(
+                                next_persisted.plan_id,
+                                PlanStatus::Running,
+                            )
+                            .await;
+                        } else {
+                            tracing::warn!(
+                                job = %self.job_id,
+                                prior_plan_id = %previous_persisted.plan_id,
+                                "Replan persistence failed; continuing execution with transient plan only"
+                            );
+                        }
+
+                        current_plan = next_plan;
+                        current_persisted_plan = next_persisted;
+                    }
+                }
+            }
         }
 
         // Otherwise, use direct tool selection loop
@@ -707,52 +1070,81 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     name: tool_name.to_string(),
                 })?;
 
-        // Tools requiring approval are blocked in autonomous jobs
-        if tool.requires_approval() {
+        // Fetch job context early so we have the real user_id for policy + hooks
+        let job_ctx = deps.context_manager.get_context(job_id).await?;
+
+        // Policy engine v1: autonomous jobs cannot execute approval-required tools.
+        if let ApprovalPolicyOutcome::RequireApproval { reason_codes } =
+            evaluate_worker_tool_approval(tool.as_ref())
+        {
+            persist_worker_policy_decision_best_effort(
+                deps,
+                &job_ctx,
+                tool_name,
+                None,
+                AutonomyPolicyDecisionKind::RequireApproval,
+                reason_codes,
+                true,
+                Some(false),
+                "tool_call_preflight",
+                serde_json::json!({}),
+            );
             return Err(crate::error::ToolError::AuthRequired {
                 name: tool_name.to_string(),
             }
             .into());
         }
 
-        // Fetch job context early so we have the real user_id for hooks
-        let job_ctx = deps.context_manager.get_context(job_id).await?;
-
-        // Run BeforeToolCall hook
-        let params = {
-            use crate::hooks::{HookError, HookEvent, HookOutcome};
-            let event = HookEvent::ToolCall {
-                tool_name: tool_name.to_string(),
-                parameters: params.clone(),
-                user_id: job_ctx.user_id.clone(),
-                context: format!("job:{}", job_id),
-            };
-            match deps.hooks.run(&event).await {
-                Err(HookError::Rejected { reason }) => {
-                    return Err(crate::error::ToolError::ExecutionFailed {
-                        name: tool_name.to_string(),
-                        reason: format!("Blocked by hook: {}", reason),
-                    }
-                    .into());
+        // Policy engine v1 hook evaluation
+        let params = match evaluate_tool_call_hook(
+            deps.hooks.as_ref(),
+            tool_name,
+            params,
+            &job_ctx.user_id,
+            &format!("job:{}", job_id),
+        )
+        .await
+        {
+            HookToolPolicyOutcome::Continue { parameters } => parameters,
+            HookToolPolicyOutcome::Modified {
+                parameters,
+                reason_codes,
+            } => {
+                persist_worker_policy_decision_best_effort(
+                    deps,
+                    &job_ctx,
+                    tool_name,
+                    None,
+                    AutonomyPolicyDecisionKind::Modify,
+                    reason_codes,
+                    false,
+                    None,
+                    "tool_call_hook",
+                    serde_json::json!({}),
+                );
+                parameters
+            }
+            HookToolPolicyOutcome::Deny {
+                reason,
+                reason_codes,
+            } => {
+                persist_worker_policy_decision_best_effort(
+                    deps,
+                    &job_ctx,
+                    tool_name,
+                    None,
+                    AutonomyPolicyDecisionKind::Deny,
+                    reason_codes,
+                    false,
+                    None,
+                    "tool_call_hook",
+                    serde_json::json!({}),
+                );
+                return Err(crate::error::ToolError::ExecutionFailed {
+                    name: tool_name.to_string(),
+                    reason: format!("Blocked by hook: {}", reason),
                 }
-                Err(err) => {
-                    return Err(crate::error::ToolError::ExecutionFailed {
-                        name: tool_name.to_string(),
-                        reason: format!("Blocked by hook failure mode: {}", err),
-                    }
-                    .into());
-                }
-                Ok(HookOutcome::Continue {
-                    modified: Some(new_params),
-                }) => serde_json::from_str(&new_params).unwrap_or_else(|e| {
-                    tracing::warn!(
-                        tool = %tool_name,
-                        "Hook returned non-JSON modification for ToolCall, ignoring: {}",
-                        e
-                    );
-                    params.clone()
-                }),
-                _ => params.clone(),
+                .into());
             }
         };
         if job_ctx.state == JobState::Cancelled {
@@ -969,7 +1361,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         reason_ctx: &mut ReasoningContext,
         plan: &ActionPlan,
         persisted_plan: Option<&PersistedPlanRun>,
-    ) -> Result<(), Error> {
+    ) -> Result<PlanExecutionOutcome, Error> {
         let mut executed_steps = 0usize;
         let mut succeeded_steps = 0usize;
         let mut failed_steps = 0usize;
@@ -984,7 +1376,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                             "Worker for job {} received stop signal during plan execution",
                             self.job_id
                         );
-                        return Ok(());
+                        return Ok(PlanExecutionOutcome::Finished);
                     }
                     WorkerMessage::Ping => {
                         tracing::trace!("Worker for job {} received ping", self.job_id);
@@ -1137,45 +1529,73 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     .await;
             }
 
+            let step_replan_request = result
+                .as_ref()
+                .err()
+                .and_then(classify_replan_reason_for_step_error)
+                .map(|reason| {
+                    (
+                        reason,
+                        format!(
+                            "Planned step {}/{} ({}) failed and requires replanning: {}",
+                            i + 1,
+                            plan.actions.len(),
+                            action.tool_name,
+                            result
+                                .as_ref()
+                                .err()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| "unknown failure".to_string())
+                        ),
+                    )
+                });
+
             // Process the result
             let completed = self
                 .process_tool_result(reason_ctx, &selection, result)
                 .await?;
 
+            if let Some((reason, detail)) = step_replan_request {
+                tracing::info!(
+                    job = %self.job_id,
+                    replan_reason = reason.code(),
+                    step_index = i,
+                    "Planned step requested automatic replan"
+                );
+                return Ok(PlanExecutionOutcome::ReplanRequested { reason, detail });
+            }
+
             if completed {
                 if let Some(p) = persisted_plan {
-                    let checks = serde_json::json!({
-                        "completion_path": "early_process_tool_result",
-                        "planned_steps": plan.actions.len(),
-                        "executed_steps": executed_steps,
-                        "succeeded_steps": succeeded_steps,
-                        "failed_steps": failed_steps,
-                        "all_planned_steps_executed": executed_steps == plan.actions.len(),
-                        "step_outcomes": step_outcomes,
-                    });
-                    let mut evidence = step_evidence.clone();
-                    evidence.push(AutonomyEvidence {
-                        kind: AutonomyEvidenceKind::Observation,
-                        source: "worker.execute_plan".to_string(),
-                        summary:
-                            "Plan execution returned early before final completion-check prompt"
+                    let (risk_class, acceptance_criteria) =
+                        self.load_goal_verifier_context(p.goal_id).await;
+                    let verifier_result = VerifierV1::verify_completion(VerificationRequest {
+                        completion_path: "early_process_tool_result",
+                        completion_claimed: true,
+                        completion_candidate_summary:
+                            "Plan execution ended early before final completion-check verification."
                                 .to_string(),
-                        confidence: 0.6,
-                        payload: checks.clone(),
-                        created_at: Utc::now(),
+                        planned_steps: plan.actions.len(),
+                        executed_steps,
+                        succeeded_steps,
+                        failed_steps,
+                        step_outcomes: step_outcomes.clone(),
+                        base_evidence: step_evidence.clone(),
+                        acceptance_criteria,
+                        risk_class,
                     });
                     self.record_plan_verification_best_effort(
                         p,
                         "execute_plan_early_completion_path",
-                        AutonomyPlanVerificationStatus::Inconclusive,
+                        verifier_result.status,
                         true,
-                        "Plan execution ended early before final completion-check verification.",
-                        checks,
-                        evidence,
+                        &verifier_result.summary,
+                        verifier_result.checks,
+                        verifier_result.evidence,
                     )
                     .await;
                 }
-                return Ok(());
+                return Ok(PlanExecutionOutcome::Finished);
             }
 
             // Small delay between actions
@@ -1191,7 +1611,46 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         reason_ctx.messages.push(ChatMessage::assistant(&response));
 
         let completion_claimed = crate::util::llm_signals_completion(&response);
-        if completion_claimed {
+        let verifier_result = if let Some(p) = persisted_plan {
+            let (risk_class, acceptance_criteria) =
+                self.load_goal_verifier_context(p.goal_id).await;
+            Some(VerifierV1::verify_completion(VerificationRequest {
+                completion_path: "final_llm_completion_check",
+                completion_claimed,
+                completion_candidate_summary: response.clone(),
+                planned_steps: plan.actions.len(),
+                executed_steps,
+                succeeded_steps,
+                failed_steps,
+                step_outcomes: step_outcomes.clone(),
+                base_evidence: step_evidence,
+                acceptance_criteria,
+                risk_class,
+            }))
+        } else {
+            None
+        };
+
+        if let (Some(p), Some(result)) = (persisted_plan, verifier_result.as_ref()) {
+            self.record_plan_verification_best_effort(
+                p,
+                "execute_plan_completion_check",
+                result.status,
+                completion_claimed,
+                &result.summary,
+                result.checks.clone(),
+                result.evidence.clone(),
+            )
+            .await;
+        }
+
+        let verifier_allows_completion = verifier_result
+            .as_ref()
+            .map(|r| r.allow_completion)
+            .unwrap_or(completion_claimed);
+        let should_complete = completion_claimed && verifier_allows_completion;
+
+        if should_complete {
             self.mark_completed().await?;
             if let Some(p) = persisted_plan {
                 self.set_plan_status_best_effort(p.plan_id, PlanStatus::Completed)
@@ -1199,77 +1658,87 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 self.set_goal_status_best_effort(p.goal_id, GoalStatus::Completed)
                     .await;
             }
-        } else {
-            // Job not complete, could re-plan or fall back to direct selection
+            return Ok(PlanExecutionOutcome::Finished);
+        }
+
+        let mut stuck_reason = "Plan completed but job incomplete - needs re-planning".to_string();
+        let mut replan_request: Option<(ReplanReason, String)> = None;
+
+        if completion_claimed && let Some(result) = verifier_result.as_ref() {
             tracing::info!(
-                "Job {} plan completed but work remains, falling back to direct selection",
-                self.job_id
+                job = %self.job_id,
+                verifier_status = ?result.status,
+                next_action = ?result.next_action,
+                verifier_failure_reasons = result.failure_reasons.len(),
+                "Verifier blocked completion for planned execution"
             );
-            // Continue with standard execution loop by returning (will be picked up by main loop)
-            self.mark_stuck("Plan completed but job incomplete - needs re-planning")
-                .await?;
-            if let Some(p) = persisted_plan {
-                self.set_plan_status_best_effort(p.plan_id, PlanStatus::Failed)
-                    .await;
-                self.set_goal_status_best_effort(p.goal_id, GoalStatus::Blocked)
-                    .await;
-            }
-        }
-
-        if let Some(p) = persisted_plan {
-            let verification_status = if completion_claimed {
-                if failed_steps == 0 {
-                    AutonomyPlanVerificationStatus::Passed
-                } else {
-                    AutonomyPlanVerificationStatus::Inconclusive
+            match result.next_action {
+                VerificationNextAction::Replan | VerificationNextAction::GatherEvidence => {
+                    replan_request = Some((
+                        ReplanReason::VerifierInsufficientEvidence,
+                        format!(
+                            "Verifier blocked completion ({}): {}",
+                            match result.next_action {
+                                VerificationNextAction::Replan => "replan",
+                                VerificationNextAction::GatherEvidence => "gather_evidence",
+                                _ => "other",
+                            },
+                            result.summary
+                        ),
+                    ));
                 }
-            } else {
-                AutonomyPlanVerificationStatus::Failed
-            };
-            let now = Utc::now();
-            let checks = serde_json::json!({
-                "completion_path": "final_llm_completion_check",
-                "planned_steps": plan.actions.len(),
-                "executed_steps": executed_steps,
-                "succeeded_steps": succeeded_steps,
-                "failed_steps": failed_steps,
-                "all_planned_steps_executed": executed_steps == plan.actions.len(),
-                "llm_completion_claimed": completion_claimed,
-                "step_outcomes": step_outcomes,
-            });
-            let mut evidence = step_evidence;
-            evidence.push(AutonomyEvidence {
-                kind: AutonomyEvidenceKind::Observation,
-                source: "worker.execute_plan".to_string(),
-                summary: "Aggregated planned execution outcome counts".to_string(),
-                confidence: 0.85,
-                payload: checks.clone(),
-                created_at: now,
-            });
-            evidence.push(AutonomyEvidence {
-                kind: AutonomyEvidenceKind::Observation,
-                source: "llm_completion_check".to_string(),
-                summary: response.chars().take(400).collect(),
-                confidence: 0.5,
-                payload: serde_json::json!({
-                    "completion_claimed": completion_claimed,
-                    "response_excerpt_truncated": response.chars().count() > 400
-                }),
-                created_at: now,
-            });
-            self.record_plan_verification_best_effort(
-                p,
-                "execute_plan_completion_check",
-                verification_status,
-                completion_claimed,
-                &response,
-                checks,
-                evidence,
-            )
-            .await;
+                VerificationNextAction::AskUser => {
+                    stuck_reason = format!(
+                        "Verifier blocked completion pending user confirmation: {}",
+                        result.summary
+                    );
+                }
+                VerificationNextAction::MarkBlocked => {
+                    stuck_reason = result.summary.clone();
+                }
+                VerificationNextAction::Complete => {
+                    stuck_reason = result.summary.clone();
+                }
+            }
+        } else if !completion_claimed {
+            tracing::info!(
+                job = %self.job_id,
+                failed_steps,
+                executed_steps,
+                planned_steps = plan.actions.len(),
+                "Plan completed but completion check indicates work remains"
+            );
+            replan_request = Some((
+                if failed_steps > 0 {
+                    ReplanReason::StepFailure
+                } else {
+                    ReplanReason::PlanExhaustedIncomplete
+                },
+                format!(
+                    "Planned execution exhausted ({}/{}) but completion check reported remaining work. Failed steps: {}. Response: {}",
+                    executed_steps,
+                    plan.actions.len(),
+                    failed_steps,
+                    response.chars().take(280).collect::<String>()
+                ),
+            ));
         }
 
-        Ok(())
+        if let Some((reason, detail)) = replan_request
+            && persisted_plan.is_some()
+        {
+            return Ok(PlanExecutionOutcome::ReplanRequested { reason, detail });
+        }
+
+        self.mark_stuck(&stuck_reason).await?;
+        if let Some(p) = persisted_plan {
+            self.set_plan_status_best_effort(p.plan_id, PlanStatus::Failed)
+                .await;
+            self.set_goal_status_best_effort(p.goal_id, GoalStatus::Blocked)
+                .await;
+        }
+
+        Ok(PlanExecutionOutcome::Finished)
     }
 
     async fn execute_tool(

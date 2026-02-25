@@ -19,6 +19,7 @@ pub(super) enum PolicyDecisionKind {
     RequireApproval,
     Deny,
     Modify,
+    RequireMoreEvidence,
 }
 
 #[derive(Debug, Clone, Serialize)]

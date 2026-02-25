@@ -15,6 +15,10 @@ use crate::agent::autonomy_telemetry::{
     PolicyDecisionKind as TelemetryPolicyDecisionKind, PolicyDecisionRecord, classify_failure,
     elapsed_ms, emit_execution_attempt, emit_policy_decision, truncate_error_preview,
 };
+use crate::agent::policy_engine::{
+    ApprovalPolicyOutcome, HookToolPolicyOutcome, evaluate_dispatcher_tool_approval,
+    evaluate_tool_call_hook,
+};
 use crate::agent::session::{PendingApproval, Session, ThreadState};
 use crate::agent::{
     Agent, ExecutionAttempt as AutonomyExecutionAttempt,
@@ -93,6 +97,9 @@ fn map_policy_decision_kind(kind: TelemetryPolicyDecisionKind) -> AutonomyPolicy
         TelemetryPolicyDecisionKind::RequireApproval => AutonomyPolicyDecisionKind::RequireApproval,
         TelemetryPolicyDecisionKind::Deny => AutonomyPolicyDecisionKind::Deny,
         TelemetryPolicyDecisionKind::Modify => AutonomyPolicyDecisionKind::Modify,
+        TelemetryPolicyDecisionKind::RequireMoreEvidence => {
+            AutonomyPolicyDecisionKind::RequireMoreEvidence
+        }
     }
 }
 
@@ -859,96 +866,101 @@ impl Agent {
                     // Execute each tool (with approval checking and hook interception)
                     for mut tc in tool_calls {
                         // Check if tool requires approval
-                        if let Some(tool) = self.tools().get(&tc.name).await
-                            && tool.requires_approval()
-                        {
-                            // Check if auto-approved for this session
-                            let mut is_auto_approved = {
+                        if let Some(tool) = self.tools().get(&tc.name).await {
+                            let session_auto_approved = {
                                 let sess = session.lock().await;
                                 sess.is_tool_auto_approved(&tc.name)
                             };
-                            let mut approval_reason_codes =
-                                vec!["tool_requires_approval".to_string()];
+                            match evaluate_dispatcher_tool_approval(
+                                tool.as_ref(),
+                                &tc.arguments,
+                                session_auto_approved,
+                            ) {
+                                ApprovalPolicyOutcome::NoApprovalRequired => {}
+                                ApprovalPolicyOutcome::RequireApproval { reason_codes } => {
+                                    if reason_codes
+                                        .iter()
+                                        .any(|c| c == "destructive_params_override_auto_approval")
+                                    {
+                                        tracing::info!(
+                                            tool = %tc.name,
+                                            "Parameters require explicit approval despite auto-approve"
+                                        );
+                                    }
+                                    let reason_codes_for_db = reason_codes.clone();
+                                    emit_policy_decision(&PolicyDecisionRecord {
+                                        user_id: message.user_id.clone(),
+                                        channel: message.channel.clone(),
+                                        thread_id,
+                                        tool_name: tc.name.clone(),
+                                        tool_call_id: tc.id.clone(),
+                                        decision: TelemetryPolicyDecisionKind::RequireApproval,
+                                        reason_codes,
+                                        auto_approved: Some(false),
+                                    });
+                                    persist_policy_decision_best_effort(
+                                        self,
+                                        message,
+                                        &job_ctx,
+                                        &tc.name,
+                                        &tc.id,
+                                        TelemetryPolicyDecisionKind::RequireApproval,
+                                        reason_codes_for_db,
+                                        Some(false),
+                                    );
+                                    let pending = PendingApproval {
+                                        request_id: Uuid::new_v4(),
+                                        tool_name: tc.name.clone(),
+                                        parameters: tc.arguments.clone(),
+                                        description: tool.description().to_string(),
+                                        tool_call_id: tc.id.clone(),
+                                        context_messages: context_messages.clone(),
+                                    };
 
-                            // Override auto-approval for destructive parameters
-                            // (e.g. `rm -rf`, `git push --force` in shell commands).
-                            if is_auto_approved && tool.requires_approval_for(&tc.arguments) {
-                                tracing::info!(
-                                    tool = %tc.name,
-                                    "Parameters require explicit approval despite auto-approve"
-                                );
-                                is_auto_approved = false;
-                                approval_reason_codes
-                                    .push("destructive_params_override_auto_approval".to_string());
+                                    return Ok(AgenticLoopResult::NeedApproval { pending });
+                                }
+                                ApprovalPolicyOutcome::AllowAutoApproved { reason_codes } => {
+                                    let reason_codes_for_db = reason_codes.clone();
+                                    emit_policy_decision(&PolicyDecisionRecord {
+                                        user_id: message.user_id.clone(),
+                                        channel: message.channel.clone(),
+                                        thread_id,
+                                        tool_name: tc.name.clone(),
+                                        tool_call_id: tc.id.clone(),
+                                        decision: TelemetryPolicyDecisionKind::Allow,
+                                        reason_codes,
+                                        auto_approved: Some(true),
+                                    });
+                                    persist_policy_decision_best_effort(
+                                        self,
+                                        message,
+                                        &job_ctx,
+                                        &tc.name,
+                                        &tc.id,
+                                        TelemetryPolicyDecisionKind::Allow,
+                                        reason_codes_for_db,
+                                        Some(true),
+                                    );
+                                }
                             }
-
-                            if !is_auto_approved {
-                                let approval_reason_codes_for_db = approval_reason_codes.clone();
-                                emit_policy_decision(&PolicyDecisionRecord {
-                                    user_id: message.user_id.clone(),
-                                    channel: message.channel.clone(),
-                                    thread_id,
-                                    tool_name: tc.name.clone(),
-                                    tool_call_id: tc.id.clone(),
-                                    decision: TelemetryPolicyDecisionKind::RequireApproval,
-                                    reason_codes: approval_reason_codes,
-                                    auto_approved: Some(false),
-                                });
-                                persist_policy_decision_best_effort(
-                                    self,
-                                    message,
-                                    &job_ctx,
-                                    &tc.name,
-                                    &tc.id,
-                                    TelemetryPolicyDecisionKind::RequireApproval,
-                                    approval_reason_codes_for_db,
-                                    Some(false),
-                                );
-                                // Need approval - store pending request and return
-                                let pending = PendingApproval {
-                                    request_id: Uuid::new_v4(),
-                                    tool_name: tc.name.clone(),
-                                    parameters: tc.arguments.clone(),
-                                    description: tool.description().to_string(),
-                                    tool_call_id: tc.id.clone(),
-                                    context_messages: context_messages.clone(),
-                                };
-
-                                return Ok(AgenticLoopResult::NeedApproval { pending });
-                            }
-
-                            emit_policy_decision(&PolicyDecisionRecord {
-                                user_id: message.user_id.clone(),
-                                channel: message.channel.clone(),
-                                thread_id,
-                                tool_name: tc.name.clone(),
-                                tool_call_id: tc.id.clone(),
-                                decision: TelemetryPolicyDecisionKind::Allow,
-                                reason_codes: vec!["session_auto_approval".to_string()],
-                                auto_approved: Some(true),
-                            });
-                            persist_policy_decision_best_effort(
-                                self,
-                                message,
-                                &job_ctx,
-                                &tc.name,
-                                &tc.id,
-                                TelemetryPolicyDecisionKind::Allow,
-                                vec!["session_auto_approval".to_string()],
-                                Some(true),
-                            );
                         }
 
                         // Hook: BeforeToolCall — allow hooks to modify or reject tool calls
                         {
-                            let event = crate::hooks::HookEvent::ToolCall {
-                                tool_name: tc.name.clone(),
-                                parameters: tc.arguments.clone(),
-                                user_id: message.user_id.clone(),
-                                context: "chat".to_string(),
-                            };
-                            match self.hooks().run(&event).await {
-                                Err(crate::hooks::HookError::Rejected { reason }) => {
+                            match evaluate_tool_call_hook(
+                                self.hooks().as_ref(),
+                                &tc.name,
+                                &tc.arguments,
+                                &message.user_id,
+                                "chat",
+                            )
+                            .await
+                            {
+                                HookToolPolicyOutcome::Deny {
+                                    reason,
+                                    reason_codes,
+                                } => {
+                                    let reason_codes_for_db = reason_codes.clone();
                                     emit_policy_decision(&PolicyDecisionRecord {
                                         user_id: message.user_id.clone(),
                                         channel: message.channel.clone(),
@@ -956,7 +968,7 @@ impl Agent {
                                         tool_name: tc.name.clone(),
                                         tool_call_id: tc.id.clone(),
                                         decision: TelemetryPolicyDecisionKind::Deny,
-                                        reason_codes: vec!["hook_rejected".to_string()],
+                                        reason_codes,
                                         auto_approved: None,
                                     });
                                     persist_policy_decision_best_effort(
@@ -966,25 +978,29 @@ impl Agent {
                                         &tc.name,
                                         &tc.id,
                                         TelemetryPolicyDecisionKind::Deny,
-                                        vec!["hook_rejected".to_string()],
+                                        reason_codes_for_db,
                                         None,
                                     );
                                     context_messages.push(ChatMessage::tool_result(
                                         &tc.id,
                                         &tc.name,
-                                        format!("Tool call rejected by hook: {}", reason),
+                                        format!("Tool call blocked by hook policy: {}", reason),
                                     ));
                                     continue;
                                 }
-                                Err(err) => {
+                                HookToolPolicyOutcome::Modified {
+                                    parameters,
+                                    reason_codes,
+                                } => {
+                                    let reason_codes_for_db = reason_codes.clone();
                                     emit_policy_decision(&PolicyDecisionRecord {
                                         user_id: message.user_id.clone(),
                                         channel: message.channel.clone(),
                                         thread_id,
                                         tool_name: tc.name.clone(),
                                         tool_call_id: tc.id.clone(),
-                                        decision: TelemetryPolicyDecisionKind::Deny,
-                                        reason_codes: vec!["hook_policy_error".to_string()],
+                                        decision: TelemetryPolicyDecisionKind::Modify,
+                                        reason_codes,
                                         auto_approved: None,
                                     });
                                     persist_policy_decision_best_effort(
@@ -993,54 +1009,15 @@ impl Agent {
                                         &job_ctx,
                                         &tc.name,
                                         &tc.id,
-                                        TelemetryPolicyDecisionKind::Deny,
-                                        vec!["hook_policy_error".to_string()],
+                                        TelemetryPolicyDecisionKind::Modify,
+                                        reason_codes_for_db,
                                         None,
                                     );
-                                    context_messages.push(ChatMessage::tool_result(
-                                        &tc.id,
-                                        &tc.name,
-                                        format!("Tool call blocked by hook policy: {}", err),
-                                    ));
-                                    continue;
+                                    tc.arguments = parameters;
                                 }
-                                Ok(crate::hooks::HookOutcome::Continue {
-                                    modified: Some(new_params),
-                                }) => match serde_json::from_str(&new_params) {
-                                    Ok(parsed) => {
-                                        emit_policy_decision(&PolicyDecisionRecord {
-                                            user_id: message.user_id.clone(),
-                                            channel: message.channel.clone(),
-                                            thread_id,
-                                            tool_name: tc.name.clone(),
-                                            tool_call_id: tc.id.clone(),
-                                            decision: TelemetryPolicyDecisionKind::Modify,
-                                            reason_codes: vec![
-                                                "hook_modified_parameters".to_string(),
-                                            ],
-                                            auto_approved: None,
-                                        });
-                                        persist_policy_decision_best_effort(
-                                            self,
-                                            message,
-                                            &job_ctx,
-                                            &tc.name,
-                                            &tc.id,
-                                            TelemetryPolicyDecisionKind::Modify,
-                                            vec!["hook_modified_parameters".to_string()],
-                                            None,
-                                        );
-                                        tc.arguments = parsed;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            tool = %tc.name,
-                                            "Hook returned non-JSON modification for ToolCall, ignoring: {}",
-                                            e
-                                        );
-                                    }
-                                },
-                                _ => {} // Continue, fail-open errors already logged
+                                HookToolPolicyOutcome::Continue { parameters } => {
+                                    tc.arguments = parameters;
+                                }
                             }
                         }
 
