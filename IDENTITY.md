@@ -22,6 +22,7 @@
 - Internal autonomy control-plane v1 persistence is now scaffolded across both PostgreSQL and libSQL backends (goals/plans/plan steps/execution attempts/policy decisions/incidents), with worker/dispatcher runtime paths best-effort writing records for planned worker runs and chat tool policy/execution events.
 - Job records now persist optional autonomy linkage IDs (`autonomy_goal_id`, `autonomy_plan_id`, `autonomy_plan_step_id`) across PostgreSQL and libSQL so worker/dispatcher autonomy records can remain correlated after DB reloads/restarts.
 - Web gateway exposes user-scoped autonomy goal/plan APIs for creation, inspection, and status updates, and now includes plan-step APIs (`GET/POST /api/plans/{id}/steps`, `GET /api/plan-steps/{id}`, `POST /api/plan-steps/{id}/status`) for structured step management before broader control actions (cancel/replan/etc.) are added.
+- Web gateway now also exposes user-scoped telemetry inspection for persisted autonomy execution attempts and policy decisions (`GET /api/plans/{id}/executions`, `GET /api/goals/{id}/policy-decisions`) to validate runtime instrumentation.
 - CLI exposes `titanclaw goal`, `titanclaw plan`, and `titanclaw plan-step` subcommands (create/list/show/set-status) for direct inspection and manual management of autonomy records in local/single-user workflows.
 
 ## UX and Operations Identity
