@@ -29,7 +29,9 @@ use tower_http::cors::{AllowHeaders, CorsLayer};
 use url::Url;
 use uuid::Uuid;
 
-use crate::agent::SessionManager;
+use crate::agent::{
+    Goal, GoalRiskClass, GoalSource, GoalStatus, Plan, PlanStatus, PlannerKind, SessionManager,
+};
 use crate::channels::IncomingMessage;
 use crate::channels::web::auth::{AuthState, auth_middleware};
 use crate::channels::web::log_layer::LogBroadcaster;
@@ -219,11 +221,17 @@ pub async fn start_server(
             "/api/jobs/{id}/files/download",
             get(job_files_download_handler),
         )
-        // Autonomy (read-only v1 inspection)
-        .route("/api/goals", get(goals_list_handler))
+        // Autonomy (v1 inspection + create)
+        .route(
+            "/api/goals",
+            get(goals_list_handler).post(goals_create_handler),
+        )
         .route("/api/goals/{id}", get(goals_detail_handler))
         .route("/api/goals/{id}/plans", get(goal_plans_list_handler))
-        .route("/api/plans", get(plans_list_handler))
+        .route(
+            "/api/plans",
+            get(plans_list_handler).post(plans_create_handler),
+        )
         .route("/api/plans/{id}", get(plans_detail_handler))
         // Logs
         .route("/api/logs/events", get(logs_events_handler))
@@ -2899,11 +2907,90 @@ async fn skills_remove_handler(
     }
 }
 
-// --- Autonomy handlers (read-only v1 inspection) ---
+// --- Autonomy handlers (v1 inspection + create) ---
 
 #[derive(Deserialize)]
 struct PlansListQuery {
     goal_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoalCreateRequest {
+    title: String,
+    intent: String,
+    priority: Option<i32>,
+    status: Option<GoalStatus>,
+    risk_class: Option<GoalRiskClass>,
+    source: Option<GoalSource>,
+    channel: Option<String>,
+    thread_id: Option<Uuid>,
+    acceptance_criteria: Option<serde_json::Value>,
+    constraints: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanCreateRequest {
+    goal_id: Uuid,
+    revision: Option<i32>,
+    status: Option<PlanStatus>,
+    planner_kind: Option<PlannerKind>,
+    source_action_plan: Option<serde_json::Value>,
+    assumptions: Option<serde_json::Value>,
+    confidence: Option<f64>,
+    estimated_cost: Option<f64>,
+    estimated_time_secs: Option<u64>,
+    summary: Option<String>,
+}
+
+async fn goals_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<GoalCreateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let title = body.title.trim();
+    if title.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "title is required".to_string()));
+    }
+    let intent = body.intent.trim();
+    if intent.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "intent is required".to_string()));
+    }
+
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let now = chrono::Utc::now();
+    let status = body.status.unwrap_or(GoalStatus::Active);
+    let goal = Goal {
+        id: Uuid::new_v4(),
+        owner_user_id: state.user_id.clone(),
+        channel: body
+            .channel
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty()),
+        thread_id: body.thread_id,
+        title: title.to_string(),
+        intent: intent.to_string(),
+        priority: body.priority.unwrap_or(0),
+        status,
+        risk_class: body.risk_class.unwrap_or(GoalRiskClass::Medium),
+        acceptance_criteria: body
+            .acceptance_criteria
+            .unwrap_or_else(|| serde_json::json!({})),
+        constraints: body.constraints.unwrap_or_else(|| serde_json::json!({})),
+        source: body.source.unwrap_or(GoalSource::UserRequest),
+        created_at: now,
+        updated_at: now,
+        completed_at: matches!(status, GoalStatus::Completed).then_some(now),
+    };
+
+    store
+        .create_goal(&goal)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "goal": goal })))
 }
 
 async fn goals_list_handler(
@@ -3007,6 +3094,81 @@ async fn plans_list_handler(
     plans.reverse();
 
     Ok(Json(serde_json::json!({ "plans": plans })))
+}
+
+async fn plans_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<PlanCreateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    if let Some(confidence) = body.confidence
+        && !(0.0..=1.0).contains(&confidence)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "confidence must be between 0.0 and 1.0".to_string(),
+        ));
+    }
+
+    let goal = store
+        .get_goal(body.goal_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .filter(|g| g.owner_user_id == state.user_id)
+        .ok_or((StatusCode::NOT_FOUND, "Goal not found".to_string()))?;
+
+    let existing = store
+        .list_plans_for_goal(goal.id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let revision = body
+        .revision
+        .unwrap_or_else(|| existing.iter().map(|p| p.revision).max().unwrap_or(0) + 1);
+    if revision <= 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "revision must be a positive integer".to_string(),
+        ));
+    }
+    if existing.iter().any(|p| p.revision == revision) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("plan revision {} already exists for goal", revision),
+        ));
+    }
+
+    let summary = body
+        .summary
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let now = chrono::Utc::now();
+    let plan = Plan {
+        id: Uuid::new_v4(),
+        goal_id: goal.id,
+        revision,
+        status: body.status.unwrap_or(PlanStatus::Draft),
+        planner_kind: body.planner_kind.unwrap_or(PlannerKind::ReasoningV1),
+        source_action_plan: body.source_action_plan,
+        assumptions: body.assumptions.unwrap_or_else(|| serde_json::json!({})),
+        confidence: body.confidence.unwrap_or(0.5),
+        estimated_cost: body.estimated_cost,
+        estimated_time_secs: body.estimated_time_secs,
+        summary,
+        created_at: now,
+        updated_at: now,
+    };
+
+    store
+        .create_plan(&plan)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "plan": plan })))
 }
 
 async fn plans_detail_handler(

@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Autonomy Control Plane v1 persistence groundwork: versioned autonomy domain types, Postgres/libSQL goal/plan/plan-step/execution/policy/incident schema (`V11`-`V16` + libSQL mirror), and backend store CRUD implementations for the new autonomy tables.
 - Read-only web gateway autonomy inspection endpoints for goals/plans (`GET /api/goals`, `GET /api/goals/{id}`, `GET /api/goals/{id}/plans`, `GET /api/plans?goal_id=...`, `GET /api/plans/{id}`), user-scoped to the authenticated gateway user.
+- User-scoped web gateway create endpoints for autonomy goals/plans (`POST /api/goals`, `POST /api/plans`) with server-generated IDs/timestamps and goal-ownership checks before plan creation.
 
 ### Changed
 

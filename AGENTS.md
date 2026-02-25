@@ -63,7 +63,7 @@ When behavior changes, keep these docs aligned in the same branch:
   - versioned autonomy domain types and dual-backend (PostgreSQL/libSQL) autonomy tables exist for goals/plans/plan steps/execution attempts/policy decisions/incidents
   - worker planned executions and dispatcher approval/tool-attempt paths now best-effort persist internal autonomy records (tracing emitters and approval UX remain unchanged)
   - `agent_jobs` now persists optional autonomy linkage IDs (`autonomy_goal_id`, `autonomy_plan_id`, `autonomy_plan_step_id`) so worker/dispatcher correlation survives DB save/load and restarts (PostgreSQL + libSQL, `V17` + libSQL schema mirror update)
-  - web gateway now exposes read-only inspection endpoints for autonomy goals/plans (`GET /api/goals`, `GET /api/goals/{id}`, `GET /api/goals/{id}/plans`, `GET /api/plans`, `GET /api/plans/{id}`) with user scoping
+  - web gateway now exposes user-scoped autonomy goal/plan APIs for create + inspection (`POST /api/goals`, `POST /api/plans`, plus `GET /api/goals*` / `GET /api/plans*`)
 - Web gateway auth/render hardening:
   - SSE query-token auth accepts URL-encoded tokens
   - WebSocket Origin validation parses loopback hosts correctly (including IPv6)
