@@ -11,6 +11,7 @@
 //! - Context compaction for long conversations
 
 mod agent_loop;
+pub mod autonomy;
 mod autonomy_telemetry;
 mod commands;
 pub mod compaction;
@@ -40,6 +41,11 @@ pub mod worker;
 
 pub(crate) use agent_loop::truncate_for_preview;
 pub use agent_loop::{Agent, AgentDeps};
+pub use autonomy::v1::{
+    Evidence, EvidenceKind, ExecutionAttempt, ExecutionAttemptStatus, Goal, GoalRiskClass,
+    GoalSource, GoalStatus, Incident, Plan, PlanStatus, PlanStep, PlanStepKind, PlanStepStatus,
+    PlannerKind, PolicyDecision, PolicyDecisionKind,
+};
 pub use compaction::{CompactionResult, ContextCompactor};
 pub use context_monitor::{CompactionStrategy, ContextBreakdown, ContextMonitor};
 pub use heartbeat::{HeartbeatConfig, HeartbeatResult, HeartbeatRunner, spawn_heartbeat};

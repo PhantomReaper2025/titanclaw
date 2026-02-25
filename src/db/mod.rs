@@ -26,8 +26,11 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
-use crate::agent::BrokenTool;
 use crate::agent::routine::{Routine, RoutineRun, RunStatus};
+use crate::agent::{
+    BrokenTool, ExecutionAttempt, Goal, GoalStatus, Plan, PlanStatus, PlanStep, PlanStepStatus,
+    PolicyDecision,
+};
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::error::DatabaseError;
 use crate::error::WorkspaceError;
@@ -473,6 +476,132 @@ pub trait AstGraphStore: Send + Sync {
     ) -> Result<Vec<StoredAstNode>, WorkspaceError>;
 }
 
+#[async_trait]
+pub trait GoalStore: Send + Sync {
+    async fn create_goal(&self, _goal: &Goal) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy goal store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn get_goal(&self, _id: Uuid) -> Result<Option<Goal>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy goal store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn list_goals(&self) -> Result<Vec<Goal>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy goal store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn update_goal_status(
+        &self,
+        _id: Uuid,
+        _status: GoalStatus,
+    ) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy goal store not implemented for backend".to_string(),
+        ))
+    }
+}
+
+#[async_trait]
+pub trait PlanStore: Send + Sync {
+    async fn create_plan(&self, _plan: &Plan) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy plan store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn list_plans_for_goal(&self, _goal_id: Uuid) -> Result<Vec<Plan>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy plan store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn get_plan(&self, _id: Uuid) -> Result<Option<Plan>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy plan store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn update_plan_status(
+        &self,
+        _id: Uuid,
+        _status: PlanStatus,
+    ) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy plan store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn create_plan_steps(&self, _steps: &[PlanStep]) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy plan store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn update_plan_step_status(
+        &self,
+        _id: Uuid,
+        _status: PlanStepStatus,
+    ) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy plan store not implemented for backend".to_string(),
+        ))
+    }
+}
+
+#[async_trait]
+pub trait AutonomyExecutionStore: Send + Sync {
+    async fn record_execution_attempt(
+        &self,
+        _attempt: &ExecutionAttempt,
+    ) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy execution store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn update_execution_attempt(
+        &self,
+        _attempt: &ExecutionAttempt,
+    ) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy execution store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn record_policy_decision(
+        &self,
+        _decision: &PolicyDecision,
+    ) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy execution store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn list_execution_attempts_for_plan(
+        &self,
+        _plan_id: Uuid,
+    ) -> Result<Vec<ExecutionAttempt>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy execution store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn list_policy_decisions_for_goal(
+        &self,
+        _goal_id: Uuid,
+    ) -> Result<Vec<PolicyDecision>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy execution store not implemented for backend".to_string(),
+        ))
+    }
+}
+
 /// Backend-agnostic database supertrait.
 ///
 /// Combines all sub-traits into one. Existing `Arc<dyn Database>` consumers
@@ -487,6 +616,9 @@ pub trait Database:
     + SettingsStore
     + WorkspaceStore
     + AstGraphStore
+    + GoalStore
+    + PlanStore
+    + AutonomyExecutionStore
     + Send
     + Sync
 {

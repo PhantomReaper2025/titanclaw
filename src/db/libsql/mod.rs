@@ -20,14 +20,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use libsql::{Connection, Database as LibSqlDatabase};
+use libsql::{Connection, Database as LibSqlDatabase, params};
 use rust_decimal::Decimal;
+use uuid::Uuid;
 
 use crate::agent::routine::{
     NotifyConfig, Routine, RoutineAction, RoutineGuardrails, RoutineRun, RunStatus, Trigger,
 };
+use crate::agent::{
+    ExecutionAttempt, Goal, GoalStatus, Plan, PlanStatus, PlanStep, PlanStepStatus, PolicyDecision,
+};
 use crate::context::JobState;
-use crate::db::Database;
+use crate::db::{AutonomyExecutionStore, Database, GoalStore, PlanStore};
 use crate::error::DatabaseError;
 use crate::workspace::MemoryDocument;
 
@@ -281,6 +285,77 @@ pub(crate) fn get_opt_ts(row: &libsql::Row, idx: i32) -> Option<DateTime<Utc>> {
     }
 }
 
+/// Convert a serde-backed enum (with `snake_case` serde names) to DB string.
+fn enum_to_snake_case<T: serde::Serialize>(value: &T) -> Result<String, DatabaseError> {
+    match serde_json::to_value(value).map_err(|e| DatabaseError::Serialization(e.to_string()))? {
+        serde_json::Value::String(s) => Ok(s),
+        other => Err(DatabaseError::Serialization(format!(
+            "expected enum string, got {}",
+            other
+        ))),
+    }
+}
+
+/// Parse a serde-backed enum from DB snake_case string.
+fn enum_from_snake_case<T: serde::de::DeserializeOwned>(
+    s: &str,
+    kind: &str,
+) -> Result<T, DatabaseError> {
+    serde_json::from_value(serde_json::Value::String(s.to_string()))
+        .map_err(|e| DatabaseError::Serialization(format!("invalid {} '{}': {}", kind, s, e)))
+}
+
+/// Convert optional JSON to libSQL text/NULL while preserving NULL semantics.
+fn opt_json_text(value: Option<&serde_json::Value>) -> Result<libsql::Value, DatabaseError> {
+    match value {
+        Some(v) => Ok(libsql::Value::Text(
+            serde_json::to_string(v).map_err(|e| DatabaseError::Serialization(e.to_string()))?,
+        )),
+        None => Ok(libsql::Value::Null),
+    }
+}
+
+/// Parse an optional JSON value from a text column. Returns None for SQL NULL.
+fn get_opt_json(row: &libsql::Row, idx: i32) -> Option<serde_json::Value> {
+    match row.get::<String>(idx) {
+        Ok(s) if s.is_empty() => None,
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("JSON parse failure at column {}: {}", idx, e);
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+fn get_opt_f64(row: &libsql::Row, idx: i32) -> Option<f64> {
+    row.get::<f64>(idx).ok()
+}
+
+fn get_opt_f32(row: &libsql::Row, idx: i32) -> Option<f32> {
+    row.get::<f64>(idx).ok().map(|v| v as f32)
+}
+
+fn get_opt_uuid(row: &libsql::Row, idx: i32) -> Option<Uuid> {
+    get_opt_text(row, idx).and_then(|s| s.parse().ok())
+}
+
+fn get_json_string_array(row: &libsql::Row, idx: i32) -> Vec<String> {
+    match row.get::<String>(idx) {
+        Ok(s) if s.is_empty() => Vec::new(),
+        Ok(s) => match serde_json::from_str::<Vec<String>>(&s) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("JSON string array parse failure at column {}: {}", idx, e);
+                Vec::new()
+            }
+        },
+        Err(_) => Vec::new(),
+    }
+}
+
 #[async_trait]
 impl Database for LibSqlBackend {
     async fn run_migrations(&self) -> Result<(), DatabaseError> {
@@ -294,6 +369,546 @@ impl Database for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Migration(format!("libSQL migration failed: {}", e)))?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl GoalStore for LibSqlBackend {
+    async fn create_goal(&self, goal: &Goal) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let status = enum_to_snake_case(&goal.status)?;
+        let risk_class = enum_to_snake_case(&goal.risk_class)?;
+        let source = enum_to_snake_case(&goal.source)?;
+
+        conn.execute(
+            r#"
+            INSERT INTO autonomy_goals (
+                id, owner_user_id, channel, thread_id, title, intent, priority,
+                status, risk_class, acceptance_criteria, constraints, source,
+                created_at, updated_at, completed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            "#,
+            params![
+                goal.id.to_string(),
+                goal.owner_user_id.as_str(),
+                opt_text(goal.channel.as_deref()),
+                opt_text_owned(goal.thread_id.map(|id| id.to_string())),
+                goal.title.as_str(),
+                goal.intent.as_str(),
+                goal.priority as i64,
+                status,
+                risk_class,
+                goal.acceptance_criteria.to_string(),
+                goal.constraints.to_string(),
+                source,
+                fmt_ts(&goal.created_at),
+                fmt_ts(&goal.updated_at),
+                fmt_opt_ts(&goal.completed_at),
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn get_goal(&self, id: Uuid) -> Result<Option<Goal>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    id, owner_user_id, channel, thread_id, title, intent, priority,
+                    status, risk_class, acceptance_criteria, constraints, source,
+                    created_at, updated_at, completed_at
+                FROM autonomy_goals
+                WHERE id = ?1
+                "#,
+                params![id.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            Some(row) => Ok(Some(row_to_goal_libsql(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn list_goals(&self) -> Result<Vec<Goal>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    id, owner_user_id, channel, thread_id, title, intent, priority,
+                    status, risk_class, acceptance_criteria, constraints, source,
+                    created_at, updated_at, completed_at
+                FROM autonomy_goals
+                ORDER BY updated_at DESC, created_at DESC
+                "#,
+                (),
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut goals = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            goals.push(row_to_goal_libsql(&row)?);
+        }
+        Ok(goals)
+    }
+
+    async fn update_goal_status(&self, id: Uuid, status: GoalStatus) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let now = fmt_ts(&Utc::now());
+        let status_str = enum_to_snake_case(&status)?;
+        let is_completed = matches!(status, GoalStatus::Completed) as i64;
+
+        conn.execute(
+            r#"
+            UPDATE autonomy_goals
+            SET
+                status = ?2,
+                updated_at = ?3,
+                completed_at = CASE
+                    WHEN ?4 = 1 THEN COALESCE(completed_at, ?3)
+                    ELSE NULL
+                END
+            WHERE id = ?1
+            "#,
+            params![id.to_string(), status_str, now.as_str(), is_completed],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl PlanStore for LibSqlBackend {
+    async fn create_plan(&self, plan: &Plan) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let status = enum_to_snake_case(&plan.status)?;
+        let planner_kind = enum_to_snake_case(&plan.planner_kind)?;
+
+        conn.execute(
+            r#"
+            INSERT INTO autonomy_plans (
+                id, goal_id, revision, status, planner_kind, source_action_plan,
+                assumptions, confidence, estimated_cost, estimated_time_secs, summary,
+                created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            "#,
+            params![
+                plan.id.to_string(),
+                plan.goal_id.to_string(),
+                plan.revision as i64,
+                status,
+                planner_kind,
+                opt_json_text(plan.source_action_plan.as_ref())?,
+                plan.assumptions.to_string(),
+                plan.confidence,
+                plan.estimated_cost,
+                plan.estimated_time_secs.map(|v| v as i64),
+                opt_text(plan.summary.as_deref()),
+                fmt_ts(&plan.created_at),
+                fmt_ts(&plan.updated_at),
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn list_plans_for_goal(&self, goal_id: Uuid) -> Result<Vec<Plan>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    id, goal_id, revision, status, planner_kind, source_action_plan,
+                    assumptions, confidence, estimated_cost, estimated_time_secs, summary,
+                    created_at, updated_at
+                FROM autonomy_plans
+                WHERE goal_id = ?1
+                ORDER BY revision DESC, created_at DESC
+                "#,
+                params![goal_id.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut plans = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            plans.push(row_to_plan_libsql(&row)?);
+        }
+        Ok(plans)
+    }
+
+    async fn get_plan(&self, id: Uuid) -> Result<Option<Plan>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    id, goal_id, revision, status, planner_kind, source_action_plan,
+                    assumptions, confidence, estimated_cost, estimated_time_secs, summary,
+                    created_at, updated_at
+                FROM autonomy_plans
+                WHERE id = ?1
+                "#,
+                params![id.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            Some(row) => Ok(Some(row_to_plan_libsql(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn update_plan_status(&self, id: Uuid, status: PlanStatus) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let now = fmt_ts(&Utc::now());
+        let status_str = enum_to_snake_case(&status)?;
+
+        conn.execute(
+            r#"
+            UPDATE autonomy_plans
+            SET status = ?2, updated_at = ?3
+            WHERE id = ?1
+            "#,
+            params![id.to_string(), status_str, now.as_str()],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn create_plan_steps(&self, steps: &[PlanStep]) -> Result<(), DatabaseError> {
+        if steps.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.connect().await?;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        for step in steps {
+            let kind = enum_to_snake_case(&step.kind)?;
+            let status = enum_to_snake_case(&step.status)?;
+
+            if let Err(e) = conn
+                .execute(
+                    r#"
+                    INSERT INTO autonomy_plan_steps (
+                        id, plan_id, sequence_num, kind, status, title, description,
+                        tool_candidates, inputs, preconditions, postconditions, "rollback",
+                        policy_requirements, started_at, completed_at, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                    "#,
+                    params![
+                        step.id.to_string(),
+                        step.plan_id.to_string(),
+                        step.sequence_num as i64,
+                        kind,
+                        status,
+                        step.title.as_str(),
+                        step.description.as_str(),
+                        step.tool_candidates.to_string(),
+                        step.inputs.to_string(),
+                        step.preconditions.to_string(),
+                        step.postconditions.to_string(),
+                        opt_json_text(step.rollback.as_ref())?,
+                        step.policy_requirements.to_string(),
+                        fmt_opt_ts(&step.started_at),
+                        fmt_opt_ts(&step.completed_at),
+                        fmt_ts(&step.created_at),
+                        fmt_ts(&step.updated_at),
+                    ],
+                )
+                .await
+            {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(DatabaseError::Query(e.to_string()));
+            }
+        }
+
+        conn.execute("COMMIT", ())
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn update_plan_step_status(
+        &self,
+        id: Uuid,
+        status: PlanStepStatus,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let now = fmt_ts(&Utc::now());
+        let status_str = enum_to_snake_case(&status)?;
+        let set_started = matches!(status, PlanStepStatus::Running) as i64;
+        let set_completed = matches!(
+            status,
+            PlanStepStatus::Succeeded | PlanStepStatus::Failed | PlanStepStatus::Skipped
+        ) as i64;
+
+        conn.execute(
+            r#"
+            UPDATE autonomy_plan_steps
+            SET
+                status = ?2,
+                updated_at = ?3,
+                started_at = CASE WHEN ?4 = 1 THEN COALESCE(started_at, ?3) ELSE started_at END,
+                completed_at = CASE WHEN ?5 = 1 THEN COALESCE(completed_at, ?3) ELSE completed_at END
+            WHERE id = ?1
+            "#,
+            params![
+                id.to_string(),
+                status_str,
+                now.as_str(),
+                set_started,
+                set_completed
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AutonomyExecutionStore for LibSqlBackend {
+    async fn record_execution_attempt(
+        &self,
+        attempt: &ExecutionAttempt,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let status = enum_to_snake_case(&attempt.status)?;
+
+        conn.execute(
+            r#"
+            INSERT INTO autonomy_execution_attempts (
+                id, goal_id, plan_id, plan_step_id, job_id, thread_id, user_id, channel,
+                tool_name, tool_call_id, tool_args, status, failure_class, retry_count,
+                started_at, finished_at, elapsed_ms, result_summary, error_preview
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+            "#,
+            params![
+                attempt.id.to_string(),
+                opt_text_owned(attempt.goal_id.map(|id| id.to_string())),
+                opt_text_owned(attempt.plan_id.map(|id| id.to_string())),
+                opt_text_owned(attempt.plan_step_id.map(|id| id.to_string())),
+                opt_text_owned(attempt.job_id.map(|id| id.to_string())),
+                opt_text_owned(attempt.thread_id.map(|id| id.to_string())),
+                attempt.user_id.as_str(),
+                attempt.channel.as_str(),
+                attempt.tool_name.as_str(),
+                opt_text(attempt.tool_call_id.as_deref()),
+                opt_json_text(attempt.tool_args.as_ref())?,
+                status,
+                opt_text(attempt.failure_class.as_deref()),
+                attempt.retry_count as i64,
+                fmt_ts(&attempt.started_at),
+                fmt_opt_ts(&attempt.finished_at),
+                attempt.elapsed_ms,
+                opt_text(attempt.result_summary.as_deref()),
+                opt_text(attempt.error_preview.as_deref()),
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn update_execution_attempt(
+        &self,
+        attempt: &ExecutionAttempt,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let status = enum_to_snake_case(&attempt.status)?;
+
+        conn.execute(
+            r#"
+            UPDATE autonomy_execution_attempts
+            SET
+                goal_id = ?2,
+                plan_id = ?3,
+                plan_step_id = ?4,
+                job_id = ?5,
+                thread_id = ?6,
+                user_id = ?7,
+                channel = ?8,
+                tool_name = ?9,
+                tool_call_id = ?10,
+                tool_args = ?11,
+                status = ?12,
+                failure_class = ?13,
+                retry_count = ?14,
+                started_at = ?15,
+                finished_at = ?16,
+                elapsed_ms = ?17,
+                result_summary = ?18,
+                error_preview = ?19
+            WHERE id = ?1
+            "#,
+            params![
+                attempt.id.to_string(),
+                opt_text_owned(attempt.goal_id.map(|id| id.to_string())),
+                opt_text_owned(attempt.plan_id.map(|id| id.to_string())),
+                opt_text_owned(attempt.plan_step_id.map(|id| id.to_string())),
+                opt_text_owned(attempt.job_id.map(|id| id.to_string())),
+                opt_text_owned(attempt.thread_id.map(|id| id.to_string())),
+                attempt.user_id.as_str(),
+                attempt.channel.as_str(),
+                attempt.tool_name.as_str(),
+                opt_text(attempt.tool_call_id.as_deref()),
+                opt_json_text(attempt.tool_args.as_ref())?,
+                status,
+                opt_text(attempt.failure_class.as_deref()),
+                attempt.retry_count as i64,
+                fmt_ts(&attempt.started_at),
+                fmt_opt_ts(&attempt.finished_at),
+                attempt.elapsed_ms,
+                opt_text(attempt.result_summary.as_deref()),
+                opt_text(attempt.error_preview.as_deref()),
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn record_policy_decision(&self, decision: &PolicyDecision) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let decision_kind = enum_to_snake_case(&decision.decision)?;
+        let reason_codes = serde_json::to_string(&decision.reason_codes)
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+
+        conn.execute(
+            r#"
+            INSERT INTO autonomy_policy_decisions (
+                id, goal_id, plan_id, plan_step_id, execution_attempt_id, user_id, channel,
+                tool_name, tool_call_id, action_kind, decision, reason_codes, risk_score,
+                confidence, requires_approval, auto_approved, evidence_required, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            "#,
+            params![
+                decision.id.to_string(),
+                opt_text_owned(decision.goal_id.map(|id| id.to_string())),
+                opt_text_owned(decision.plan_id.map(|id| id.to_string())),
+                opt_text_owned(decision.plan_step_id.map(|id| id.to_string())),
+                opt_text_owned(decision.execution_attempt_id.map(|id| id.to_string())),
+                decision.user_id.as_str(),
+                decision.channel.as_str(),
+                opt_text(decision.tool_name.as_deref()),
+                opt_text(decision.tool_call_id.as_deref()),
+                decision.action_kind.as_str(),
+                decision_kind,
+                reason_codes,
+                decision.risk_score.map(|v| v as f64),
+                decision.confidence.map(|v| v as f64),
+                decision.requires_approval as i64,
+                decision.auto_approved.map(|v| if v { 1_i64 } else { 0_i64 }),
+                decision.evidence_required.to_string(),
+                fmt_ts(&decision.created_at),
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn list_execution_attempts_for_plan(
+        &self,
+        plan_id: Uuid,
+    ) -> Result<Vec<ExecutionAttempt>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    id, goal_id, plan_id, plan_step_id, job_id, thread_id, user_id, channel,
+                    tool_name, tool_call_id, tool_args, status, failure_class, retry_count,
+                    started_at, finished_at, elapsed_ms, result_summary, error_preview
+                FROM autonomy_execution_attempts
+                WHERE plan_id = ?1
+                ORDER BY started_at DESC, id DESC
+                "#,
+                params![plan_id.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut attempts = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            attempts.push(row_to_execution_attempt_libsql(&row)?);
+        }
+        Ok(attempts)
+    }
+
+    async fn list_policy_decisions_for_goal(
+        &self,
+        goal_id: Uuid,
+    ) -> Result<Vec<PolicyDecision>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    id, goal_id, plan_id, plan_step_id, execution_attempt_id, user_id, channel,
+                    tool_name, tool_call_id, action_kind, decision, reason_codes, risk_score,
+                    confidence, requires_approval, auto_approved, evidence_required, created_at
+                FROM autonomy_policy_decisions
+                WHERE goal_id = ?1
+                ORDER BY created_at DESC, id DESC
+                "#,
+                params![goal_id.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut decisions = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            decisions.push(row_to_policy_decision_libsql(&row)?);
+        }
+        Ok(decisions)
     }
 }
 
@@ -374,6 +989,118 @@ pub(crate) fn row_to_routine_run_libsql(row: &libsql::Row) -> Result<RoutineRun,
         tokens_used: row.get::<i64>(8).ok().map(|v| v as i32),
         job_id: get_opt_text(row, 9).and_then(|s| s.parse().ok()),
         created_at: get_ts(row, 10),
+    })
+}
+
+pub(crate) fn row_to_goal_libsql(row: &libsql::Row) -> Result<Goal, DatabaseError> {
+    Ok(Goal {
+        id: get_text(row, 0).parse().unwrap_or_default(),
+        owner_user_id: get_text(row, 1),
+        channel: get_opt_text(row, 2),
+        thread_id: get_opt_uuid(row, 3),
+        title: get_text(row, 4),
+        intent: get_text(row, 5),
+        priority: get_i64(row, 6) as i32,
+        status: enum_from_snake_case(&get_text(row, 7), "GoalStatus")?,
+        risk_class: enum_from_snake_case(&get_text(row, 8), "GoalRiskClass")?,
+        acceptance_criteria: get_json(row, 9),
+        constraints: get_json(row, 10),
+        source: enum_from_snake_case(&get_text(row, 11), "GoalSource")?,
+        created_at: get_ts(row, 12),
+        updated_at: get_ts(row, 13),
+        completed_at: get_opt_ts(row, 14),
+    })
+}
+
+pub(crate) fn row_to_plan_libsql(row: &libsql::Row) -> Result<Plan, DatabaseError> {
+    Ok(Plan {
+        id: get_text(row, 0).parse().unwrap_or_default(),
+        goal_id: get_text(row, 1).parse().unwrap_or_default(),
+        revision: get_i64(row, 2) as i32,
+        status: enum_from_snake_case(&get_text(row, 3), "PlanStatus")?,
+        planner_kind: enum_from_snake_case(&get_text(row, 4), "PlannerKind")?,
+        source_action_plan: get_opt_json(row, 5),
+        assumptions: get_json(row, 6),
+        confidence: get_opt_f64(row, 7).unwrap_or_default(),
+        estimated_cost: get_opt_f64(row, 8),
+        estimated_time_secs: row.get::<i64>(9).ok().filter(|v| *v >= 0).map(|v| v as u64),
+        summary: get_opt_text(row, 10),
+        created_at: get_ts(row, 11),
+        updated_at: get_ts(row, 12),
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn row_to_plan_step_libsql(row: &libsql::Row) -> Result<PlanStep, DatabaseError> {
+    Ok(PlanStep {
+        id: get_text(row, 0).parse().unwrap_or_default(),
+        plan_id: get_text(row, 1).parse().unwrap_or_default(),
+        sequence_num: get_i64(row, 2) as i32,
+        kind: enum_from_snake_case(&get_text(row, 3), "PlanStepKind")?,
+        status: enum_from_snake_case(&get_text(row, 4), "PlanStepStatus")?,
+        title: get_text(row, 5),
+        description: get_text(row, 6),
+        tool_candidates: get_json(row, 7),
+        inputs: get_json(row, 8),
+        preconditions: get_json(row, 9),
+        postconditions: get_json(row, 10),
+        rollback: get_opt_json(row, 11),
+        policy_requirements: get_json(row, 12),
+        started_at: get_opt_ts(row, 13),
+        completed_at: get_opt_ts(row, 14),
+        created_at: get_ts(row, 15),
+        updated_at: get_ts(row, 16),
+    })
+}
+
+pub(crate) fn row_to_execution_attempt_libsql(
+    row: &libsql::Row,
+) -> Result<ExecutionAttempt, DatabaseError> {
+    Ok(ExecutionAttempt {
+        id: get_text(row, 0).parse().unwrap_or_default(),
+        goal_id: get_opt_uuid(row, 1),
+        plan_id: get_opt_uuid(row, 2),
+        plan_step_id: get_opt_uuid(row, 3),
+        job_id: get_opt_uuid(row, 4),
+        thread_id: get_opt_uuid(row, 5),
+        user_id: get_text(row, 6),
+        channel: get_text(row, 7),
+        tool_name: get_text(row, 8),
+        tool_call_id: get_opt_text(row, 9),
+        tool_args: get_opt_json(row, 10),
+        status: enum_from_snake_case(&get_text(row, 11), "ExecutionAttemptStatus")?,
+        failure_class: get_opt_text(row, 12),
+        retry_count: get_i64(row, 13) as i32,
+        started_at: get_ts(row, 14),
+        finished_at: get_opt_ts(row, 15),
+        elapsed_ms: row.get::<i64>(16).ok(),
+        result_summary: get_opt_text(row, 17),
+        error_preview: get_opt_text(row, 18),
+    })
+}
+
+pub(crate) fn row_to_policy_decision_libsql(
+    row: &libsql::Row,
+) -> Result<PolicyDecision, DatabaseError> {
+    Ok(PolicyDecision {
+        id: get_text(row, 0).parse().unwrap_or_default(),
+        goal_id: get_opt_uuid(row, 1),
+        plan_id: get_opt_uuid(row, 2),
+        plan_step_id: get_opt_uuid(row, 3),
+        execution_attempt_id: get_opt_uuid(row, 4),
+        user_id: get_text(row, 5),
+        channel: get_text(row, 6),
+        tool_name: get_opt_text(row, 7),
+        tool_call_id: get_opt_text(row, 8),
+        action_kind: get_text(row, 9),
+        decision: enum_from_snake_case(&get_text(row, 10), "PolicyDecisionKind")?,
+        reason_codes: get_json_string_array(row, 11),
+        risk_score: get_opt_f32(row, 12),
+        confidence: get_opt_f32(row, 13),
+        requires_approval: get_i64(row, 14) != 0,
+        auto_approved: get_opt_bool(row, 15),
+        evidence_required: get_json(row, 16),
+        created_at: get_ts(row, 17),
     })
 }
 

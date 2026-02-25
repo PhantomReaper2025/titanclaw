@@ -59,6 +59,9 @@ When behavior changes, keep these docs aligned in the same branch:
 - Sandbox job completion signaling:
   - workers should terminate jobs through structured completion reports (`/worker/{job_id}/complete`) as the primary path
   - free-text completion phrase matching is fallback-only in worker loops (compatibility bridge)
+- Autonomy Control Plane v1 groundwork (internal persistence):
+  - versioned autonomy domain types and dual-backend (PostgreSQL/libSQL) autonomy tables exist for goals/plans/plan steps/execution attempts/policy decisions/incidents
+  - worker planned executions and dispatcher approval/tool-attempt paths now best-effort persist internal autonomy records (tracing emitters and approval UX remain unchanged)
 - Web gateway auth/render hardening:
   - SSE query-token auth accepts URL-encoded tokens
   - WebSocket Origin validation parses loopback hosts correctly (including IPv6)

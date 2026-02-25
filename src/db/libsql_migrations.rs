@@ -567,6 +567,167 @@ CREATE INDEX IF NOT EXISTS idx_routine_runs_status ON routine_runs(status);
 -- heartbeat_state
 CREATE INDEX IF NOT EXISTS idx_heartbeat_next_run ON heartbeat_state(next_run);
 
+-- ==================== Autonomy Control Plane v1 ====================
+
+CREATE TABLE IF NOT EXISTS autonomy_goals (
+    id TEXT PRIMARY KEY,
+    owner_user_id TEXT NOT NULL,
+    channel TEXT,
+    thread_id TEXT,
+    title TEXT NOT NULL,
+    intent TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    risk_class TEXT NOT NULL,
+    acceptance_criteria TEXT NOT NULL DEFAULT '{}',
+    constraints TEXT NOT NULL DEFAULT '{}',
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_autonomy_goals_owner_status
+    ON autonomy_goals(owner_user_id, status);
+CREATE INDEX IF NOT EXISTS idx_autonomy_goals_status_updated
+    ON autonomy_goals(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_autonomy_goals_thread
+    ON autonomy_goals(thread_id)
+    WHERE thread_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS autonomy_plans (
+    id TEXT PRIMARY KEY,
+    goal_id TEXT NOT NULL REFERENCES autonomy_goals(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    planner_kind TEXT NOT NULL,
+    source_action_plan TEXT,
+    assumptions TEXT NOT NULL DEFAULT '{}',
+    confidence REAL NOT NULL,
+    estimated_cost REAL,
+    estimated_time_secs INTEGER,
+    summary TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (goal_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_autonomy_plans_goal_status
+    ON autonomy_plans(goal_id, status);
+
+CREATE TABLE IF NOT EXISTS autonomy_plan_steps (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES autonomy_plans(id) ON DELETE CASCADE,
+    sequence_num INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    tool_candidates TEXT NOT NULL DEFAULT '[]',
+    inputs TEXT NOT NULL DEFAULT '{}',
+    preconditions TEXT NOT NULL DEFAULT '[]',
+    postconditions TEXT NOT NULL DEFAULT '[]',
+    "rollback" TEXT,
+    policy_requirements TEXT NOT NULL DEFAULT '{}',
+    started_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (plan_id, sequence_num)
+);
+
+CREATE INDEX IF NOT EXISTS idx_autonomy_plan_steps_plan_status
+    ON autonomy_plan_steps(plan_id, status);
+
+CREATE TABLE IF NOT EXISTS autonomy_execution_attempts (
+    id TEXT PRIMARY KEY,
+    goal_id TEXT REFERENCES autonomy_goals(id) ON DELETE SET NULL,
+    plan_id TEXT REFERENCES autonomy_plans(id) ON DELETE SET NULL,
+    plan_step_id TEXT REFERENCES autonomy_plan_steps(id) ON DELETE SET NULL,
+    job_id TEXT,
+    thread_id TEXT,
+    user_id TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    tool_call_id TEXT,
+    tool_args TEXT,
+    status TEXT NOT NULL,
+    failure_class TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at TEXT,
+    elapsed_ms INTEGER,
+    result_summary TEXT,
+    error_preview TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_autonomy_execution_attempts_step_started
+    ON autonomy_execution_attempts(plan_step_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_autonomy_execution_attempts_goal_started
+    ON autonomy_execution_attempts(goal_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_autonomy_execution_attempts_tool_status_started
+    ON autonomy_execution_attempts(tool_name, status, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS autonomy_policy_decisions (
+    id TEXT PRIMARY KEY,
+    goal_id TEXT REFERENCES autonomy_goals(id) ON DELETE SET NULL,
+    plan_id TEXT REFERENCES autonomy_plans(id) ON DELETE SET NULL,
+    plan_step_id TEXT REFERENCES autonomy_plan_steps(id) ON DELETE SET NULL,
+    execution_attempt_id TEXT REFERENCES autonomy_execution_attempts(id) ON DELETE SET NULL,
+    user_id TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    tool_name TEXT,
+    tool_call_id TEXT,
+    action_kind TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    reason_codes TEXT NOT NULL DEFAULT '[]',
+    risk_score REAL,
+    confidence REAL,
+    requires_approval INTEGER NOT NULL DEFAULT 0,
+    auto_approved INTEGER,
+    evidence_required TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_autonomy_policy_decisions_goal_created
+    ON autonomy_policy_decisions(goal_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_autonomy_policy_decisions_execution_attempt
+    ON autonomy_policy_decisions(execution_attempt_id);
+CREATE INDEX IF NOT EXISTS idx_autonomy_policy_decisions_decision_created
+    ON autonomy_policy_decisions(decision, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS autonomy_incidents (
+    id TEXT PRIMARY KEY,
+    goal_id TEXT REFERENCES autonomy_goals(id) ON DELETE SET NULL,
+    plan_id TEXT REFERENCES autonomy_plans(id) ON DELETE SET NULL,
+    plan_step_id TEXT REFERENCES autonomy_plan_steps(id) ON DELETE SET NULL,
+    execution_attempt_id TEXT REFERENCES autonomy_execution_attempts(id) ON DELETE SET NULL,
+    policy_decision_id TEXT REFERENCES autonomy_policy_decisions(id) ON DELETE SET NULL,
+    job_id TEXT,
+    thread_id TEXT,
+    user_id TEXT NOT NULL,
+    channel TEXT,
+    incident_type TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    summary TEXT NOT NULL,
+    details TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    resolved_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_autonomy_incidents_goal_created
+    ON autonomy_incidents(goal_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_autonomy_incidents_execution_attempt
+    ON autonomy_incidents(execution_attempt_id);
+CREATE INDEX IF NOT EXISTS idx_autonomy_incidents_policy_decision
+    ON autonomy_incidents(policy_decision_id);
+CREATE INDEX IF NOT EXISTS idx_autonomy_incidents_status_created
+    ON autonomy_incidents(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_autonomy_incidents_type_severity_created
+    ON autonomy_incidents(incident_type, severity, created_at DESC);
+
 -- ==================== Seed data ====================
 
 -- Pre-populate leak detection patterns (matches PostgreSQL V2 migration).

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Autonomy Control Plane v1 persistence groundwork: versioned autonomy domain types, Postgres/libSQL goal/plan/plan-step/execution/policy/incident schema (`V11`-`V16` + libSQL mirror), and backend store CRUD implementations for the new autonomy tables.
+
+### Changed
+
+- Worker planning and chat tool dispatch now best-effort persist internal autonomy records: worker-generated `ActionPlan`s create/update `Goal`/`Plan`/`PlanStep` records during planned execution, and dispatcher approval/tool-attempt telemetry is additionally mirrored into DB-backed autonomy policy/execution tables without changing the existing approval UX or tracing emitters.
+
 ## [1.0.2] - 2026-02-23
 
 ### Fixed

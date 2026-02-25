@@ -19,6 +19,7 @@
 - Runtime defaults are configured during onboarding and persisted as:
   - `CODING_RUNTIME_DEFAULT`
   - `OPENCODE_MODEL_DEFAULT`
+- Internal autonomy control-plane v1 persistence is now scaffolded across both PostgreSQL and libSQL backends (goals/plans/plan steps/execution attempts/policy decisions/incidents), with worker/dispatcher runtime paths best-effort writing records for planned worker runs and chat tool policy/execution events.
 
 ## UX and Operations Identity
 

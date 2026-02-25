@@ -6,16 +6,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::Utc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::agent::Agent;
 use crate::agent::autonomy_telemetry::{
-    ExecutionAttemptRecord, ExecutionAttemptStatus, PolicyDecisionKind, PolicyDecisionRecord,
-    classify_failure, elapsed_ms, emit_execution_attempt, emit_policy_decision,
-    truncate_error_preview,
+    ExecutionAttemptRecord, ExecutionAttemptStatus as TelemetryExecutionAttemptStatus,
+    PolicyDecisionKind as TelemetryPolicyDecisionKind, PolicyDecisionRecord, classify_failure,
+    elapsed_ms, emit_execution_attempt, emit_policy_decision, truncate_error_preview,
 };
 use crate::agent::session::{PendingApproval, Session, ThreadState};
+use crate::agent::{
+    Agent, ExecutionAttempt as AutonomyExecutionAttempt,
+    ExecutionAttemptStatus as AutonomyExecutionAttemptStatus,
+    PolicyDecision as AutonomyPolicyDecision, PolicyDecisionKind as AutonomyPolicyDecisionKind,
+};
 use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
@@ -80,6 +85,118 @@ fn truncate_preview_chars(s: &str, max_chars: usize) -> String {
         let truncated = s.chars().take(max_chars).collect::<String>();
         format!("{}…", truncated)
     }
+}
+
+fn map_policy_decision_kind(kind: TelemetryPolicyDecisionKind) -> AutonomyPolicyDecisionKind {
+    match kind {
+        TelemetryPolicyDecisionKind::Allow => AutonomyPolicyDecisionKind::Allow,
+        TelemetryPolicyDecisionKind::RequireApproval => AutonomyPolicyDecisionKind::RequireApproval,
+        TelemetryPolicyDecisionKind::Deny => AutonomyPolicyDecisionKind::Deny,
+        TelemetryPolicyDecisionKind::Modify => AutonomyPolicyDecisionKind::Modify,
+    }
+}
+
+fn map_execution_attempt_status(
+    status: TelemetryExecutionAttemptStatus,
+) -> AutonomyExecutionAttemptStatus {
+    match status {
+        TelemetryExecutionAttemptStatus::Succeeded => AutonomyExecutionAttemptStatus::Succeeded,
+        TelemetryExecutionAttemptStatus::Failed => AutonomyExecutionAttemptStatus::Failed,
+    }
+}
+
+fn failure_class_to_string(
+    failure_class: Option<crate::agent::autonomy_telemetry::FailureClass>,
+) -> Option<String> {
+    failure_class.and_then(|fc| {
+        serde_json::to_value(fc)
+            .ok()
+            .and_then(|v| v.as_str().map(ToString::to_string))
+    })
+}
+
+fn persist_policy_decision_best_effort(
+    agent: &Agent,
+    message: &IncomingMessage,
+    tool_name: &str,
+    tool_call_id: &str,
+    decision: TelemetryPolicyDecisionKind,
+    reason_codes: Vec<String>,
+    auto_approved: Option<bool>,
+) {
+    let Some(store) = agent.store().cloned() else {
+        return;
+    };
+    let record = AutonomyPolicyDecision {
+        id: Uuid::new_v4(),
+        goal_id: None,
+        plan_id: None,
+        plan_step_id: None,
+        execution_attempt_id: None,
+        user_id: message.user_id.clone(),
+        channel: message.channel.clone(),
+        tool_name: Some(tool_name.to_string()),
+        tool_call_id: Some(tool_call_id.to_string()),
+        action_kind: "tool_call".to_string(),
+        decision: map_policy_decision_kind(decision),
+        reason_codes,
+        risk_score: None,
+        confidence: None,
+        requires_approval: matches!(decision, TelemetryPolicyDecisionKind::RequireApproval),
+        auto_approved,
+        evidence_required: serde_json::json!({}),
+        created_at: Utc::now(),
+    };
+    tokio::spawn(async move {
+        if let Err(e) = store.record_policy_decision(&record).await {
+            tracing::warn!("Failed to persist autonomy policy decision: {}", e);
+        }
+    });
+}
+
+fn persist_execution_attempt_best_effort(
+    agent: &Agent,
+    message: &IncomingMessage,
+    thread_id: Uuid,
+    job_ctx: &JobContext,
+    tool_name: &str,
+    tool_call_id: &str,
+    tool_args: &serde_json::Value,
+    attempt_status: TelemetryExecutionAttemptStatus,
+    failure_class: Option<crate::agent::autonomy_telemetry::FailureClass>,
+    error_preview: Option<String>,
+    started_at: chrono::DateTime<Utc>,
+    elapsed_ms_value: u64,
+) {
+    let Some(store) = agent.store().cloned() else {
+        return;
+    };
+    let record = AutonomyExecutionAttempt {
+        id: Uuid::new_v4(),
+        goal_id: None,
+        plan_id: None,
+        plan_step_id: None,
+        job_id: Some(job_ctx.job_id),
+        thread_id: Some(thread_id),
+        user_id: message.user_id.clone(),
+        channel: message.channel.clone(),
+        tool_name: tool_name.to_string(),
+        tool_call_id: Some(tool_call_id.to_string()),
+        tool_args: Some(tool_args.clone()),
+        status: map_execution_attempt_status(attempt_status),
+        failure_class: failure_class_to_string(failure_class),
+        retry_count: 0,
+        started_at,
+        finished_at: Some(Utc::now()),
+        elapsed_ms: Some(elapsed_ms_value as i64),
+        result_summary: None,
+        error_preview,
+    };
+    tokio::spawn(async move {
+        if let Err(e) = store.record_execution_attempt(&record).await {
+            tracing::warn!("Failed to persist autonomy execution attempt: {}", e);
+        }
+    });
 }
 
 fn shell_preview_from_args(args_value: &serde_json::Value) -> Option<String> {
@@ -765,16 +882,26 @@ impl Agent {
                             }
 
                             if !is_auto_approved {
+                                let approval_reason_codes_for_db = approval_reason_codes.clone();
                                 emit_policy_decision(&PolicyDecisionRecord {
                                     user_id: message.user_id.clone(),
                                     channel: message.channel.clone(),
                                     thread_id,
                                     tool_name: tc.name.clone(),
                                     tool_call_id: tc.id.clone(),
-                                    decision: PolicyDecisionKind::RequireApproval,
+                                    decision: TelemetryPolicyDecisionKind::RequireApproval,
                                     reason_codes: approval_reason_codes,
                                     auto_approved: Some(false),
                                 });
+                                persist_policy_decision_best_effort(
+                                    self,
+                                    message,
+                                    &tc.name,
+                                    &tc.id,
+                                    TelemetryPolicyDecisionKind::RequireApproval,
+                                    approval_reason_codes_for_db,
+                                    Some(false),
+                                );
                                 // Need approval - store pending request and return
                                 let pending = PendingApproval {
                                     request_id: Uuid::new_v4(),
@@ -794,10 +921,19 @@ impl Agent {
                                 thread_id,
                                 tool_name: tc.name.clone(),
                                 tool_call_id: tc.id.clone(),
-                                decision: PolicyDecisionKind::Allow,
+                                decision: TelemetryPolicyDecisionKind::Allow,
                                 reason_codes: vec!["session_auto_approval".to_string()],
                                 auto_approved: Some(true),
                             });
+                            persist_policy_decision_best_effort(
+                                self,
+                                message,
+                                &tc.name,
+                                &tc.id,
+                                TelemetryPolicyDecisionKind::Allow,
+                                vec!["session_auto_approval".to_string()],
+                                Some(true),
+                            );
                         }
 
                         // Hook: BeforeToolCall — allow hooks to modify or reject tool calls
@@ -816,10 +952,19 @@ impl Agent {
                                         thread_id,
                                         tool_name: tc.name.clone(),
                                         tool_call_id: tc.id.clone(),
-                                        decision: PolicyDecisionKind::Deny,
+                                        decision: TelemetryPolicyDecisionKind::Deny,
                                         reason_codes: vec!["hook_rejected".to_string()],
                                         auto_approved: None,
                                     });
+                                    persist_policy_decision_best_effort(
+                                        self,
+                                        message,
+                                        &tc.name,
+                                        &tc.id,
+                                        TelemetryPolicyDecisionKind::Deny,
+                                        vec!["hook_rejected".to_string()],
+                                        None,
+                                    );
                                     context_messages.push(ChatMessage::tool_result(
                                         &tc.id,
                                         &tc.name,
@@ -834,10 +979,19 @@ impl Agent {
                                         thread_id,
                                         tool_name: tc.name.clone(),
                                         tool_call_id: tc.id.clone(),
-                                        decision: PolicyDecisionKind::Deny,
+                                        decision: TelemetryPolicyDecisionKind::Deny,
                                         reason_codes: vec!["hook_policy_error".to_string()],
                                         auto_approved: None,
                                     });
+                                    persist_policy_decision_best_effort(
+                                        self,
+                                        message,
+                                        &tc.name,
+                                        &tc.id,
+                                        TelemetryPolicyDecisionKind::Deny,
+                                        vec!["hook_policy_error".to_string()],
+                                        None,
+                                    );
                                     context_messages.push(ChatMessage::tool_result(
                                         &tc.id,
                                         &tc.name,
@@ -855,12 +1009,21 @@ impl Agent {
                                             thread_id,
                                             tool_name: tc.name.clone(),
                                             tool_call_id: tc.id.clone(),
-                                            decision: PolicyDecisionKind::Modify,
+                                            decision: TelemetryPolicyDecisionKind::Modify,
                                             reason_codes: vec![
                                                 "hook_modified_parameters".to_string(),
                                             ],
                                             auto_approved: None,
                                         });
+                                        persist_policy_decision_best_effort(
+                                            self,
+                                            message,
+                                            &tc.name,
+                                            &tc.id,
+                                            TelemetryPolicyDecisionKind::Modify,
+                                            vec!["hook_modified_parameters".to_string()],
+                                            None,
+                                        );
                                         tc.arguments = parsed;
                                     }
                                     Err(e) => {
@@ -887,6 +1050,7 @@ impl Agent {
                             .await;
 
                         let live_stream = tc.name == "shell";
+                        let tool_attempt_started_at = Utc::now();
                         let tool_attempt_started = std::time::Instant::now();
                         let mut piped_cache_hit = false;
                         let tool_result = if live_stream
@@ -928,13 +1092,14 @@ impl Agent {
 
                         let tool_attempt_elapsed = tool_attempt_started.elapsed();
                         let (attempt_status, failure_class, error_preview) = match &tool_result {
-                            Ok(_) => (ExecutionAttemptStatus::Succeeded, None, None),
+                            Ok(_) => (TelemetryExecutionAttemptStatus::Succeeded, None, None),
                             Err(err) => (
-                                ExecutionAttemptStatus::Failed,
+                                TelemetryExecutionAttemptStatus::Failed,
                                 Some(classify_failure(err)),
                                 Some(truncate_error_preview(err)),
                             ),
                         };
+                        let error_preview_for_log = error_preview.clone();
                         emit_execution_attempt(&ExecutionAttemptRecord {
                             user_id: message.user_id.clone(),
                             channel: message.channel.clone(),
@@ -946,8 +1111,22 @@ impl Agent {
                             elapsed_ms: elapsed_ms(tool_attempt_elapsed),
                             status: attempt_status,
                             failure_class,
-                            error_preview,
+                            error_preview: error_preview_for_log,
                         });
+                        persist_execution_attempt_best_effort(
+                            self,
+                            message,
+                            thread_id,
+                            &job_ctx,
+                            &tc.name,
+                            &tc.id,
+                            &tc.arguments,
+                            attempt_status,
+                            failure_class,
+                            error_preview.clone(),
+                            tool_attempt_started_at,
+                            elapsed_ms(tool_attempt_elapsed),
+                        );
 
                         if !live_stream && let Ok(ref output) = tool_result {
                             for preview in chunk_tool_result_preview(output) {

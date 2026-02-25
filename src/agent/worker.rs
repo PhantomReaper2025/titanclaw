@@ -3,12 +3,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use futures::future::join_all;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::agent::scheduler::WorkerMessage;
 use crate::agent::task::TaskOutput;
+use crate::agent::{
+    ExecutionAttempt as AutonomyExecutionAttempt,
+    ExecutionAttemptStatus as AutonomyExecutionAttemptStatus, Goal, GoalRiskClass, GoalSource,
+    GoalStatus, Plan, PlanStatus, PlanStep, PlanStepKind, PlanStepStatus, PlannerKind,
+};
 use crate::context::{ContextManager, JobState};
 use crate::db::Database;
 use crate::error::Error;
@@ -46,6 +52,12 @@ struct ToolExecResult {
     result: Result<String, Error>,
 }
 
+struct PersistedPlanRun {
+    goal_id: Uuid,
+    plan_id: Uuid,
+    step_ids: Vec<Uuid>,
+}
+
 impl Worker {
     /// Create a new worker for a specific job.
     pub fn new(job_id: Uuid, deps: WorkerDeps) -> Self {
@@ -79,6 +91,223 @@ impl Worker {
 
     fn use_planning(&self) -> bool {
         self.deps.use_planning
+    }
+
+    async fn persist_action_plan(
+        &self,
+        job_ctx: &crate::context::JobContext,
+        plan: &ActionPlan,
+    ) -> Option<PersistedPlanRun> {
+        let store = self.store()?.clone();
+        let now = Utc::now();
+        let goal_id = Uuid::new_v4();
+        let plan_id = Uuid::new_v4();
+
+        let goal = Goal {
+            id: goal_id,
+            owner_user_id: job_ctx.user_id.clone(),
+            channel: None,
+            thread_id: None,
+            title: job_ctx.title.clone(),
+            intent: plan.goal.clone(),
+            priority: 0,
+            status: GoalStatus::Active,
+            risk_class: GoalRiskClass::Medium,
+            acceptance_criteria: serde_json::json!({}),
+            constraints: serde_json::json!({}),
+            source: GoalSource::UserRequest,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        if let Err(e) = store.create_goal(&goal).await {
+            tracing::warn!(
+                job = %self.job_id,
+                "Failed to persist autonomy goal scaffold: {}",
+                e
+            );
+            return None;
+        }
+
+        let db_plan = Plan {
+            id: plan_id,
+            goal_id,
+            revision: 1,
+            status: PlanStatus::Ready,
+            planner_kind: PlannerKind::ReasoningV1,
+            source_action_plan: serde_json::to_value(plan).ok(),
+            assumptions: serde_json::json!({}),
+            confidence: plan.confidence,
+            estimated_cost: plan.estimated_cost,
+            estimated_time_secs: plan.estimated_time_secs,
+            summary: Some(plan.goal.clone()),
+            created_at: now,
+            updated_at: now,
+        };
+        if let Err(e) = store.create_plan(&db_plan).await {
+            tracing::warn!(
+                job = %self.job_id,
+                goal_id = %goal_id,
+                "Failed to persist autonomy plan scaffold: {}",
+                e
+            );
+            return None;
+        }
+
+        let mut step_ids = Vec::with_capacity(plan.actions.len());
+        let steps: Vec<PlanStep> = plan
+            .actions
+            .iter()
+            .enumerate()
+            .map(|(i, action)| {
+                let step_id = Uuid::new_v4();
+                step_ids.push(step_id);
+                PlanStep {
+                    id: step_id,
+                    plan_id,
+                    sequence_num: i as i32,
+                    kind: PlanStepKind::ToolCall,
+                    status: PlanStepStatus::Pending,
+                    title: action.tool_name.clone(),
+                    description: action.reasoning.clone(),
+                    tool_candidates: serde_json::json!([
+                        {
+                            "tool_name": action.tool_name,
+                        }
+                    ]),
+                    inputs: action.parameters.clone(),
+                    preconditions: serde_json::json!([]),
+                    postconditions: serde_json::json!([]),
+                    rollback: None,
+                    policy_requirements: serde_json::json!({}),
+                    started_at: None,
+                    completed_at: None,
+                    created_at: now,
+                    updated_at: now,
+                }
+            })
+            .collect();
+
+        if let Err(e) = store.create_plan_steps(&steps).await {
+            tracing::warn!(
+                job = %self.job_id,
+                plan_id = %plan_id,
+                "Failed to persist autonomy plan steps scaffold: {}",
+                e
+            );
+            return None;
+        }
+
+        Some(PersistedPlanRun {
+            goal_id,
+            plan_id,
+            step_ids,
+        })
+    }
+
+    async fn set_plan_status_best_effort(&self, plan_id: Uuid, status: PlanStatus) {
+        let Some(store) = self.store() else {
+            return;
+        };
+        if let Err(e) = store.update_plan_status(plan_id, status).await {
+            tracing::warn!(plan_id = %plan_id, "Failed to update plan status: {}", e);
+        }
+    }
+
+    async fn set_goal_status_best_effort(&self, goal_id: Uuid, status: GoalStatus) {
+        let Some(store) = self.store() else {
+            return;
+        };
+        if let Err(e) = store.update_goal_status(goal_id, status).await {
+            tracing::warn!(goal_id = %goal_id, "Failed to update goal status: {}", e);
+        }
+    }
+
+    async fn set_plan_step_status_best_effort(&self, step_id: Uuid, status: PlanStepStatus) {
+        let Some(store) = self.store() else {
+            return;
+        };
+        if let Err(e) = store.update_plan_step_status(step_id, status).await {
+            tracing::warn!(step_id = %step_id, "Failed to update plan step status: {}", e);
+        }
+    }
+
+    async fn record_worker_execution_attempt_best_effort(
+        &self,
+        persisted: &PersistedPlanRun,
+        step_index: usize,
+        tool_name: &str,
+        tool_args: &serde_json::Value,
+        tool_call_id: &str,
+        started_at: chrono::DateTime<Utc>,
+        result: &Result<String, Error>,
+        elapsed_ms: i64,
+        retry_count: i32,
+    ) {
+        let Some(store) = self.store() else {
+            return;
+        };
+        let step_id = match persisted.step_ids.get(step_index) {
+            Some(id) => *id,
+            None => return,
+        };
+        let now = Utc::now();
+        let (status, failure_class, error_preview) = match result {
+            Ok(_) => (AutonomyExecutionAttemptStatus::Succeeded, None, None),
+            Err(err) => {
+                let fc = crate::agent::autonomy_telemetry::classify_failure(err);
+                let fc_str = serde_json::to_value(fc)
+                    .ok()
+                    .and_then(|v| v.as_str().map(ToString::to_string));
+                (
+                    match fc {
+                        crate::agent::autonomy_telemetry::FailureClass::ToolTimeout => {
+                            AutonomyExecutionAttemptStatus::Timeout
+                        }
+                        _ => AutonomyExecutionAttemptStatus::Failed,
+                    },
+                    fc_str,
+                    Some(err.to_string().chars().take(400).collect::<String>()),
+                )
+            }
+        };
+
+        let attempt = AutonomyExecutionAttempt {
+            id: Uuid::new_v4(),
+            goal_id: Some(persisted.goal_id),
+            plan_id: Some(persisted.plan_id),
+            plan_step_id: Some(step_id),
+            job_id: Some(self.job_id),
+            thread_id: None,
+            user_id: self
+                .context_manager()
+                .get_context(self.job_id)
+                .await
+                .map(|c| c.user_id)
+                .unwrap_or_else(|_| "default".to_string()),
+            channel: "worker".to_string(),
+            tool_name: tool_name.to_string(),
+            tool_call_id: Some(tool_call_id.to_string()),
+            tool_args: Some(tool_args.clone()),
+            status,
+            failure_class,
+            retry_count,
+            started_at,
+            finished_at: Some(now),
+            elapsed_ms: Some(elapsed_ms),
+            result_summary: None,
+            error_preview,
+        };
+
+        if let Err(e) = store.record_execution_attempt(&attempt).await {
+            tracing::warn!(
+                job = %self.job_id,
+                plan_id = %persisted.plan_id,
+                step_id = %step_id,
+                "Failed to persist worker execution attempt: {}",
+                e
+            );
+        }
     }
 
     /// Fire-and-forget persistence of job status.
@@ -192,7 +421,31 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                             .join("\n")
                     )));
 
-                    Some(p)
+                    // Best-effort persistence of the generated plan into the new
+                    // autonomy control-plane tables. Worker execution continues
+                    // even if persistence fails.
+                    let job_ctx = match self.context_manager().get_context(self.job_id).await {
+                        Ok(ctx) => Some(ctx),
+                        Err(e) => {
+                            tracing::warn!(
+                                job = %self.job_id,
+                                "Failed to load job context for autonomy persistence: {}",
+                                e
+                            );
+                            None
+                        }
+                    };
+                    let persisted_plan = if let Some(ref job_ctx) = job_ctx {
+                        self.persist_action_plan(job_ctx, &p).await
+                    } else {
+                        None
+                    };
+                    if let Some(ref persisted) = persisted_plan {
+                        self.set_plan_status_best_effort(persisted.plan_id, PlanStatus::Running)
+                            .await;
+                    }
+
+                    Some((p, persisted_plan))
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -208,8 +461,10 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         };
 
         // If we have a plan, execute it
-        if let Some(ref plan) = plan {
-            return self.execute_plan(rx, reasoning, reason_ctx, plan).await;
+        if let Some((ref plan, ref persisted_plan)) = plan {
+            return self
+                .execute_plan(rx, reasoning, reason_ctx, plan, persisted_plan.as_ref())
+                .await;
         }
 
         // Otherwise, use direct tool selection loop
@@ -643,6 +898,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         reasoning: &Reasoning,
         reason_ctx: &mut ReasoningContext,
         plan: &ActionPlan,
+        persisted_plan: Option<&PersistedPlanRun>,
     ) -> Result<(), Error> {
         for (i, action) in plan.actions.iter().enumerate() {
             // Check for stop signal
@@ -671,10 +927,20 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 action.reasoning
             );
 
+            if let Some(p) = persisted_plan
+                && let Some(step_id) = p.step_ids.get(i)
+            {
+                self.set_plan_step_status_best_effort(*step_id, PlanStepStatus::Running)
+                    .await;
+            }
+
             // Execute the planned tool
+            let started_at = Utc::now();
+            let started = std::time::Instant::now();
             let result = self
                 .execute_tool(&action.tool_name, &action.parameters)
                 .await;
+            let elapsed_ms = started.elapsed().as_millis() as i64;
 
             // Create a synthetic ToolSelection for process_tool_result.
             // Plan actions don't originate from an LLM tool_call response so
@@ -686,6 +952,33 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 alternatives: vec![],
                 tool_call_id: format!("plan_{}_{}", self.job_id, i),
             };
+
+            if let Some(p) = persisted_plan {
+                self.record_worker_execution_attempt_best_effort(
+                    p,
+                    i,
+                    &action.tool_name,
+                    &action.parameters,
+                    &selection.tool_call_id,
+                    started_at,
+                    &result,
+                    elapsed_ms,
+                    0,
+                )
+                .await;
+            }
+
+            if let Some(p) = persisted_plan
+                && let Some(step_id) = p.step_ids.get(i)
+            {
+                let status = if result.is_ok() {
+                    PlanStepStatus::Succeeded
+                } else {
+                    PlanStepStatus::Failed
+                };
+                self.set_plan_step_status_best_effort(*step_id, status)
+                    .await;
+            }
 
             // Process the result
             let completed = self
@@ -710,6 +1003,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
         if crate::util::llm_signals_completion(&response) {
             self.mark_completed().await?;
+            if let Some(p) = persisted_plan {
+                self.set_plan_status_best_effort(p.plan_id, PlanStatus::Completed)
+                    .await;
+                self.set_goal_status_best_effort(p.goal_id, GoalStatus::Completed)
+                    .await;
+            }
         } else {
             // Job not complete, could re-plan or fall back to direct selection
             tracing::info!(
@@ -719,6 +1018,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             // Continue with standard execution loop by returning (will be picked up by main loop)
             self.mark_stuck("Plan completed but job incomplete - needs re-planning")
                 .await?;
+            if let Some(p) = persisted_plan {
+                self.set_plan_status_best_effort(p.plan_id, PlanStatus::Failed)
+                    .await;
+                self.set_goal_status_best_effort(p.goal_id, GoalStatus::Blocked)
+                    .await;
+            }
         }
 
         Ok(())
