@@ -9,7 +9,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::agent::{Plan, PlanStatus, PlanStep, PlanStepKind, PlanStepStatus, PlannerKind};
+use crate::agent::{
+    Plan, PlanStatus, PlanStep, PlanStepKind, PlanStepStatus, PlanVerification, PlannerKind,
+};
 const DEFAULT_USER_ID: &str = "default";
 
 #[derive(Subcommand, Debug, Clone)]
@@ -80,6 +82,20 @@ pub enum PlanCommand {
         /// Owner user ID (used to validate goal ownership)
         #[arg(long, default_value = DEFAULT_USER_ID)]
         user_id: String,
+    },
+
+    /// List persisted verification outcomes for a plan
+    Verifications {
+        /// Plan ID
+        id: Uuid,
+
+        /// Owner user ID (used to validate goal ownership)
+        #[arg(long, default_value = DEFAULT_USER_ID)]
+        user_id: String,
+
+        /// Max number of verification records to print (newest first)
+        #[arg(long)]
+        limit: Option<usize>,
     },
 
     /// Update plan status
@@ -221,6 +237,9 @@ pub async fn run_plan_command(cmd: PlanCommand) -> anyhow::Result<()> {
             .await
         }
         PlanCommand::Show { id, user_id } => show_plan(db.as_ref(), id, &user_id).await,
+        PlanCommand::Verifications { id, user_id, limit } => {
+            list_plan_verifications(db.as_ref(), id, &user_id, limit).await
+        }
         PlanCommand::SetStatus {
             id,
             status,
@@ -470,6 +489,57 @@ async fn show_plan(
     }
 
     println!("{}", serde_json::to_string_pretty(&plan)?);
+    Ok(())
+}
+
+async fn list_plan_verifications(
+    db: &dyn crate::db::Database,
+    plan_id: Uuid,
+    user_id: &str,
+    limit: Option<usize>,
+) -> anyhow::Result<()> {
+    if let Some(limit) = limit
+        && limit == 0
+    {
+        anyhow::bail!("limit must be >= 1");
+    }
+
+    let plan = db
+        .get_plan(plan_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to load plan {}", plan_id))?
+        .ok_or_else(|| anyhow::anyhow!("plan not found: {}", plan_id))?;
+
+    let goal = db
+        .get_goal(plan.goal_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to load goal {}", plan.goal_id))?
+        .ok_or_else(|| anyhow::anyhow!("goal {} for plan {} not found", plan.goal_id, plan.id))?;
+    if goal.owner_user_id != user_id {
+        anyhow::bail!("plan {} not found for user {}", plan_id, user_id);
+    }
+
+    let mut verifications: Vec<PlanVerification> = db
+        .list_plan_verifications_for_plan(plan_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to list verifications for plan {}", plan_id))?;
+    verifications.sort_by_key(|v| (v.created_at, v.id));
+    verifications.reverse();
+
+    if let Some(limit) = limit {
+        verifications.truncate(limit);
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "plan_id": plan_id,
+            "plan_verifications": verifications
+        }))?
+    );
     Ok(())
 }
 
@@ -894,7 +964,14 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use serde_json::json;
+
+    #[derive(Parser)]
+    struct TestPlanCli {
+        #[command(subcommand)]
+        cmd: PlanCommand,
+    }
 
     #[test]
     fn test_parse_replan_steps_payload_accepts_wrapper_and_array() {
@@ -992,5 +1069,29 @@ mod tests {
 
         let err = build_replan_steps_from_inputs(plan_id, inputs).unwrap_err();
         assert!(err.to_string().contains("duplicate sequence_num"));
+    }
+
+    #[test]
+    fn test_parse_plan_verifications_subcommand() {
+        let plan_id = Uuid::new_v4();
+        let cli = TestPlanCli::try_parse_from([
+            "titanclaw",
+            "verifications",
+            &plan_id.to_string(),
+            "--user-id",
+            "alice",
+            "--limit",
+            "5",
+        ])
+        .expect("parse plan verifications command");
+
+        match cli.cmd {
+            PlanCommand::Verifications { id, user_id, limit } => {
+                assert_eq!(id, plan_id);
+                assert_eq!(user_id, "alice");
+                assert_eq!(limit, Some(5));
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
     }
 }

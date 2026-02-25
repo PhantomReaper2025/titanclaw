@@ -333,6 +333,7 @@ impl Worker {
     async fn record_plan_verification_best_effort(
         &self,
         persisted: &PersistedPlanRun,
+        verifier_kind: &str,
         status: AutonomyPlanVerificationStatus,
         completion_claimed: bool,
         summary: &str,
@@ -359,7 +360,7 @@ impl Worker {
             job_id: Some(self.job_id),
             user_id,
             channel: "worker".to_string(),
-            verifier_kind: "execute_plan_completion_check".to_string(),
+            verifier_kind: verifier_kind.to_string(),
             status,
             completion_claimed,
             evidence_count,
@@ -972,6 +973,8 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         let mut executed_steps = 0usize;
         let mut succeeded_steps = 0usize;
         let mut failed_steps = 0usize;
+        let mut step_outcomes = Vec::<serde_json::Value>::with_capacity(plan.actions.len());
+        let mut step_evidence = Vec::<AutonomyEvidence>::with_capacity(plan.actions.len());
         for (i, action) in plan.actions.iter().enumerate() {
             // Check for stop signal
             if let Ok(msg) = rx.try_recv() {
@@ -1026,6 +1029,69 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             } else {
                 failed_steps += 1;
             }
+            let (failure_class, error_preview, result_preview) = match &result {
+                Ok(output) => (
+                    None,
+                    None,
+                    Some(output.chars().take(400).collect::<String>()),
+                ),
+                Err(err) => {
+                    let fc = crate::agent::autonomy_telemetry::classify_failure(err);
+                    let fc_str = serde_json::to_value(fc)
+                        .ok()
+                        .and_then(|v| v.as_str().map(ToString::to_string));
+                    (
+                        fc_str,
+                        Some(err.to_string().chars().take(400).collect::<String>()),
+                        None,
+                    )
+                }
+            };
+            let tool_name_lower = action.tool_name.to_ascii_lowercase();
+            let evidence_kind = if tool_name_lower.contains("test")
+                || tool_name_lower.contains("lint")
+                || tool_name_lower.contains("check")
+            {
+                AutonomyEvidenceKind::TestRun
+            } else if tool_name_lower.contains("shell")
+                || tool_name_lower.contains("command")
+                || tool_name_lower.contains("exec")
+            {
+                AutonomyEvidenceKind::CommandOutput
+            } else {
+                AutonomyEvidenceKind::ToolResult
+            };
+            let step_payload = serde_json::json!({
+                "sequence_index": i,
+                "tool_name": action.tool_name,
+                "reasoning": action.reasoning,
+                "elapsed_ms": elapsed_ms,
+                "status": if step_succeeded { "succeeded" } else { "failed" },
+                "failure_class": failure_class,
+                "result_preview": result_preview,
+                "error_preview": error_preview,
+            });
+            step_outcomes.push(step_payload.clone());
+            step_evidence.push(AutonomyEvidence {
+                kind: evidence_kind,
+                source: format!("worker.plan_step.{}", i),
+                summary: format!(
+                    "{} {} ({})",
+                    if step_succeeded {
+                        "Succeeded"
+                    } else {
+                        "Failed"
+                    },
+                    action.tool_name,
+                    action.reasoning
+                )
+                .chars()
+                .take(240)
+                .collect(),
+                confidence: if step_succeeded { 0.95 } else { 0.8 },
+                payload: step_payload,
+                created_at: started_at,
+            });
 
             // Create a synthetic ToolSelection for process_tool_result.
             // Plan actions don't originate from an LLM tool_call response so
@@ -1077,6 +1143,38 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 .await?;
 
             if completed {
+                if let Some(p) = persisted_plan {
+                    let checks = serde_json::json!({
+                        "completion_path": "early_process_tool_result",
+                        "planned_steps": plan.actions.len(),
+                        "executed_steps": executed_steps,
+                        "succeeded_steps": succeeded_steps,
+                        "failed_steps": failed_steps,
+                        "all_planned_steps_executed": executed_steps == plan.actions.len(),
+                        "step_outcomes": step_outcomes,
+                    });
+                    let mut evidence = step_evidence.clone();
+                    evidence.push(AutonomyEvidence {
+                        kind: AutonomyEvidenceKind::Observation,
+                        source: "worker.execute_plan".to_string(),
+                        summary:
+                            "Plan execution returned early before final completion-check prompt"
+                                .to_string(),
+                        confidence: 0.6,
+                        payload: checks.clone(),
+                        created_at: Utc::now(),
+                    });
+                    self.record_plan_verification_best_effort(
+                        p,
+                        "execute_plan_early_completion_path",
+                        AutonomyPlanVerificationStatus::Inconclusive,
+                        true,
+                        "Plan execution ended early before final completion-check verification.",
+                        checks,
+                        evidence,
+                    )
+                    .await;
+                }
                 return Ok(());
             }
 
@@ -1130,36 +1228,38 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             };
             let now = Utc::now();
             let checks = serde_json::json!({
+                "completion_path": "final_llm_completion_check",
                 "planned_steps": plan.actions.len(),
                 "executed_steps": executed_steps,
                 "succeeded_steps": succeeded_steps,
                 "failed_steps": failed_steps,
                 "all_planned_steps_executed": executed_steps == plan.actions.len(),
+                "llm_completion_claimed": completion_claimed,
+                "step_outcomes": step_outcomes,
             });
-            let evidence = vec![
-                AutonomyEvidence {
-                    kind: AutonomyEvidenceKind::Observation,
-                    source: "worker.execute_plan".to_string(),
-                    summary: "Final completion verification after planned actions".to_string(),
-                    confidence: 0.8,
-                    payload: checks.clone(),
-                    created_at: now,
-                },
-                AutonomyEvidence {
-                    kind: AutonomyEvidenceKind::UserConfirmation,
-                    source: "llm_completion_check".to_string(),
-                    summary: response.chars().take(400).collect(),
-                    confidence: 0.5,
-                    payload: serde_json::json!({
-                        "completion_claimed": completion_claimed,
-                        "response_excerpt_truncated": response.chars().count() > 400
-                    }),
-                    created_at: now,
-                },
-            ];
-
+            let mut evidence = step_evidence;
+            evidence.push(AutonomyEvidence {
+                kind: AutonomyEvidenceKind::Observation,
+                source: "worker.execute_plan".to_string(),
+                summary: "Aggregated planned execution outcome counts".to_string(),
+                confidence: 0.85,
+                payload: checks.clone(),
+                created_at: now,
+            });
+            evidence.push(AutonomyEvidence {
+                kind: AutonomyEvidenceKind::Observation,
+                source: "llm_completion_check".to_string(),
+                summary: response.chars().take(400).collect(),
+                confidence: 0.5,
+                payload: serde_json::json!({
+                    "completion_claimed": completion_claimed,
+                    "response_excerpt_truncated": response.chars().count() > 400
+                }),
+                created_at: now,
+            });
             self.record_plan_verification_best_effort(
                 p,
+                "execute_plan_completion_check",
                 verification_status,
                 completion_claimed,
                 &response,

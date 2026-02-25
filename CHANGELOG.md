@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI plan-step commands (`titanclaw plan-step create|list|show|set-status`) for local plan-step creation, inspection, and status updates with user-scoped ownership validation.
 - User-scoped autonomy telemetry inspection endpoints (`GET /api/plans/{id}/executions`, `GET /api/goals/{id}/policy-decisions`) to inspect persisted runtime execution attempts and policy decisions from worker/dispatcher instrumentation.
 - User-scoped plan verification inspection endpoint (`GET /api/plans/{id}/verifications`) to inspect persisted worker completion-check verification outcomes for autonomy plans.
+- CLI plan verification inspection command (`titanclaw plan verifications`) with user-scoped ownership checks and optional `--limit`.
 - Atomic plan-step replacement support for replans: `POST /api/plans/{id}/steps/replace` and `titanclaw plan-step replace`, backed by transactional `replace_plan_steps_for_plan` implementations in PostgreSQL and libSQL.
 - Plan revisioning actions: `POST /api/plans/{id}/replan` and `titanclaw plan replan` create the next plan revision from an existing plan with optional metadata overrides, optional superseding of the source plan, and optional source-step copying into the new revision.
 - Replan now also supports inline step payloads in one call: `POST /api/plans/{id}/replan` accepts `steps`, and `titanclaw plan replan` accepts `--steps-file` / `--steps-json` (mutually exclusive with step-copy mode).
@@ -30,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Worker planning and chat tool dispatch now best-effort persist internal autonomy records: worker-generated `ActionPlan`s create/update `Goal`/`Plan`/`PlanStep` records during planned execution, and dispatcher approval/tool-attempt telemetry is additionally mirrored into DB-backed autonomy policy/execution tables without changing the existing approval UX or tracing emitters.
 - Worker planned execution completion checks now also best-effort persist DB-backed autonomy plan verification records (`autonomy_plan_verifications`, `V18` + libSQL schema mirror) for later inspection via the web gateway.
+- Worker plan verification persistence now captures richer per-step checks/evidence summaries and also records an `Inconclusive` verification on early `execute_plan()` completion-path exits (future-proofing the dormant `completed` branch).
 - Job runtime context now carries optional autonomy linkage IDs (`goal_id` / `plan_id` / `plan_step_id`) in memory so worker/dispatcher paths can correlate records more consistently during execution.
 - `agent_jobs` now persists optional autonomy linkage IDs (`autonomy_goal_id`, `autonomy_plan_id`, `autonomy_plan_step_id`) across PostgreSQL/libSQL (`V17` + libSQL schema compatibility path), so autonomy correlation survives DB save/load and restart boundaries.
 
