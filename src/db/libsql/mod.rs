@@ -689,6 +689,80 @@ impl PlanStore for LibSqlBackend {
         Ok(())
     }
 
+    async fn replace_plan_steps_for_plan(
+        &self,
+        plan_id: Uuid,
+        steps: &[PlanStep],
+    ) -> Result<(), DatabaseError> {
+        if steps.iter().any(|s| s.plan_id != plan_id) {
+            return Err(DatabaseError::Query(
+                "replace_plan_steps_for_plan received step with mismatched plan_id".to_string(),
+            ));
+        }
+
+        let conn = self.connect().await?;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        if let Err(e) = conn
+            .execute(
+                "DELETE FROM autonomy_plan_steps WHERE plan_id = ?1",
+                params![plan_id.to_string()],
+            )
+            .await
+        {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Err(DatabaseError::Query(e.to_string()));
+        }
+
+        for step in steps {
+            let kind = enum_to_snake_case(&step.kind)?;
+            let status = enum_to_snake_case(&step.status)?;
+
+            if let Err(e) = conn
+                .execute(
+                    r#"
+                    INSERT INTO autonomy_plan_steps (
+                        id, plan_id, sequence_num, kind, status, title, description,
+                        tool_candidates, inputs, preconditions, postconditions, "rollback",
+                        policy_requirements, started_at, completed_at, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                    "#,
+                    params![
+                        step.id.to_string(),
+                        step.plan_id.to_string(),
+                        step.sequence_num as i64,
+                        kind,
+                        status,
+                        step.title.as_str(),
+                        step.description.as_str(),
+                        step.tool_candidates.to_string(),
+                        step.inputs.to_string(),
+                        step.preconditions.to_string(),
+                        step.postconditions.to_string(),
+                        opt_json_text(step.rollback.as_ref())?,
+                        step.policy_requirements.to_string(),
+                        fmt_opt_ts(&step.started_at),
+                        fmt_opt_ts(&step.completed_at),
+                        fmt_ts(&step.created_at),
+                        fmt_ts(&step.updated_at),
+                    ],
+                )
+                .await
+            {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(DatabaseError::Query(e.to_string()));
+            }
+        }
+
+        conn.execute("COMMIT", ())
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(())
+    }
+
     async fn get_plan_step(&self, id: Uuid) -> Result<Option<PlanStep>, DatabaseError> {
         let conn = self.connect().await?;
         let mut rows = conn

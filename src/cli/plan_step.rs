@@ -1,10 +1,11 @@
 //! Autonomy plan-step CLI commands.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use chrono::Utc;
 use clap::Subcommand;
+use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -63,6 +64,33 @@ pub enum PlanStepCommand {
         /// Optional JSON rollback payload
         #[arg(long)]
         rollback_json: Option<String>,
+    },
+
+    /// Replace all plan steps for a plan atomically (replan workflow)
+    Replace {
+        /// Plan ID to replace steps for
+        #[arg(long)]
+        plan_id: Uuid,
+
+        /// Owner user ID (used to validate goal ownership)
+        #[arg(long, default_value = DEFAULT_USER_ID)]
+        user_id: String,
+
+        /// JSON file containing either {\"steps\": [...]} or [...] step objects
+        #[arg(
+            long,
+            conflicts_with = "steps_json",
+            required_unless_present = "steps_json"
+        )]
+        steps_file: Option<PathBuf>,
+
+        /// Inline JSON containing either {\"steps\": [...]} or [...] step objects
+        #[arg(
+            long,
+            conflicts_with = "steps_file",
+            required_unless_present = "steps_file"
+        )]
+        steps_json: Option<String>,
     },
 
     /// List plan steps for a plan
@@ -135,6 +163,12 @@ pub async fn run_plan_step_command(cmd: PlanStepCommand) -> anyhow::Result<()> {
             )
             .await
         }
+        PlanStepCommand::Replace {
+            plan_id,
+            user_id,
+            steps_file,
+            steps_json,
+        } => replace_plan_steps(db.as_ref(), plan_id, &user_id, steps_file, steps_json).await,
         PlanStepCommand::List { plan_id, user_id } => {
             list_plan_steps(db.as_ref(), plan_id, &user_id).await
         }
@@ -145,6 +179,30 @@ pub async fn run_plan_step_command(cmd: PlanStepCommand) -> anyhow::Result<()> {
             user_id,
         } => set_plan_step_status(db.as_ref(), id, &status, &user_id).await,
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplacePlanStepInput {
+    sequence_num: i32,
+    kind: String,
+    title: String,
+    description: String,
+    #[serde(default)]
+    tool_candidates: Value,
+    #[serde(default)]
+    inputs: Value,
+    #[serde(default)]
+    preconditions: Value,
+    #[serde(default)]
+    postconditions: Value,
+    rollback: Option<Value>,
+    #[serde(default)]
+    policy_requirements: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplacePlanStepsWrapper {
+    steps: Vec<ReplacePlanStepInput>,
 }
 
 async fn connect_db() -> anyhow::Result<Arc<dyn crate::db::Database>> {
@@ -221,6 +279,79 @@ async fn create_plan_step(
 
     println!("Created plan step {} for plan {}", step.id, step.plan_id);
     println!("{}", serde_json::to_string_pretty(&step)?);
+    Ok(())
+}
+
+async fn replace_plan_steps(
+    db: &dyn crate::db::Database,
+    plan_id: Uuid,
+    user_id: &str,
+    steps_file: Option<PathBuf>,
+    steps_json: Option<String>,
+) -> anyhow::Result<()> {
+    let plan = load_owned_plan(db, plan_id, user_id).await?;
+    let raw = match (steps_file, steps_json) {
+        (Some(path), None) => tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("failed to read steps file {}", path.display()))?,
+        (None, Some(json)) => json,
+        _ => anyhow::bail!("exactly one of --steps-file or --steps-json is required"),
+    };
+
+    let inputs = parse_replace_steps_payload(&raw)?;
+    let mut seen = std::collections::HashSet::new();
+    let now = Utc::now();
+    let mut steps = Vec::with_capacity(inputs.len());
+
+    for input in inputs {
+        if input.sequence_num <= 0 {
+            anyhow::bail!("sequence_num must be a positive integer");
+        }
+        if !seen.insert(input.sequence_num) {
+            anyhow::bail!("duplicate sequence_num {}", input.sequence_num);
+        }
+        let title = input.title.trim();
+        let description = input.description.trim();
+        if title.is_empty() {
+            anyhow::bail!("step title is required");
+        }
+        if description.is_empty() {
+            anyhow::bail!("step description is required");
+        }
+
+        steps.push(PlanStep {
+            id: Uuid::new_v4(),
+            plan_id: plan.id,
+            sequence_num: input.sequence_num,
+            kind: parse_plan_step_kind(&input.kind)?,
+            status: PlanStepStatus::Pending,
+            title: title.to_string(),
+            description: description.to_string(),
+            tool_candidates: normalize_json_value(input.tool_candidates),
+            inputs: normalize_json_value(input.inputs),
+            preconditions: normalize_json_value(input.preconditions),
+            postconditions: normalize_json_value(input.postconditions),
+            rollback: input.rollback.filter(|v| !v.is_null()),
+            policy_requirements: normalize_json_value(input.policy_requirements),
+            started_at: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+
+    db.replace_plan_steps_for_plan(plan.id, &steps)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", e))
+        .with_context(|| format!("failed to replace plan steps for plan {}", plan.id))?;
+
+    println!(
+        "Replaced plan steps for plan {} ({} step{})",
+        plan.id,
+        steps.len(),
+        if steps.len() == 1 { "" } else { "s" }
+    );
+    println!("{}", serde_json::to_string_pretty(&steps)?);
     Ok(())
 }
 
@@ -337,6 +468,22 @@ async fn load_owned_plan(
     }
 
     Ok(plan)
+}
+
+fn parse_replace_steps_payload(raw: &str) -> anyhow::Result<Vec<ReplacePlanStepInput>> {
+    if let Ok(wrapper) = serde_json::from_str::<ReplacePlanStepsWrapper>(raw) {
+        return Ok(wrapper.steps);
+    }
+    serde_json::from_str::<Vec<ReplacePlanStepInput>>(raw)
+        .map_err(|e| anyhow::anyhow!("invalid replace payload JSON: {}", e))
+}
+
+fn normalize_json_value(value: Value) -> Value {
+    if value.is_null() {
+        serde_json::json!({})
+    } else {
+        value
+    }
 }
 
 fn parse_json_arg_or_default(name: &str, raw: Option<String>) -> anyhow::Result<Value> {

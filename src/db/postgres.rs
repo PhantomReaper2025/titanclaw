@@ -269,6 +269,66 @@ impl PlanStore for PgBackend {
         Ok(())
     }
 
+    async fn replace_plan_steps_for_plan(
+        &self,
+        plan_id: Uuid,
+        steps: &[PlanStep],
+    ) -> Result<(), DatabaseError> {
+        if steps.iter().any(|s| s.plan_id != plan_id) {
+            return Err(DatabaseError::Query(
+                "replace_plan_steps_for_plan received step with mismatched plan_id".to_string(),
+            ));
+        }
+
+        let mut conn = self.store.conn().await?;
+        let tx = conn.transaction().await?;
+
+        tx.execute(
+            "DELETE FROM autonomy_plan_steps WHERE plan_id = $1",
+            &[&plan_id],
+        )
+        .await?;
+
+        for step in steps {
+            tx.execute(
+                r#"
+                INSERT INTO autonomy_plan_steps (
+                    id, plan_id, sequence_num, kind, status, title, description,
+                    tool_candidates, inputs, preconditions, postconditions, "rollback",
+                    policy_requirements, started_at, completed_at, created_at, updated_at
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7,
+                    $8, $9, $10, $11, $12,
+                    $13, $14, $15, $16, $17
+                )
+                "#,
+                &[
+                    &step.id,
+                    &step.plan_id,
+                    &step.sequence_num,
+                    &plan_step_kind_to_str(step.kind),
+                    &plan_step_status_to_str(step.status),
+                    &step.title,
+                    &step.description,
+                    &step.tool_candidates,
+                    &step.inputs,
+                    &step.preconditions,
+                    &step.postconditions,
+                    &step.rollback,
+                    &step.policy_requirements,
+                    &step.started_at,
+                    &step.completed_at,
+                    &step.created_at,
+                    &step.updated_at,
+                ],
+            )
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn get_plan_step(&self, id: Uuid) -> Result<Option<PlanStep>, DatabaseError> {
         let conn = self.store.conn().await?;
         let row = conn

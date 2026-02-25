@@ -543,6 +543,16 @@ pub trait PlanStore: Send + Sync {
         ))
     }
 
+    async fn replace_plan_steps_for_plan(
+        &self,
+        _plan_id: Uuid,
+        _steps: &[PlanStep],
+    ) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy plan store not implemented for backend".to_string(),
+        ))
+    }
+
     async fn get_plan_step(&self, _id: Uuid) -> Result<Option<PlanStep>, DatabaseError> {
         Err(DatabaseError::Query(
             "autonomy plan store not implemented for backend".to_string(),

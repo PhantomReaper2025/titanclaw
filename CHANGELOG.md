@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - User-scoped plan-step web APIs for autonomy plan structure management (`GET/POST /api/plans/{id}/steps`, `GET /api/plan-steps/{id}`, `POST /api/plan-steps/{id}/status`) backed by new `PlanStore` step read helpers in both PostgreSQL and libSQL backends.
 - CLI plan-step commands (`titanclaw plan-step create|list|show|set-status`) for local plan-step creation, inspection, and status updates with user-scoped ownership validation.
 - User-scoped autonomy telemetry inspection endpoints (`GET /api/plans/{id}/executions`, `GET /api/goals/{id}/policy-decisions`) to inspect persisted runtime execution attempts and policy decisions from worker/dispatcher instrumentation.
+- Atomic plan-step replacement support for replans: `POST /api/plans/{id}/steps/replace` and `titanclaw plan-step replace`, backed by transactional `replace_plan_steps_for_plan` implementations in PostgreSQL and libSQL.
 
 ### Changed
 

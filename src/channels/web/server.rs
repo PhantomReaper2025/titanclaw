@@ -248,6 +248,10 @@ pub async fn start_server(
             "/api/plans/{id}/steps",
             get(plan_steps_list_handler).post(plan_steps_create_handler),
         )
+        .route(
+            "/api/plans/{id}/steps/replace",
+            post(plan_steps_replace_handler),
+        )
         .route("/api/plan-steps/{id}", get(plan_step_detail_handler))
         .route(
             "/api/plan-steps/{id}/status",
@@ -3051,6 +3055,73 @@ fn normalize_plan_step_json(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+fn build_plan_steps_from_inputs(
+    plan_id: Uuid,
+    inputs: Vec<PlanStepCreateInput>,
+    allow_empty: bool,
+) -> Result<Vec<PlanStep>, (StatusCode, String)> {
+    if inputs.is_empty() && !allow_empty {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "At least one plan step is required".to_string(),
+        ));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for step in &inputs {
+        if step.sequence_num <= 0 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "sequence_num must be positive".to_string(),
+            ));
+        }
+        if !seen.insert(step.sequence_num) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("duplicate sequence_num {}", step.sequence_num),
+            ));
+        }
+        if step.title.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "step title is required".to_string(),
+            ));
+        }
+        if step.description.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "step description is required".to_string(),
+            ));
+        }
+    }
+
+    let now = chrono::Utc::now();
+    let steps = inputs
+        .into_iter()
+        .map(|input| PlanStep {
+            id: Uuid::new_v4(),
+            plan_id,
+            sequence_num: input.sequence_num,
+            kind: input.kind,
+            status: PlanStepStatus::Pending,
+            title: input.title.trim().to_string(),
+            description: input.description.trim().to_string(),
+            tool_candidates: normalize_plan_step_json(input.tool_candidates),
+            inputs: normalize_plan_step_json(input.inputs),
+            preconditions: normalize_plan_step_json(input.preconditions),
+            postconditions: normalize_plan_step_json(input.postconditions),
+            rollback: input.rollback,
+            policy_requirements: normalize_plan_step_json(input.policy_requirements),
+            started_at: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .collect();
+
+    Ok(steps)
+}
+
 async fn goals_create_handler(
     State(state): State<Arc<GatewayState>>,
     Json(body): Json<GoalCreateRequest>,
@@ -3480,13 +3551,6 @@ async fn plan_steps_create_handler(
     Path(id): Path<String>,
     Json(body): Json<PlanStepsCreateRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if body.steps.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "At least one plan step is required".to_string(),
-        ));
-    }
-
     let store = state.store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Database not available".to_string(),
@@ -3496,59 +3560,7 @@ async fn plan_steps_create_handler(
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plan ID".to_string()))?;
 
     let plan = load_owned_plan(state.as_ref(), store.as_ref(), plan_id).await?;
-
-    let mut seen = std::collections::HashSet::new();
-    for step in &body.steps {
-        if step.sequence_num <= 0 {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "sequence_num must be positive".to_string(),
-            ));
-        }
-        if !seen.insert(step.sequence_num) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("duplicate sequence_num {}", step.sequence_num),
-            ));
-        }
-        if step.title.trim().is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "step title is required".to_string(),
-            ));
-        }
-        if step.description.trim().is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "step description is required".to_string(),
-            ));
-        }
-    }
-
-    let now = chrono::Utc::now();
-    let steps: Vec<PlanStep> = body
-        .steps
-        .into_iter()
-        .map(|input| PlanStep {
-            id: Uuid::new_v4(),
-            plan_id: plan.id,
-            sequence_num: input.sequence_num,
-            kind: input.kind,
-            status: PlanStepStatus::Pending,
-            title: input.title.trim().to_string(),
-            description: input.description.trim().to_string(),
-            tool_candidates: normalize_plan_step_json(input.tool_candidates),
-            inputs: normalize_plan_step_json(input.inputs),
-            preconditions: normalize_plan_step_json(input.preconditions),
-            postconditions: normalize_plan_step_json(input.postconditions),
-            rollback: input.rollback,
-            policy_requirements: normalize_plan_step_json(input.policy_requirements),
-            started_at: None,
-            completed_at: None,
-            created_at: now,
-            updated_at: now,
-        })
-        .collect();
+    let steps = build_plan_steps_from_inputs(plan.id, body.steps, false)?;
 
     store
         .create_plan_steps(&steps)
@@ -3558,6 +3570,34 @@ async fn plan_steps_create_handler(
     Ok(Json(serde_json::json!({
         "plan_id": plan.id,
         "steps": steps
+    })))
+}
+
+async fn plan_steps_replace_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(body): Json<PlanStepsCreateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let plan_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plan ID".to_string()))?;
+
+    let plan = load_owned_plan(state.as_ref(), store.as_ref(), plan_id).await?;
+    let steps = build_plan_steps_from_inputs(plan.id, body.steps, true)?;
+
+    store
+        .replace_plan_steps_for_plan(plan.id, &steps)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "plan_id": plan.id,
+        "steps": steps,
+        "replaced": true
     })))
 }
 
