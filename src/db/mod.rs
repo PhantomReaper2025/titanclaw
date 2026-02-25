@@ -632,6 +632,15 @@ pub trait AutonomyExecutionStore: Send + Sync {
         ))
     }
 
+    async fn list_policy_decisions_for_user(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<PolicyDecision>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy execution store not implemented for backend".to_string(),
+        ))
+    }
+
     async fn record_plan_verification(
         &self,
         _verification: &PlanVerification,

@@ -1091,6 +1091,38 @@ impl AutonomyExecutionStore for LibSqlBackend {
         Ok(decisions)
     }
 
+    async fn list_policy_decisions_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<PolicyDecision>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    id, goal_id, plan_id, plan_step_id, execution_attempt_id, user_id, channel,
+                    tool_name, tool_call_id, action_kind, decision, reason_codes, risk_score,
+                    confidence, requires_approval, auto_approved, evidence_required, created_at
+                FROM autonomy_policy_decisions
+                WHERE user_id = ?1
+                ORDER BY created_at DESC, id DESC
+                "#,
+                params![user_id],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut decisions = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            decisions.push(row_to_policy_decision_libsql(&row)?);
+        }
+        Ok(decisions)
+    }
+
     async fn record_plan_verification(
         &self,
         verification: &PlanVerification,

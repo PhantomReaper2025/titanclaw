@@ -586,6 +586,20 @@ impl AutonomyExecutionStore for PgBackend {
         rows.iter().map(row_to_policy_decision).collect()
     }
 
+    async fn list_policy_decisions_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<PolicyDecision>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT * FROM autonomy_policy_decisions WHERE user_id = $1 ORDER BY created_at DESC, id DESC",
+                &[&user_id],
+            )
+            .await?;
+        rows.iter().map(row_to_policy_decision).collect()
+    }
+
     async fn record_plan_verification(
         &self,
         verification: &PlanVerification,

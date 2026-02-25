@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Internal autonomy runtime control-plane v1 modules: `PlannerV1`, shared policy-evaluation helpers, `VerifierV1`, and `ReplannerV1` scaffolding with targeted unit tests.
 - Internal runtime rollout flags for autonomy control-plane v1 behavior: `AUTONOMY_POLICY_ENGINE_V1`, `AUTONOMY_VERIFIER_V1`, and `AUTONOMY_REPLANNER_V1` (default enabled).
 - Targeted runtime integration tests for autonomy Phase 1 paths: approval-resume hook re-check blocking (`thread_ops`) and verifier-blocked planned completion -> replan request (`worker`).
+- Additional autonomy Phase 1 acceptance tests: end-to-end worker auto-replan success (`Worker::run`) and direct approval-resume approve/reject policy-decision persistence assertions in `thread_ops`.
 
 ### Changed
 
@@ -43,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Worker plan-step evidence classification now records richer verifier evidence/check metadata (test/lint-check/diff/command categories), and `VerifierV1` uses these signals to permit high-risk completions with explicit acceptance criteria when validation/change evidence is present.
 - Job runtime context now carries optional autonomy linkage IDs (`goal_id` / `plan_id` / `plan_step_id`) in memory so worker/dispatcher paths can correlate records more consistently during execution.
 - `agent_jobs` now persists optional autonomy linkage IDs (`autonomy_goal_id`, `autonomy_plan_id`, `autonomy_plan_step_id`) across PostgreSQL/libSQL (`V17` + libSQL schema compatibility path), so autonomy correlation survives DB save/load and restart boundaries.
+- Added internal DB convenience query `list_policy_decisions_for_user(...)` across PostgreSQL/libSQL backends to support direct testing/inspection of chat approval-resume policy-decision persistence paths.
 
 ## [1.0.2] - 2026-02-23
 

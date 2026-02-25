@@ -1638,6 +1638,7 @@ mod tests {
 
     use async_trait::async_trait;
     use serde_json::json;
+    use uuid::Uuid;
 
     use super::*;
     use crate::channels::{ChannelManager, IncomingMessage};
@@ -1678,6 +1679,27 @@ mod tests {
                 _ => Ok(HookOutcome::ok()),
             }
         }
+    }
+
+    async fn wait_for_policy_decisions_for_user(
+        db: &dyn crate::db::Database,
+        user_id: &str,
+        min_count: usize,
+    ) -> Vec<crate::agent::PolicyDecision> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = db
+                    .list_policy_decisions_for_user(user_id)
+                    .await
+                    .expect("list policy decisions for user");
+                if rows.len() >= min_count {
+                    break rows;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for policy decisions")
     }
 
     #[cfg(feature = "libsql")]
@@ -1761,6 +1783,123 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("blocked by hook after approval")
+        );
+
+        let policy_rows =
+            wait_for_policy_decisions_for_user(harness.db.as_ref(), "user-1", 2).await;
+        assert!(
+            policy_rows.iter().any(|d| {
+                d.tool_name.as_deref() == Some("shell")
+                    && d.tool_call_id.as_deref() == Some("call-1")
+                    && d.action_kind == "approval_resume_decision"
+                    && d.decision == crate::agent::PolicyDecisionKind::Allow
+                    && d.reason_codes.iter().any(|r| r == "user_approved_tool")
+            }),
+            "expected approval_resume_decision allow policy record"
+        );
+        assert!(
+            policy_rows.iter().any(|d| {
+                d.tool_name.as_deref() == Some("shell")
+                    && d.tool_call_id.as_deref() == Some("call-1")
+                    && d.action_kind == "approval_resume_hook"
+                    && d.decision == crate::agent::PolicyDecisionKind::Deny
+            }),
+            "expected approval_resume_hook deny policy record"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_process_approval_rejection_persists_policy_decision_and_keeps_thread_consistent()
+    {
+        let harness = TestHarnessBuilder::new().build().await;
+
+        let mut config = AgentConfig::resolve(&Settings::default()).expect("config");
+        config.autonomy_policy_engine_v1 = true;
+
+        let agent = Agent::new(
+            config,
+            harness.deps,
+            ChannelManager::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let message = IncomingMessage::new("test", "user-2", "reject")
+            .with_metadata(json!({"source":"test"}));
+        let session = agent.session_manager.get_or_create_session("user-2").await;
+
+        let (thread_id, request_id) = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("Please run shell");
+            thread.record_tool_call("call-reject", "shell", json!({"command":"echo hi"}));
+            let request_id = Uuid::new_v4();
+            thread.await_approval(crate::agent::PendingApproval {
+                request_id,
+                tool_name: "shell".to_string(),
+                parameters: json!({"command":"echo hi"}),
+                description: "Run shell".to_string(),
+                tool_call_id: "call-reject".to_string(),
+                context_messages: vec![ChatMessage::user("Please run shell")],
+            });
+            (thread.id, request_id)
+        };
+
+        let out = agent
+            .process_approval(
+                &message,
+                session.clone(),
+                thread_id,
+                Some(request_id),
+                false,
+                false,
+            )
+            .await
+            .expect("process rejection");
+
+        match out {
+            crate::agent::submission::SubmissionResult::Response { content } => {
+                assert!(content.contains("was rejected"));
+            }
+            other => panic!("unexpected submission result: {:?}", other),
+        }
+
+        let sess = session.lock().await;
+        let thread = sess.threads.get(&thread_id).expect("thread");
+        assert_eq!(thread.state, ThreadState::Idle);
+        assert!(thread.pending_approval.is_none());
+        let turn = thread.last_turn().expect("turn");
+        assert!(
+            turn.response
+                .as_deref()
+                .unwrap_or_default()
+                .contains("was rejected")
+        );
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert!(
+            turn.tool_calls[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rejected by user")
+        );
+        drop(sess);
+
+        let policy_rows =
+            wait_for_policy_decisions_for_user(harness.db.as_ref(), "user-2", 1).await;
+        assert!(
+            policy_rows.iter().any(|d| {
+                d.tool_name.as_deref() == Some("shell")
+                    && d.tool_call_id.as_deref() == Some("call-reject")
+                    && d.action_kind == "approval_resume_decision"
+                    && d.decision == crate::agent::PolicyDecisionKind::Deny
+                    && d.reason_codes.iter().any(|r| r == "user_rejected_tool")
+                    && d.auto_approved == Some(false)
+            }),
+            "expected rejection policy decision record"
         );
     }
 }
