@@ -23,6 +23,10 @@ use crate::tools::builtin::{
     ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
     WriteFileTool,
 };
+use crate::tools::contract_v2::{
+    ToolContractV2Descriptor, infer_tool_contract_v2_descriptor,
+    resolve_contract_v2_descriptor_overlay,
+};
 use crate::tools::tool::{Tool, ToolDomain};
 use crate::tools::wasm::{
     Capabilities, OAuthRefreshConfig, ResourceLimits, WasmError, WasmStorageError, WasmToolRuntime,
@@ -215,6 +219,82 @@ impl ToolRegistry {
                 parameters: tool.parameters_schema(),
             })
             .collect()
+    }
+
+    /// Infer a Tool Contract V2 descriptor from the current tool registration.
+    pub async fn infer_tool_contract_v2(&self, name: &str) -> Option<ToolContractV2Descriptor> {
+        let tool = self.get(name).await?;
+        Some(infer_tool_contract_v2_descriptor(tool.as_ref()))
+    }
+
+    /// Resolve a Tool Contract V2 descriptor with optional DB-backed overrides.
+    ///
+    /// Override precedence is: user override -> global override -> inferred.
+    pub async fn resolve_tool_contract_v2(
+        &self,
+        name: &str,
+        store: Option<&dyn Database>,
+        user_id: Option<&str>,
+    ) -> Option<ToolContractV2Descriptor> {
+        let tool = self.get(name).await?;
+        let inferred = infer_tool_contract_v2_descriptor(tool.as_ref());
+
+        let (user_override, global_override) = if let Some(store) = store {
+            let user_override = if let Some(uid) = user_id {
+                match store.get_tool_contract_override(name, Some(uid)).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            tool = %name,
+                            user_id = %uid,
+                            error = %e,
+                            "Failed to load user Tool Contract V2 override; falling back to inferred descriptor"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let global_override = match store.get_tool_contract_override(name, None).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        tool = %name,
+                        error = %e,
+                        "Failed to load global Tool Contract V2 override; falling back to inferred descriptor"
+                    );
+                    None
+                }
+            };
+            (user_override, global_override)
+        } else {
+            (None, None)
+        };
+
+        Some(resolve_contract_v2_descriptor_overlay(
+            inferred,
+            user_override.as_ref(),
+            global_override.as_ref(),
+        ))
+    }
+
+    /// Resolve Tool Contract V2 descriptors for all registered tools.
+    pub async fn resolve_tool_contracts_v2(
+        &self,
+        store: Option<&dyn Database>,
+        user_id: Option<&str>,
+    ) -> Vec<ToolContractV2Descriptor> {
+        let mut names = self.list().await;
+        names.sort();
+        let mut descriptors = Vec::with_capacity(names.len());
+        for name in names {
+            if let Some(descriptor) = self.resolve_tool_contract_v2(&name, store, user_id).await {
+                descriptors.push(descriptor);
+            }
+        }
+        descriptors
     }
 
     /// Register development tools for building software.
@@ -604,6 +684,16 @@ mod tests {
         let defs = registry.tool_definitions().await;
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "echo");
+    }
+
+    #[tokio::test]
+    async fn test_infer_tool_contract_v2() {
+        let registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool)).await;
+
+        let descriptor = registry.infer_tool_contract_v2("echo").await.unwrap();
+        assert_eq!(descriptor.tool_name, "echo");
+        assert_eq!(descriptor.domain, "orchestrator");
     }
 
     #[tokio::test]
