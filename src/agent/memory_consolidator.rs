@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::agent::{
     ConsolidationAction, ConsolidationRun, ConsolidationRunStatus, MemoryEvent, MemoryRecord,
-    MemoryRecordStatus, MemorySourceKind, MemoryType,
+    MemoryRecordStatus, MemorySourceKind, MemoryType, ProceduralPlaybook, ProceduralPlaybookStatus,
 };
 use crate::db::Database;
 
@@ -80,11 +80,15 @@ impl MemoryConsolidator {
                 Ok(ProcessOutcome {
                     promoted,
                     archived,
+                    playbook_created,
                     action,
                 }) => {
                     run.processed_count += 1;
                     if promoted {
                         run.promoted_count += 1;
+                    }
+                    if playbook_created {
+                        run.playbooks_created_count += 1;
                     }
                     if archived {
                         run.archived_count += 1;
@@ -127,9 +131,19 @@ impl MemoryConsolidator {
         let now = Utc::now();
         let mut promoted = false;
         let mut archived = false;
+        let mut playbook_created = false;
         let action;
 
-        if record.category == "routine_run_summary" {
+        if record.category == "routine_playbook_candidate" {
+            playbook_created = self.promote_routine_playbook_candidate(record, now).await?;
+            promoted = true;
+            archived = true;
+            action = ConsolidationAction::GeneratePlaybook;
+            self.store
+                .update_memory_record_status(record.id, MemoryRecordStatus::Archived)
+                .await
+                .map_err(|e| format!("archive playbook candidate source record: {e}"))?;
+        } else if record.category == "routine_run_summary" {
             let semantic = MemoryRecord {
                 id: Uuid::new_v4(),
                 owner_user_id: record.owner_user_id.clone(),
@@ -208,8 +222,89 @@ impl MemoryConsolidator {
         Ok(ProcessOutcome {
             promoted,
             archived,
+            playbook_created,
             action,
         })
+    }
+
+    async fn promote_routine_playbook_candidate(
+        &self,
+        record: &MemoryRecord,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<bool, String> {
+        let payload = &record.payload;
+        let task_class = payload
+            .get("task_class")
+            .and_then(|v| v.as_str())
+            .unwrap_or("routine_automation")
+            .to_string();
+        let routine_name = payload
+            .get("routine_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| record.title.as_str())
+            .to_string();
+        let playbook_name = format!("Routine: {}", routine_name);
+
+        let existing = self
+            .store
+            .list_procedural_playbooks_for_user(&record.owner_user_id)
+            .await
+            .map_err(|e| format!("list procedural playbooks: {e}"))?;
+
+        let maybe_existing = existing
+            .into_iter()
+            .find(|p| p.name == playbook_name && p.task_class == task_class);
+
+        if let Some(mut playbook) = maybe_existing {
+            playbook.success_count = playbook.success_count.saturating_add(1);
+            playbook.confidence = playbook.confidence.max(record.confidence).min(0.95);
+            playbook.updated_at = now;
+            let mut source_ids = playbook
+                .source_memory_record_ids
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let source_id_json = json!(record.id);
+            if !source_ids.iter().any(|v| v == &source_id_json) {
+                source_ids.push(source_id_json);
+            }
+            playbook.source_memory_record_ids = serde_json::Value::Array(source_ids);
+            self.store
+                .create_or_update_procedural_playbook(&playbook)
+                .await
+                .map_err(|e| format!("update procedural playbook: {e}"))?;
+            Ok(false)
+        } else {
+            let playbook = ProceduralPlaybook {
+                id: Uuid::new_v4(),
+                owner_user_id: record.owner_user_id.clone(),
+                name: playbook_name,
+                task_class,
+                trigger_signals: json!({
+                    "trigger_type": payload.get("trigger_type"),
+                    "routine_name": routine_name,
+                }),
+                steps_template: json!({
+                    "candidate_steps_hint": payload.get("candidate_steps_hint"),
+                    "source_category": record.category,
+                }),
+                tool_preferences: json!({}),
+                constraints: json!({}),
+                success_count: 1,
+                failure_count: 0,
+                confidence: record.confidence.max(0.65).min(0.9),
+                status: ProceduralPlaybookStatus::Draft,
+                requires_approval: false,
+                source_memory_record_ids: json!([record.id]),
+                created_at: now,
+                updated_at: now,
+            };
+            self.store
+                .create_or_update_procedural_playbook(&playbook)
+                .await
+                .map_err(|e| format!("create procedural playbook: {e}"))?;
+            Ok(true)
+        }
     }
 }
 
@@ -217,6 +312,7 @@ impl MemoryConsolidator {
 struct ProcessOutcome {
     promoted: bool,
     archived: bool,
+    playbook_created: bool,
     action: ConsolidationAction,
 }
 
@@ -305,5 +401,172 @@ mod tests {
             .expect("list memory events");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_kind, "consolidated");
+    }
+
+    #[tokio::test]
+    async fn run_once_promotes_routine_playbook_candidate_into_procedural_playbook() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("memory_consolidator_playbook_test.db");
+        let backend = LibSqlBackend::new_local(&db_path)
+            .await
+            .expect("libsql local");
+        backend.run_migrations().await.expect("migrations");
+
+        let consolidator = MemoryConsolidator::new(
+            MemoryConsolidatorConfig {
+                enabled: true,
+                interval: Duration::from_secs(60),
+                batch_size: 10,
+            },
+            Arc::new(backend),
+        );
+
+        let now = Utc::now();
+        let first_candidate = MemoryRecord {
+            id: Uuid::new_v4(),
+            owner_user_id: "user-1".to_string(),
+            goal_id: None,
+            plan_id: None,
+            plan_step_id: None,
+            job_id: None,
+            thread_id: None,
+            memory_type: MemoryType::Episodic,
+            source_kind: MemorySourceKind::RoutineRun,
+            category: "routine_playbook_candidate".to_string(),
+            title: "Routine cleanup playbook candidate".to_string(),
+            summary: "Repeated successful cleanup routine".to_string(),
+            payload: json!({
+                "task_class": "routine_automation",
+                "routine_name": "cleanup",
+                "trigger_type": "cron",
+                "candidate_steps_hint": ["scan", "cleanup", "verify"]
+            }),
+            provenance: json!({"source":"test","timestamp":now}),
+            confidence: 0.82,
+            sensitivity: crate::agent::MemorySensitivity::Internal,
+            ttl_secs: None,
+            status: MemoryRecordStatus::Active,
+            workspace_doc_path: None,
+            workspace_document_id: None,
+            created_at: now,
+            updated_at: now,
+            expires_at: None,
+        };
+        consolidator
+            .store
+            .create_memory_record(&first_candidate)
+            .await
+            .expect("create first candidate");
+
+        let first_run = consolidator.run_once().await.expect("first run");
+        assert_eq!(first_run.status, ConsolidationRunStatus::Completed);
+        assert_eq!(first_run.processed_count, 1);
+        assert_eq!(first_run.promoted_count, 1);
+        assert_eq!(first_run.playbooks_created_count, 1);
+        assert_eq!(first_run.archived_count, 1);
+
+        let mut playbooks = consolidator
+            .store
+            .list_procedural_playbooks_for_user("user-1")
+            .await
+            .expect("list playbooks after first run");
+        assert_eq!(playbooks.len(), 1);
+        let playbook_id = playbooks[0].id;
+        assert_eq!(playbooks[0].name, "Routine: cleanup");
+        assert_eq!(playbooks[0].task_class, "routine_automation");
+        assert_eq!(playbooks[0].success_count, 1);
+        assert_eq!(playbooks[0].status, ProceduralPlaybookStatus::Draft);
+        assert_eq!(
+            playbooks[0]
+                .source_memory_record_ids
+                .as_array()
+                .expect("source ids array")
+                .len(),
+            1
+        );
+
+        let records_after_first = consolidator
+            .store
+            .list_memory_records_for_user("user-1")
+            .await
+            .expect("list memory records after first run");
+        assert!(
+            records_after_first.iter().any(|r| {
+                r.id == first_candidate.id && r.status == MemoryRecordStatus::Archived
+            })
+        );
+
+        let second_now = now + chrono::Duration::seconds(1);
+        let second_candidate = MemoryRecord {
+            id: Uuid::new_v4(),
+            owner_user_id: "user-1".to_string(),
+            goal_id: None,
+            plan_id: None,
+            plan_step_id: None,
+            job_id: None,
+            thread_id: None,
+            memory_type: MemoryType::Episodic,
+            source_kind: MemorySourceKind::RoutineRun,
+            category: "routine_playbook_candidate".to_string(),
+            title: "Routine cleanup playbook candidate".to_string(),
+            summary: "Repeated successful cleanup routine again".to_string(),
+            payload: json!({
+                "task_class": "routine_automation",
+                "routine_name": "cleanup",
+                "trigger_type": "cron",
+                "candidate_steps_hint": ["scan", "cleanup", "verify"]
+            }),
+            provenance: json!({"source":"test","timestamp":second_now}),
+            confidence: 0.88,
+            sensitivity: crate::agent::MemorySensitivity::Internal,
+            ttl_secs: None,
+            status: MemoryRecordStatus::Active,
+            workspace_doc_path: None,
+            workspace_document_id: None,
+            created_at: second_now,
+            updated_at: second_now,
+            expires_at: None,
+        };
+        consolidator
+            .store
+            .create_memory_record(&second_candidate)
+            .await
+            .expect("create second candidate");
+
+        let second_run = consolidator.run_once().await.expect("second run");
+        assert_eq!(second_run.status, ConsolidationRunStatus::Completed);
+        assert_eq!(second_run.processed_count, 1);
+        assert_eq!(second_run.promoted_count, 1);
+        assert_eq!(second_run.playbooks_created_count, 0);
+        assert_eq!(second_run.archived_count, 1);
+
+        playbooks = consolidator
+            .store
+            .list_procedural_playbooks_for_user("user-1")
+            .await
+            .expect("list playbooks after second run");
+        assert_eq!(playbooks.len(), 1);
+        assert_eq!(playbooks[0].id, playbook_id);
+        assert_eq!(playbooks[0].success_count, 2);
+        assert!(playbooks[0].confidence >= 0.88);
+        let source_ids = playbooks[0]
+            .source_memory_record_ids
+            .as_array()
+            .expect("source ids array after update");
+        assert_eq!(source_ids.len(), 2);
+        assert!(source_ids.iter().any(|v| *v == json!(first_candidate.id)));
+        assert!(source_ids.iter().any(|v| *v == json!(second_candidate.id)));
+
+        let second_events = consolidator
+            .store
+            .list_memory_events_for_record(second_candidate.id)
+            .await
+            .expect("list memory events for second candidate");
+        assert_eq!(second_events.len(), 1);
+        assert_eq!(second_events[0].event_kind, "consolidated");
+        assert_eq!(
+            second_events[0].action,
+            Some(ConsolidationAction::GeneratePlaybook)
+        );
     }
 }

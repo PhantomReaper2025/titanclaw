@@ -472,12 +472,12 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
                         "timestamp": now_ts,
                         "routine_run_id": run.id,
                     }),
-                    desired_memory_type: Some(MemoryType::Procedural),
+                    desired_memory_type: Some(MemoryType::Episodic),
                     confidence_hint: Some(0.72),
                     sensitivity_hint: None,
                     ttl_secs_hint: None,
                     high_impact: false,
-                    intent: MemoryWriteIntent::Generic,
+                    intent: MemoryWriteIntent::RoutineSummary { successful: true },
                 },
             );
         }
