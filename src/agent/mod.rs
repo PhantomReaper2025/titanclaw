@@ -23,6 +23,7 @@ pub mod job_monitor;
 pub mod kernel_monitor;
 pub mod kernel_orchestrator;
 pub mod memory_plane;
+mod memory_write_policy;
 mod planner_v1;
 mod policy_engine;
 pub mod profile_onboarding;

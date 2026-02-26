@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Targeted runtime integration tests for autonomy Phase 1 paths: approval-resume hook re-check blocking (`thread_ops`) and verifier-blocked planned completion -> replan request (`worker`).
 - Additional autonomy Phase 1 acceptance tests: end-to-end worker auto-replan success (`Worker::run`) and direct approval-resume approve/reject policy-decision persistence assertions in `thread_ops`.
 - Internal Memory Plane v2 groundwork: typed memory-plane domain models (`src/agent/memory_plane.rs`), new `AutonomyMemoryStore` DB subtrait, dual-backend Postgres/libSQL CRUD foundations for memory records/events/procedural playbooks/consolidation runs, and schema migrations `V19`-`V23` plus libSQL schema mirror updates.
+- Internal Phase 2 Memory Plane v2 config/decision scaffolding: default-off runtime rollout flags (`AUTONOMY_MEMORY_PLANE_V2`, `AUTONOMY_MEMORY_RETRIEVAL_V2`, `AUTONOMY_MEMORY_CONSOLIDATION_V2` + tuning knobs) and a deterministic `MemoryWritePolicyEngine` classifier module with unit tests.
 
 ### Changed
 

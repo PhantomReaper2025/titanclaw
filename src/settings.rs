@@ -315,6 +315,38 @@ pub struct AgentSettings {
     #[serde(default = "default_true")]
     pub autonomy_replanner_v1: bool,
 
+    /// Enable Memory Plane v2 runtime writes/services.
+    #[serde(default)]
+    pub autonomy_memory_plane_v2: bool,
+
+    /// Enable Memory Plane v2 retrieval composer integration.
+    #[serde(default)]
+    pub autonomy_memory_retrieval_v2: bool,
+
+    /// Enable Memory Plane v2 background consolidation loop.
+    #[serde(default)]
+    pub autonomy_memory_consolidation_v2: bool,
+
+    /// Memory consolidation loop interval in seconds.
+    #[serde(default = "default_memory_consolidation_interval_secs")]
+    pub autonomy_memory_consolidation_interval_secs: u64,
+
+    /// Memory consolidation loop batch size.
+    #[serde(default = "default_memory_consolidation_batch_size")]
+    pub autonomy_memory_consolidation_batch_size: u32,
+
+    /// Working-memory snapshot TTL in seconds.
+    #[serde(default = "default_memory_working_ttl_secs")]
+    pub autonomy_memory_working_ttl_secs: u64,
+
+    /// Default episodic TTL in days for non-audit records.
+    #[serde(default = "default_memory_episodic_ttl_days")]
+    pub autonomy_memory_episodic_ttl_days: u32,
+
+    /// Minimum repeated-success threshold before procedural playbook promotion.
+    #[serde(default = "default_memory_playbook_min_repetitions")]
+    pub autonomy_memory_playbook_min_repetitions: u32,
+
     /// Self-repair check interval in seconds.
     #[serde(default = "default_repair_interval")]
     pub repair_check_interval_secs: u64,
@@ -417,6 +449,26 @@ fn default_repair_interval() -> u64 {
     60 // 1 minute
 }
 
+fn default_memory_consolidation_interval_secs() -> u64 {
+    60
+}
+
+fn default_memory_consolidation_batch_size() -> u32 {
+    50
+}
+
+fn default_memory_working_ttl_secs() -> u64 {
+    24 * 60 * 60
+}
+
+fn default_memory_episodic_ttl_days() -> u32 {
+    30
+}
+
+fn default_memory_playbook_min_repetitions() -> u32 {
+    3
+}
+
 fn default_session_idle_timeout() -> u64 {
     7 * 24 * 3600 // 7 days
 }
@@ -480,6 +532,15 @@ impl Default for AgentSettings {
             autonomy_policy_engine_v1: true,
             autonomy_verifier_v1: true,
             autonomy_replanner_v1: true,
+            autonomy_memory_plane_v2: false,
+            autonomy_memory_retrieval_v2: false,
+            autonomy_memory_consolidation_v2: false,
+            autonomy_memory_consolidation_interval_secs: default_memory_consolidation_interval_secs(
+            ),
+            autonomy_memory_consolidation_batch_size: default_memory_consolidation_batch_size(),
+            autonomy_memory_working_ttl_secs: default_memory_working_ttl_secs(),
+            autonomy_memory_episodic_ttl_days: default_memory_episodic_ttl_days(),
+            autonomy_memory_playbook_min_repetitions: default_memory_playbook_min_repetitions(),
             repair_check_interval_secs: default_repair_interval(),
             max_repair_attempts: default_max_repair_attempts(),
             session_idle_timeout_secs: default_session_idle_timeout(),

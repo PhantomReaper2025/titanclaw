@@ -21,6 +21,22 @@ pub struct AgentConfig {
     pub autonomy_verifier_v1: bool,
     /// Enable bounded automatic replanning in worker planned execution.
     pub autonomy_replanner_v1: bool,
+    /// Enable Memory Plane v2 runtime writes/services.
+    pub autonomy_memory_plane_v2: bool,
+    /// Enable Memory Plane v2 retrieval composer integration.
+    pub autonomy_memory_retrieval_v2: bool,
+    /// Enable Memory Plane v2 background consolidation loop.
+    pub autonomy_memory_consolidation_v2: bool,
+    /// Consolidation loop interval.
+    pub autonomy_memory_consolidation_interval: Duration,
+    /// Consolidation loop batch size.
+    pub autonomy_memory_consolidation_batch_size: u32,
+    /// Working-memory snapshot TTL.
+    pub autonomy_memory_working_ttl: Duration,
+    /// Default episodic TTL for non-audit records (days).
+    pub autonomy_memory_episodic_ttl_days: u32,
+    /// Minimum repeated successes before playbook promotion.
+    pub autonomy_memory_playbook_min_repetitions: u32,
     /// Session idle timeout. Sessions inactive longer than this are pruned.
     pub session_idle_timeout: Duration,
     /// Remote swarm wait timeout before local fallback.
@@ -147,6 +163,78 @@ impl AgentConfig {
                     message: format!("must be 'true' or 'false': {e}"),
                 })?
                 .unwrap_or(settings.agent.autonomy_replanner_v1),
+            autonomy_memory_plane_v2: optional_env("AUTONOMY_MEMORY_PLANE_V2")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "AUTONOMY_MEMORY_PLANE_V2".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(settings.agent.autonomy_memory_plane_v2),
+            autonomy_memory_retrieval_v2: optional_env("AUTONOMY_MEMORY_RETRIEVAL_V2")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "AUTONOMY_MEMORY_RETRIEVAL_V2".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(settings.agent.autonomy_memory_retrieval_v2),
+            autonomy_memory_consolidation_v2: optional_env("AUTONOMY_MEMORY_CONSOLIDATION_V2")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "AUTONOMY_MEMORY_CONSOLIDATION_V2".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(settings.agent.autonomy_memory_consolidation_v2),
+            autonomy_memory_consolidation_interval: Duration::from_secs(
+                optional_env("AUTONOMY_MEMORY_CONSOLIDATION_INTERVAL_SECS")?
+                    .map(|s| s.parse())
+                    .transpose()
+                    .map_err(|e| ConfigError::InvalidValue {
+                        key: "AUTONOMY_MEMORY_CONSOLIDATION_INTERVAL_SECS".to_string(),
+                        message: format!("must be a positive integer: {e}"),
+                    })?
+                    .unwrap_or(settings.agent.autonomy_memory_consolidation_interval_secs),
+            ),
+            autonomy_memory_consolidation_batch_size: optional_env(
+                "AUTONOMY_MEMORY_CONSOLIDATION_BATCH_SIZE",
+            )?
+            .map(|s| s.parse())
+            .transpose()
+            .map_err(|e| ConfigError::InvalidValue {
+                key: "AUTONOMY_MEMORY_CONSOLIDATION_BATCH_SIZE".to_string(),
+                message: format!("must be a positive integer: {e}"),
+            })?
+            .unwrap_or(settings.agent.autonomy_memory_consolidation_batch_size),
+            autonomy_memory_working_ttl: Duration::from_secs(
+                optional_env("AUTONOMY_MEMORY_WORKING_TTL_SECS")?
+                    .map(|s| s.parse())
+                    .transpose()
+                    .map_err(|e| ConfigError::InvalidValue {
+                        key: "AUTONOMY_MEMORY_WORKING_TTL_SECS".to_string(),
+                        message: format!("must be a positive integer: {e}"),
+                    })?
+                    .unwrap_or(settings.agent.autonomy_memory_working_ttl_secs),
+            ),
+            autonomy_memory_episodic_ttl_days: optional_env("AUTONOMY_MEMORY_EPISODIC_TTL_DAYS")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "AUTONOMY_MEMORY_EPISODIC_TTL_DAYS".to_string(),
+                    message: format!("must be a positive integer: {e}"),
+                })?
+                .unwrap_or(settings.agent.autonomy_memory_episodic_ttl_days),
+            autonomy_memory_playbook_min_repetitions: optional_env(
+                "AUTONOMY_MEMORY_PLAYBOOK_MIN_REPETITIONS",
+            )?
+            .map(|s| s.parse())
+            .transpose()
+            .map_err(|e| ConfigError::InvalidValue {
+                key: "AUTONOMY_MEMORY_PLAYBOOK_MIN_REPETITIONS".to_string(),
+                message: format!("must be a positive integer: {e}"),
+            })?
+            .unwrap_or(settings.agent.autonomy_memory_playbook_min_repetitions),
             session_idle_timeout: Duration::from_secs(
                 optional_env("SESSION_IDLE_TIMEOUT_SECS")?
                     .map(|s| s.parse())
@@ -342,6 +430,14 @@ mod tests {
             std::env::remove_var("AUTONOMY_POLICY_ENGINE_V1");
             std::env::remove_var("AUTONOMY_VERIFIER_V1");
             std::env::remove_var("AUTONOMY_REPLANNER_V1");
+            std::env::remove_var("AUTONOMY_MEMORY_PLANE_V2");
+            std::env::remove_var("AUTONOMY_MEMORY_RETRIEVAL_V2");
+            std::env::remove_var("AUTONOMY_MEMORY_CONSOLIDATION_V2");
+            std::env::remove_var("AUTONOMY_MEMORY_CONSOLIDATION_INTERVAL_SECS");
+            std::env::remove_var("AUTONOMY_MEMORY_CONSOLIDATION_BATCH_SIZE");
+            std::env::remove_var("AUTONOMY_MEMORY_WORKING_TTL_SECS");
+            std::env::remove_var("AUTONOMY_MEMORY_EPISODIC_TTL_DAYS");
+            std::env::remove_var("AUTONOMY_MEMORY_PLAYBOOK_MIN_REPETITIONS");
         }
     }
 
@@ -369,6 +465,55 @@ mod tests {
         assert!(!cfg.autonomy_policy_engine_v1);
         assert!(!cfg.autonomy_verifier_v1);
         assert!(!cfg.autonomy_replanner_v1);
+        clear_autonomy_flag_env();
+    }
+
+    #[test]
+    fn autonomy_memory_flags_default_disabled_with_expected_knobs() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        clear_autonomy_flag_env();
+        let cfg = AgentConfig::resolve(&Settings::default()).expect("resolve");
+        assert!(!cfg.autonomy_memory_plane_v2);
+        assert!(!cfg.autonomy_memory_retrieval_v2);
+        assert!(!cfg.autonomy_memory_consolidation_v2);
+        assert_eq!(
+            cfg.autonomy_memory_consolidation_interval,
+            Duration::from_secs(60)
+        );
+        assert_eq!(cfg.autonomy_memory_consolidation_batch_size, 50);
+        assert_eq!(cfg.autonomy_memory_working_ttl, Duration::from_secs(86_400));
+        assert_eq!(cfg.autonomy_memory_episodic_ttl_days, 30);
+        assert_eq!(cfg.autonomy_memory_playbook_min_repetitions, 3);
+    }
+
+    #[test]
+    fn autonomy_memory_flags_env_override() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex");
+        clear_autonomy_flag_env();
+        // SAFETY: env mutation is serialized under ENV_MUTEX in tests.
+        unsafe {
+            std::env::set_var("AUTONOMY_MEMORY_PLANE_V2", "true");
+            std::env::set_var("AUTONOMY_MEMORY_RETRIEVAL_V2", "true");
+            std::env::set_var("AUTONOMY_MEMORY_CONSOLIDATION_V2", "true");
+            std::env::set_var("AUTONOMY_MEMORY_CONSOLIDATION_INTERVAL_SECS", "90");
+            std::env::set_var("AUTONOMY_MEMORY_CONSOLIDATION_BATCH_SIZE", "64");
+            std::env::set_var("AUTONOMY_MEMORY_WORKING_TTL_SECS", "7200");
+            std::env::set_var("AUTONOMY_MEMORY_EPISODIC_TTL_DAYS", "14");
+            std::env::set_var("AUTONOMY_MEMORY_PLAYBOOK_MIN_REPETITIONS", "5");
+        }
+
+        let cfg = AgentConfig::resolve(&Settings::default()).expect("resolve");
+        assert!(cfg.autonomy_memory_plane_v2);
+        assert!(cfg.autonomy_memory_retrieval_v2);
+        assert!(cfg.autonomy_memory_consolidation_v2);
+        assert_eq!(
+            cfg.autonomy_memory_consolidation_interval,
+            Duration::from_secs(90)
+        );
+        assert_eq!(cfg.autonomy_memory_consolidation_batch_size, 64);
+        assert_eq!(cfg.autonomy_memory_working_ttl, Duration::from_secs(7200));
+        assert_eq!(cfg.autonomy_memory_episodic_ttl_days, 14);
+        assert_eq!(cfg.autonomy_memory_playbook_min_repetitions, 5);
         clear_autonomy_flag_env();
     }
 }
