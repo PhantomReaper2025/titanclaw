@@ -28,8 +28,9 @@ use uuid::Uuid;
 
 use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::agent::{
-    BrokenTool, ExecutionAttempt, Goal, GoalStatus, Plan, PlanStatus, PlanStep, PlanStepStatus,
-    PlanVerification, PolicyDecision,
+    BrokenTool, ConsolidationRun, ExecutionAttempt, Goal, GoalStatus, MemoryEvent, MemoryRecord,
+    MemoryRecordStatus, Plan, PlanStatus, PlanStep, PlanStepStatus, PlanVerification,
+    PolicyDecision, ProceduralPlaybook, ProceduralPlaybookStatus,
 };
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::error::DatabaseError;
@@ -660,6 +661,131 @@ pub trait AutonomyExecutionStore: Send + Sync {
     }
 }
 
+#[async_trait]
+pub trait AutonomyMemoryStore: Send + Sync {
+    async fn create_memory_record(&self, _record: &MemoryRecord) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy memory store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn get_memory_record(&self, _id: Uuid) -> Result<Option<MemoryRecord>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy memory store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn list_memory_records_for_user(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<MemoryRecord>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy memory store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn list_memory_records_for_goal(
+        &self,
+        _goal_id: Uuid,
+    ) -> Result<Vec<MemoryRecord>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy memory store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn update_memory_record_status(
+        &self,
+        _id: Uuid,
+        _status: MemoryRecordStatus,
+    ) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy memory store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn record_memory_event(&self, _event: &MemoryEvent) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy memory store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn list_memory_events_for_record(
+        &self,
+        _memory_record_id: Uuid,
+    ) -> Result<Vec<MemoryEvent>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy memory store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn create_or_update_procedural_playbook(
+        &self,
+        _playbook: &ProceduralPlaybook,
+    ) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy memory store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn get_procedural_playbook(
+        &self,
+        _id: Uuid,
+    ) -> Result<Option<ProceduralPlaybook>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy memory store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn list_procedural_playbooks_for_user(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<ProceduralPlaybook>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy memory store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn update_procedural_playbook_status(
+        &self,
+        _id: Uuid,
+        _status: ProceduralPlaybookStatus,
+    ) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy memory store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn record_consolidation_run(&self, _run: &ConsolidationRun) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy memory store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn update_consolidation_run(&self, _run: &ConsolidationRun) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy memory store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn list_consolidation_runs_for_user(
+        &self,
+        _user_id: Option<&str>,
+    ) -> Result<Vec<ConsolidationRun>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy memory store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn list_pending_episodic_for_consolidation(
+        &self,
+        _limit: i64,
+    ) -> Result<Vec<MemoryRecord>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy memory store not implemented for backend".to_string(),
+        ))
+    }
+}
+
 /// Backend-agnostic database supertrait.
 ///
 /// Combines all sub-traits into one. Existing `Arc<dyn Database>` consumers
@@ -677,6 +803,7 @@ pub trait Database:
     + GoalStore
     + PlanStore
     + AutonomyExecutionStore
+    + AutonomyMemoryStore
     + Send
     + Sync
 {

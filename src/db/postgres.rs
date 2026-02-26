@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use rust_decimal::Decimal;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio_postgres::Row;
 use uuid::Uuid;
@@ -20,11 +21,15 @@ use crate::agent::autonomy::v1::{
     PlannerKind, PolicyDecision, PolicyDecisionKind,
 };
 use crate::agent::routine::{Routine, RoutineRun, RunStatus};
+use crate::agent::{
+    ConsolidationRun, MemoryEvent, MemoryRecord, MemoryRecordStatus, ProceduralPlaybook,
+    ProceduralPlaybookStatus,
+};
 use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
-    AutonomyExecutionStore, ConversationStore, Database, GoalStore, JobStore, PlanStore,
-    RoutineStore, SandboxStore, SettingsStore, ToolFailureStore, WorkspaceStore,
+    AutonomyExecutionStore, AutonomyMemoryStore, ConversationStore, Database, GoalStore, JobStore,
+    PlanStore, RoutineStore, SandboxStore, SettingsStore, ToolFailureStore, WorkspaceStore,
 };
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::history::{
@@ -654,8 +659,414 @@ impl AutonomyExecutionStore for PgBackend {
     }
 }
 
+#[async_trait]
+impl AutonomyMemoryStore for PgBackend {
+    async fn create_memory_record(&self, record: &MemoryRecord) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        let memory_type = enum_json_string(&record.memory_type, "memory_type")?;
+        let source_kind = enum_json_string(&record.source_kind, "memory_source_kind")?;
+        let sensitivity = enum_json_string(&record.sensitivity, "memory_sensitivity")?;
+        let status = enum_json_string(&record.status, "memory_record_status")?;
+
+        conn.execute(
+            r#"
+            INSERT INTO autonomy_memory_records (
+                id, owner_user_id, goal_id, plan_id, plan_step_id, job_id, thread_id,
+                memory_type, source_kind, category, title, summary, payload, provenance,
+                confidence, sensitivity, ttl_secs, status, workspace_doc_path,
+                workspace_document_id, created_at, updated_at, expires_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7,
+                $8, $9, $10, $11, $12, $13, $14,
+                $15, $16, $17, $18, $19,
+                $20, $21, $22, $23
+            )
+            "#,
+            &[
+                &record.id,
+                &record.owner_user_id,
+                &record.goal_id,
+                &record.plan_id,
+                &record.plan_step_id,
+                &record.job_id,
+                &record.thread_id,
+                &memory_type,
+                &source_kind,
+                &record.category,
+                &record.title,
+                &record.summary,
+                &record.payload,
+                &record.provenance,
+                &record.confidence,
+                &sensitivity,
+                &record.ttl_secs,
+                &status,
+                &record.workspace_doc_path,
+                &record.workspace_document_id,
+                &record.created_at,
+                &record.updated_at,
+                &record.expires_at,
+            ],
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn get_memory_record(&self, id: Uuid) -> Result<Option<MemoryRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT * FROM autonomy_memory_records WHERE id = $1",
+                &[&id],
+            )
+            .await?;
+        row.map(|r| row_to_memory_record(&r)).transpose()
+    }
+
+    async fn list_memory_records_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<MemoryRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT * FROM autonomy_memory_records WHERE owner_user_id = $1 ORDER BY created_at DESC, id DESC",
+                &[&user_id],
+            )
+            .await?;
+        rows.iter().map(row_to_memory_record).collect()
+    }
+
+    async fn list_memory_records_for_goal(
+        &self,
+        goal_id: Uuid,
+    ) -> Result<Vec<MemoryRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT * FROM autonomy_memory_records WHERE goal_id = $1 ORDER BY created_at DESC, id DESC",
+                &[&goal_id],
+            )
+            .await?;
+        rows.iter().map(row_to_memory_record).collect()
+    }
+
+    async fn update_memory_record_status(
+        &self,
+        id: Uuid,
+        status: MemoryRecordStatus,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        let status = enum_json_string(&status, "memory_record_status")?;
+        conn.execute(
+            r#"
+            UPDATE autonomy_memory_records
+            SET status = $2, updated_at = NOW()
+            WHERE id = $1
+            "#,
+            &[&id, &status],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn record_memory_event(&self, event: &MemoryEvent) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        let reason_codes = serde_json::to_value(&event.reason_codes)
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+        let action = opt_enum_json_string(event.action.as_ref(), "consolidation_action")?;
+
+        conn.execute(
+            r#"
+            INSERT INTO autonomy_memory_events (
+                id, memory_record_id, event_kind, actor, reason_codes, action, "before", "after", created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9
+            )
+            "#,
+            &[
+                &event.id,
+                &event.memory_record_id,
+                &event.event_kind,
+                &event.actor,
+                &reason_codes,
+                &action,
+                &event.before,
+                &event.after,
+                &event.created_at,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn list_memory_events_for_record(
+        &self,
+        memory_record_id: Uuid,
+    ) -> Result<Vec<MemoryEvent>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                r#"SELECT * FROM autonomy_memory_events WHERE memory_record_id = $1 ORDER BY created_at DESC, id DESC"#,
+                &[&memory_record_id],
+            )
+            .await?;
+        rows.iter().map(row_to_memory_event).collect()
+    }
+
+    async fn create_or_update_procedural_playbook(
+        &self,
+        playbook: &ProceduralPlaybook,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        let status = enum_json_string(&playbook.status, "procedural_playbook_status")?;
+
+        conn.execute(
+            r#"
+            INSERT INTO autonomy_procedural_playbooks (
+                id, owner_user_id, name, task_class, trigger_signals, steps_template,
+                tool_preferences, constraints, success_count, failure_count, confidence,
+                status, requires_approval, source_memory_record_ids, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6,
+                $7, $8, $9, $10, $11,
+                $12, $13, $14, $15, $16
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                owner_user_id = EXCLUDED.owner_user_id,
+                name = EXCLUDED.name,
+                task_class = EXCLUDED.task_class,
+                trigger_signals = EXCLUDED.trigger_signals,
+                steps_template = EXCLUDED.steps_template,
+                tool_preferences = EXCLUDED.tool_preferences,
+                constraints = EXCLUDED.constraints,
+                success_count = EXCLUDED.success_count,
+                failure_count = EXCLUDED.failure_count,
+                confidence = EXCLUDED.confidence,
+                status = EXCLUDED.status,
+                requires_approval = EXCLUDED.requires_approval,
+                source_memory_record_ids = EXCLUDED.source_memory_record_ids,
+                updated_at = EXCLUDED.updated_at
+            "#,
+            &[
+                &playbook.id,
+                &playbook.owner_user_id,
+                &playbook.name,
+                &playbook.task_class,
+                &playbook.trigger_signals,
+                &playbook.steps_template,
+                &playbook.tool_preferences,
+                &playbook.constraints,
+                &playbook.success_count,
+                &playbook.failure_count,
+                &playbook.confidence,
+                &status,
+                &playbook.requires_approval,
+                &playbook.source_memory_record_ids,
+                &playbook.created_at,
+                &playbook.updated_at,
+            ],
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn get_procedural_playbook(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<ProceduralPlaybook>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT * FROM autonomy_procedural_playbooks WHERE id = $1",
+                &[&id],
+            )
+            .await?;
+        row.map(|r| row_to_procedural_playbook(&r)).transpose()
+    }
+
+    async fn list_procedural_playbooks_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<ProceduralPlaybook>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT * FROM autonomy_procedural_playbooks WHERE owner_user_id = $1 ORDER BY updated_at DESC, id DESC",
+                &[&user_id],
+            )
+            .await?;
+        rows.iter().map(row_to_procedural_playbook).collect()
+    }
+
+    async fn update_procedural_playbook_status(
+        &self,
+        id: Uuid,
+        status: ProceduralPlaybookStatus,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        let status = enum_json_string(&status, "procedural_playbook_status")?;
+        conn.execute(
+            r#"
+            UPDATE autonomy_procedural_playbooks
+            SET status = $2, updated_at = NOW()
+            WHERE id = $1
+            "#,
+            &[&id, &status],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn record_consolidation_run(&self, run: &ConsolidationRun) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        let status = enum_json_string(&run.status, "consolidation_run_status")?;
+
+        conn.execute(
+            r#"
+            INSERT INTO autonomy_consolidation_runs (
+                id, owner_user_id, status, started_at, finished_at, batch_size, processed_count,
+                promoted_count, playbooks_created_count, archived_count, error_count,
+                checkpoint_cursor, notes
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7,
+                $8, $9, $10, $11,
+                $12, $13
+            )
+            "#,
+            &[
+                &run.id,
+                &run.owner_user_id,
+                &status,
+                &run.started_at,
+                &run.finished_at,
+                &run.batch_size,
+                &run.processed_count,
+                &run.promoted_count,
+                &run.playbooks_created_count,
+                &run.archived_count,
+                &run.error_count,
+                &run.checkpoint_cursor,
+                &run.notes,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn update_consolidation_run(&self, run: &ConsolidationRun) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        let status = enum_json_string(&run.status, "consolidation_run_status")?;
+        conn.execute(
+            r#"
+            UPDATE autonomy_consolidation_runs
+            SET owner_user_id = $2,
+                status = $3,
+                started_at = $4,
+                finished_at = $5,
+                batch_size = $6,
+                processed_count = $7,
+                promoted_count = $8,
+                playbooks_created_count = $9,
+                archived_count = $10,
+                error_count = $11,
+                checkpoint_cursor = $12,
+                notes = $13
+            WHERE id = $1
+            "#,
+            &[
+                &run.id,
+                &run.owner_user_id,
+                &status,
+                &run.started_at,
+                &run.finished_at,
+                &run.batch_size,
+                &run.processed_count,
+                &run.promoted_count,
+                &run.playbooks_created_count,
+                &run.archived_count,
+                &run.error_count,
+                &run.checkpoint_cursor,
+                &run.notes,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn list_consolidation_runs_for_user(
+        &self,
+        user_id: Option<&str>,
+    ) -> Result<Vec<ConsolidationRun>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = if let Some(user_id) = user_id {
+            conn.query(
+                "SELECT * FROM autonomy_consolidation_runs WHERE owner_user_id = $1 ORDER BY started_at DESC, id DESC",
+                &[&user_id],
+            )
+            .await?
+        } else {
+            conn.query(
+                "SELECT * FROM autonomy_consolidation_runs ORDER BY started_at DESC, id DESC",
+                &[],
+            )
+            .await?
+        };
+        rows.iter().map(row_to_consolidation_run).collect()
+    }
+
+    async fn list_pending_episodic_for_consolidation(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<MemoryRecord>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT * FROM autonomy_memory_records
+                WHERE memory_type = $1
+                  AND status = $2
+                  AND (expires_at IS NULL OR expires_at > NOW())
+                ORDER BY created_at ASC, id ASC
+                LIMIT $3
+                "#,
+                &[&"episodic", &"active", &limit],
+            )
+            .await?;
+        rows.iter().map(row_to_memory_record).collect()
+    }
+}
+
 fn enum_parse_error(kind: &str, value: &str) -> DatabaseError {
     DatabaseError::Serialization(format!("invalid autonomy {} value: {}", kind, value))
+}
+
+fn enum_json_string<T: Serialize>(value: &T, kind: &str) -> Result<String, DatabaseError> {
+    match serde_json::to_value(value).map_err(|e| DatabaseError::Serialization(e.to_string()))? {
+        Value::String(s) => Ok(s),
+        other => Err(DatabaseError::Serialization(format!(
+            "invalid autonomy {} enum encoding: {}",
+            kind, other
+        ))),
+    }
+}
+
+fn enum_json_parse<T: DeserializeOwned>(value: &str, kind: &str) -> Result<T, DatabaseError> {
+    serde_json::from_value(Value::String(value.to_string())).map_err(|e| {
+        DatabaseError::Serialization(format!(
+            "invalid autonomy {} value '{}': {}",
+            kind, value, e
+        ))
+    })
+}
+
+fn opt_enum_json_string<T: Serialize>(
+    value: Option<&T>,
+    kind: &str,
+) -> Result<Option<String>, DatabaseError> {
+    value.map(|v| enum_json_string(v, kind)).transpose()
 }
 
 fn goal_status_to_str(value: GoalStatus) -> &'static str {
@@ -1042,6 +1453,102 @@ fn row_to_plan_verification(row: &Row) -> Result<PlanVerification, DatabaseError
         checks: row.get("checks"),
         evidence: row.get("evidence"),
         created_at: row.get("created_at"),
+    })
+}
+
+fn row_to_memory_record(row: &Row) -> Result<MemoryRecord, DatabaseError> {
+    let memory_type: String = row.get("memory_type");
+    let source_kind: String = row.get("source_kind");
+    let sensitivity: String = row.get("sensitivity");
+    let status: String = row.get("status");
+
+    Ok(MemoryRecord {
+        id: row.get("id"),
+        owner_user_id: row.get("owner_user_id"),
+        goal_id: row.get("goal_id"),
+        plan_id: row.get("plan_id"),
+        plan_step_id: row.get("plan_step_id"),
+        job_id: row.get("job_id"),
+        thread_id: row.get("thread_id"),
+        memory_type: enum_json_parse(&memory_type, "memory_type")?,
+        source_kind: enum_json_parse(&source_kind, "memory_source_kind")?,
+        category: row.get("category"),
+        title: row.get("title"),
+        summary: row.get("summary"),
+        payload: row.get("payload"),
+        provenance: row.get("provenance"),
+        confidence: row.get("confidence"),
+        sensitivity: enum_json_parse(&sensitivity, "memory_sensitivity")?,
+        ttl_secs: row.get("ttl_secs"),
+        status: enum_json_parse(&status, "memory_record_status")?,
+        workspace_doc_path: row.get("workspace_doc_path"),
+        workspace_document_id: row.get("workspace_document_id"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        expires_at: row.get("expires_at"),
+    })
+}
+
+fn row_to_memory_event(row: &Row) -> Result<MemoryEvent, DatabaseError> {
+    let reason_codes: Value = row.get("reason_codes");
+    let action: Option<String> = row.get("action");
+
+    Ok(MemoryEvent {
+        id: row.get("id"),
+        memory_record_id: row.get("memory_record_id"),
+        event_kind: row.get("event_kind"),
+        actor: row.get("actor"),
+        reason_codes: json_value_to_string_vec(reason_codes, "memory_event.reason_codes")?,
+        action: action
+            .as_deref()
+            .map(|s| enum_json_parse(s, "consolidation_action"))
+            .transpose()?,
+        before: row.get("before"),
+        after: row.get("after"),
+        created_at: row.get("created_at"),
+    })
+}
+
+fn row_to_procedural_playbook(row: &Row) -> Result<ProceduralPlaybook, DatabaseError> {
+    let status: String = row.get("status");
+
+    Ok(ProceduralPlaybook {
+        id: row.get("id"),
+        owner_user_id: row.get("owner_user_id"),
+        name: row.get("name"),
+        task_class: row.get("task_class"),
+        trigger_signals: row.get("trigger_signals"),
+        steps_template: row.get("steps_template"),
+        tool_preferences: row.get("tool_preferences"),
+        constraints: row.get("constraints"),
+        success_count: row.get("success_count"),
+        failure_count: row.get("failure_count"),
+        confidence: row.get("confidence"),
+        status: enum_json_parse(&status, "procedural_playbook_status")?,
+        requires_approval: row.get("requires_approval"),
+        source_memory_record_ids: row.get("source_memory_record_ids"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_consolidation_run(row: &Row) -> Result<ConsolidationRun, DatabaseError> {
+    let status: String = row.get("status");
+
+    Ok(ConsolidationRun {
+        id: row.get("id"),
+        owner_user_id: row.get("owner_user_id"),
+        status: enum_json_parse(&status, "consolidation_run_status")?,
+        started_at: row.get("started_at"),
+        finished_at: row.get("finished_at"),
+        batch_size: row.get("batch_size"),
+        processed_count: row.get("processed_count"),
+        promoted_count: row.get("promoted_count"),
+        playbooks_created_count: row.get("playbooks_created_count"),
+        archived_count: row.get("archived_count"),
+        error_count: row.get("error_count"),
+        checkpoint_cursor: row.get("checkpoint_cursor"),
+        notes: row.get("notes"),
     })
 }
 

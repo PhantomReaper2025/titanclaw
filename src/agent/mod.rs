@@ -22,6 +22,7 @@ mod heartbeat;
 pub mod job_monitor;
 pub mod kernel_monitor;
 pub mod kernel_orchestrator;
+pub mod memory_plane;
 mod planner_v1;
 mod policy_engine;
 pub mod profile_onboarding;
@@ -53,6 +54,11 @@ pub use autonomy::v1::{
 pub use compaction::{CompactionResult, ContextCompactor};
 pub use context_monitor::{CompactionStrategy, ContextBreakdown, ContextMonitor};
 pub use heartbeat::{HeartbeatConfig, HeartbeatResult, HeartbeatRunner, spawn_heartbeat};
+pub use memory_plane::{
+    ConsolidationAction, ConsolidationRun, ConsolidationRunStatus, MemoryEvent, MemoryRecord,
+    MemoryRecordStatus, MemorySensitivity, MemorySourceKind, MemoryType, ProceduralPlaybook,
+    ProceduralPlaybookStatus,
+};
 pub use profile_onboarding::ProfileOnboardingManager;
 pub use profile_synthesizer::{ProfileSynthesisConfig, ProfileSynthesizer};
 pub use router::{MessageIntent, Router};

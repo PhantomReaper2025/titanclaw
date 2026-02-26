@@ -758,6 +758,107 @@ CREATE INDEX IF NOT EXISTS idx_autonomy_incidents_status_created
 CREATE INDEX IF NOT EXISTS idx_autonomy_incidents_type_severity_created
     ON autonomy_incidents(incident_type, severity, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS autonomy_memory_records (
+    id TEXT PRIMARY KEY,
+    owner_user_id TEXT NOT NULL,
+    goal_id TEXT REFERENCES autonomy_goals(id) ON DELETE SET NULL,
+    plan_id TEXT REFERENCES autonomy_plans(id) ON DELETE SET NULL,
+    plan_step_id TEXT REFERENCES autonomy_plan_steps(id) ON DELETE SET NULL,
+    job_id TEXT,
+    thread_id TEXT,
+    memory_type TEXT NOT NULL,
+    source_kind TEXT NOT NULL,
+    category TEXT NOT NULL,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    provenance TEXT NOT NULL DEFAULT '{}',
+    confidence REAL NOT NULL DEFAULT 0,
+    sensitivity TEXT NOT NULL,
+    ttl_secs INTEGER,
+    status TEXT NOT NULL,
+    workspace_doc_path TEXT,
+    workspace_document_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS autonomy_memory_events (
+    id TEXT PRIMARY KEY,
+    memory_record_id TEXT NOT NULL REFERENCES autonomy_memory_records(id) ON DELETE CASCADE,
+    event_kind TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    reason_codes TEXT NOT NULL DEFAULT '[]',
+    action TEXT,
+    "before" TEXT NOT NULL DEFAULT '{}',
+    "after" TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS autonomy_procedural_playbooks (
+    id TEXT PRIMARY KEY,
+    owner_user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    task_class TEXT NOT NULL,
+    trigger_signals TEXT NOT NULL DEFAULT '{}',
+    steps_template TEXT NOT NULL DEFAULT '[]',
+    tool_preferences TEXT NOT NULL DEFAULT '{}',
+    constraints TEXT NOT NULL DEFAULT '{}',
+    success_count INTEGER NOT NULL DEFAULT 0,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    confidence REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    requires_approval INTEGER NOT NULL DEFAULT 0,
+    source_memory_record_ids TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS autonomy_consolidation_runs (
+    id TEXT PRIMARY KEY,
+    owner_user_id TEXT,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at TEXT,
+    batch_size INTEGER NOT NULL DEFAULT 0,
+    processed_count INTEGER NOT NULL DEFAULT 0,
+    promoted_count INTEGER NOT NULL DEFAULT 0,
+    playbooks_created_count INTEGER NOT NULL DEFAULT 0,
+    archived_count INTEGER NOT NULL DEFAULT 0,
+    error_count INTEGER NOT NULL DEFAULT 0,
+    checkpoint_cursor TEXT,
+    notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_autonomy_memory_records_owner_type_created
+    ON autonomy_memory_records(owner_user_id, memory_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_autonomy_memory_records_owner_status_created
+    ON autonomy_memory_records(owner_user_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_autonomy_memory_records_goal_created
+    ON autonomy_memory_records(goal_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_autonomy_memory_records_plan_created
+    ON autonomy_memory_records(plan_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_autonomy_memory_records_expires_at
+    ON autonomy_memory_records(expires_at);
+CREATE INDEX IF NOT EXISTS idx_autonomy_memory_records_type_status_created
+    ON autonomy_memory_records(memory_type, status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_autonomy_memory_events_record_created
+    ON autonomy_memory_events(memory_record_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_autonomy_memory_events_kind_created
+    ON autonomy_memory_events(event_kind, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_autonomy_procedural_playbooks_owner_task_status
+    ON autonomy_procedural_playbooks(owner_user_id, task_class, status);
+CREATE INDEX IF NOT EXISTS idx_autonomy_procedural_playbooks_status_updated
+    ON autonomy_procedural_playbooks(status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_autonomy_consolidation_runs_owner_started
+    ON autonomy_consolidation_runs(owner_user_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_autonomy_consolidation_runs_status_started
+    ON autonomy_consolidation_runs(status, started_at DESC);
+
 -- ==================== Seed data ====================
 
 -- Pre-populate leak detection patterns (matches PostgreSQL V2 migration).
