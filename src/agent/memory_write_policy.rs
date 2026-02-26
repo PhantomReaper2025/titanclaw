@@ -7,7 +7,7 @@ use crate::agent::{
 };
 
 #[derive(Debug, Clone)]
-pub(super) struct MemoryWritePolicyConfig {
+pub(crate) struct MemoryWritePolicyConfig {
     pub working_ttl_secs: i64,
     pub episodic_ttl_secs: i64,
 }
@@ -22,7 +22,7 @@ impl Default for MemoryWritePolicyConfig {
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum MemoryWriteIntent {
+pub(crate) enum MemoryWriteIntent {
     WorkerStepOutcome {
         success: bool,
     },
@@ -48,7 +48,7 @@ pub(super) enum MemoryWriteIntent {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct MemoryWriteCandidate {
+pub(crate) struct MemoryWriteCandidate {
     pub source_kind: MemorySourceKind,
     pub category: String,
     pub title: String,
@@ -64,7 +64,7 @@ pub(super) struct MemoryWriteCandidate {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct MemoryWriteDecision {
+pub(crate) struct MemoryWriteDecision {
     pub allow: bool,
     pub memory_type: MemoryType,
     pub status: MemoryRecordStatus,
@@ -75,16 +75,16 @@ pub(super) struct MemoryWriteDecision {
     pub required_provenance_fields: Vec<String>,
 }
 
-pub(super) struct MemoryWritePolicyEngine {
+pub(crate) struct MemoryWritePolicyEngine {
     cfg: MemoryWritePolicyConfig,
 }
 
 impl MemoryWritePolicyEngine {
-    pub(super) fn new(cfg: MemoryWritePolicyConfig) -> Self {
+    pub(crate) fn new(cfg: MemoryWritePolicyConfig) -> Self {
         Self { cfg }
     }
 
-    pub(super) fn classify(&self, candidate: &MemoryWriteCandidate) -> MemoryWriteDecision {
+    pub(crate) fn classify(&self, candidate: &MemoryWriteCandidate) -> MemoryWriteDecision {
         let mut decision = MemoryWriteDecision {
             allow: true,
             memory_type: candidate

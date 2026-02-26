@@ -8,6 +8,8 @@ use futures::future::join_all;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::agent::memory_plane::{MemoryRecordWriteRequest, persist_memory_record_best_effort};
+use crate::agent::memory_write_policy::MemoryWriteIntent;
 use crate::agent::planner_v1::PlannerV1;
 use crate::agent::policy_engine::{
     ApprovalPolicyOutcome, HookToolPolicyOutcome, evaluate_tool_call_hook,
@@ -21,7 +23,7 @@ use crate::agent::{
     Evidence as AutonomyEvidence, EvidenceKind as AutonomyEvidenceKind,
     ExecutionAttempt as AutonomyExecutionAttempt,
     ExecutionAttemptStatus as AutonomyExecutionAttemptStatus, Goal, GoalRiskClass, GoalSource,
-    GoalStatus, Plan, PlanStatus, PlanStep, PlanStepKind, PlanStepStatus,
+    GoalStatus, MemorySourceKind, Plan, PlanStatus, PlanStep, PlanStepKind, PlanStepStatus,
     PlanVerification as AutonomyPlanVerification,
     PlanVerificationStatus as AutonomyPlanVerificationStatus, PlannerKind,
     PolicyDecision as AutonomyPolicyDecision, PolicyDecisionKind as AutonomyPolicyDecisionKind,
@@ -53,6 +55,7 @@ pub struct WorkerDeps {
     pub autonomy_policy_engine_v1: bool,
     pub autonomy_verifier_v1: bool,
     pub autonomy_replanner_v1: bool,
+    pub autonomy_memory_plane_v2: bool,
 }
 
 /// Worker that executes a single job.
@@ -192,6 +195,49 @@ fn persist_worker_policy_decision_best_effort(
     let Some(store) = deps.store.clone() else {
         return;
     };
+    if deps.autonomy_memory_plane_v2 {
+        persist_memory_record_best_effort(
+            store.clone(),
+            MemoryRecordWriteRequest {
+                owner_user_id: job_ctx.user_id.clone(),
+                goal_id: job_ctx.autonomy_goal_id,
+                plan_id: job_ctx.autonomy_plan_id,
+                plan_step_id: job_ctx.autonomy_plan_step_id,
+                job_id: Some(job_ctx.job_id),
+                thread_id: None,
+                source_kind: MemorySourceKind::WorkerPlanExecution,
+                category: "policy_decision".to_string(),
+                title: format!("Worker policy {:?} for {}", decision, tool_name),
+                summary: format!(
+                    "Worker policy {:?} on tool '{}' ({})",
+                    decision, tool_name, action_kind
+                ),
+                payload: serde_json::json!({
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "decision": decision,
+                    "reason_codes": reason_codes.clone(),
+                    "requires_approval": requires_approval,
+                    "auto_approved": auto_approved,
+                    "action_kind": action_kind,
+                    "evidence_required": evidence_required,
+                }),
+                provenance: serde_json::json!({
+                    "source": "worker.persist_worker_policy_decision_best_effort",
+                    "timestamp": Utc::now(),
+                }),
+                desired_memory_type: None,
+                confidence_hint: None,
+                sensitivity_hint: None,
+                ttl_secs_hint: None,
+                high_impact: false,
+                intent: MemoryWriteIntent::PolicyOutcome {
+                    denied: matches!(decision, AutonomyPolicyDecisionKind::Deny),
+                    requires_approval,
+                },
+            },
+        );
+    }
     let record = AutonomyPolicyDecision {
         id: Uuid::new_v4(),
         goal_id: job_ctx.autonomy_goal_id,
@@ -256,6 +302,10 @@ impl Worker {
 
     fn autonomy_verifier_v1(&self) -> bool {
         self.deps.autonomy_verifier_v1
+    }
+
+    fn autonomy_memory_plane_v2(&self) -> bool {
+        self.deps.autonomy_memory_plane_v2
     }
 
     fn autonomy_replanner_v1(&self) -> bool {
@@ -648,7 +698,7 @@ impl Worker {
             goal_id: Some(persisted.goal_id),
             plan_id: persisted.plan_id,
             job_id: Some(self.job_id),
-            user_id,
+            user_id: user_id.clone(),
             channel: "worker".to_string(),
             verifier_kind: verifier_kind.to_string(),
             status,
@@ -668,6 +718,61 @@ impl Worker {
                 e
             );
         }
+
+        if self.autonomy_memory_plane_v2() {
+            persist_memory_record_best_effort(
+                store.clone(),
+                MemoryRecordWriteRequest {
+                    owner_user_id: user_id,
+                    goal_id: Some(persisted.goal_id),
+                    plan_id: Some(persisted.plan_id),
+                    plan_step_id: None,
+                    job_id: Some(self.job_id),
+                    thread_id: None,
+                    source_kind: MemorySourceKind::WorkerPlanExecution,
+                    category: "verifier_outcome".to_string(),
+                    title: format!("Verifier {}: {}", verifier_kind, verification.summary),
+                    summary: verification.summary.clone(),
+                    payload: serde_json::json!({
+                        "verifier_kind": verifier_kind,
+                        "status": verification.status,
+                        "completion_claimed": completion_claimed,
+                        "evidence_count": evidence_count,
+                        "checks": verification.checks,
+                        "evidence": verification.evidence,
+                    }),
+                    provenance: serde_json::json!({
+                        "source": "worker.record_plan_verification_best_effort",
+                        "timestamp": verification.created_at,
+                        "plan_verification_id": verification.id,
+                    }),
+                    desired_memory_type: None,
+                    confidence_hint: None,
+                    sensitivity_hint: None,
+                    ttl_secs_hint: None,
+                    high_impact: false,
+                    intent: MemoryWriteIntent::VerifierOutcome {
+                        passed: matches!(status, AutonomyPlanVerificationStatus::Passed),
+                        high_risk: false,
+                        contradiction_detected: matches!(
+                            status,
+                            AutonomyPlanVerificationStatus::Failed
+                                | AutonomyPlanVerificationStatus::Inconclusive
+                        ),
+                    },
+                },
+            );
+        }
+    }
+
+    fn persist_worker_memory_record_best_effort(&self, request: MemoryRecordWriteRequest) {
+        if !self.autonomy_memory_plane_v2() {
+            return;
+        }
+        let Some(store) = self.store().cloned() else {
+            return;
+        };
+        persist_memory_record_best_effort(store, request);
     }
 
     async fn load_goal_verifier_context(
@@ -1479,6 +1584,15 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         let mut failed_steps = 0usize;
         let mut step_outcomes = Vec::<serde_json::Value>::with_capacity(plan.actions.len());
         let mut step_evidence = Vec::<AutonomyEvidence>::with_capacity(plan.actions.len());
+        let memory_user_id = if self.autonomy_memory_plane_v2() {
+            self.context_manager()
+                .get_context(self.job_id)
+                .await
+                .map(|ctx| ctx.user_id)
+                .unwrap_or_else(|_| "default".to_string())
+        } else {
+            String::new()
+        };
         for (i, action) in plan.actions.iter().enumerate() {
             // Check for stop signal
             if let Ok(msg) = rx.try_recv() {
@@ -1567,6 +1681,57 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 "command": action.parameters.get("command").and_then(|v| v.as_str()),
             });
             step_outcomes.push(step_payload.clone());
+            if self.autonomy_memory_plane_v2() {
+                let (goal_id, plan_id, plan_step_id) = persisted_plan
+                    .map(|p| (Some(p.goal_id), Some(p.plan_id), p.step_ids.get(i).copied()))
+                    .unwrap_or((None, None, None));
+                self.persist_worker_memory_record_best_effort(MemoryRecordWriteRequest {
+                    owner_user_id: memory_user_id.clone(),
+                    goal_id,
+                    plan_id,
+                    plan_step_id,
+                    job_id: Some(self.job_id),
+                    thread_id: None,
+                    source_kind: MemorySourceKind::WorkerPlanExecution,
+                    category: "worker_step_outcome".to_string(),
+                    title: format!(
+                        "Planned step {} {} ({})",
+                        i + 1,
+                        if step_succeeded {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        },
+                        action.tool_name
+                    ),
+                    summary: format!(
+                        "Step {}/{} {} in {}ms: {}",
+                        i + 1,
+                        plan.actions.len(),
+                        if step_succeeded {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        },
+                        elapsed_ms,
+                        action.reasoning.chars().take(160).collect::<String>()
+                    ),
+                    payload: step_payload.clone(),
+                    provenance: serde_json::json!({
+                        "source": "worker.execute_plan",
+                        "timestamp": started_at,
+                        "tool_call_id": format!("plan_{}_{}", self.job_id, i),
+                    }),
+                    desired_memory_type: None,
+                    confidence_hint: None,
+                    sensitivity_hint: None,
+                    ttl_secs_hint: None,
+                    high_impact: false,
+                    intent: MemoryWriteIntent::WorkerStepOutcome {
+                        success: step_succeeded,
+                    },
+                });
+            }
             step_evidence.push(AutonomyEvidence {
                 kind: evidence_class.kind,
                 source: format!("worker.plan_step.{}", i),
@@ -1672,6 +1837,39 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             if self.autonomy_replanner_v1()
                 && let Some((reason, detail)) = step_replan_request
             {
+                if self.autonomy_memory_plane_v2() {
+                    let (goal_id, plan_id, plan_step_id) = persisted_plan
+                        .map(|p| (Some(p.goal_id), Some(p.plan_id), p.step_ids.get(i).copied()))
+                        .unwrap_or((None, None, None));
+                    self.persist_worker_memory_record_best_effort(MemoryRecordWriteRequest {
+                        owner_user_id: memory_user_id.clone(),
+                        goal_id,
+                        plan_id,
+                        plan_step_id,
+                        job_id: Some(self.job_id),
+                        thread_id: None,
+                        source_kind: MemorySourceKind::WorkerPlanExecution,
+                        category: "replan_event".to_string(),
+                        title: format!("Automatic replan requested after step {}", i + 1),
+                        summary: detail.clone(),
+                        payload: serde_json::json!({
+                            "reason": reason.code(),
+                            "detail": detail,
+                            "step_index": i,
+                            "tool_name": action.tool_name,
+                        }),
+                        provenance: serde_json::json!({
+                            "source": "worker.execute_plan",
+                            "timestamp": Utc::now(),
+                        }),
+                        desired_memory_type: None,
+                        confidence_hint: None,
+                        sensitivity_hint: None,
+                        ttl_secs_hint: None,
+                        high_impact: false,
+                        intent: MemoryWriteIntent::Generic,
+                    });
+                }
                 tracing::info!(
                     job = %self.job_id,
                     replan_reason = reason.code(),
@@ -1846,6 +2044,41 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             && let Some((reason, detail)) = replan_request
             && persisted_plan.is_some()
         {
+            if self.autonomy_memory_plane_v2() {
+                let (goal_id, plan_id) = persisted_plan
+                    .map(|p| (Some(p.goal_id), Some(p.plan_id)))
+                    .unwrap_or((None, None));
+                self.persist_worker_memory_record_best_effort(MemoryRecordWriteRequest {
+                    owner_user_id: memory_user_id,
+                    goal_id,
+                    plan_id,
+                    plan_step_id: None,
+                    job_id: Some(self.job_id),
+                    thread_id: None,
+                    source_kind: MemorySourceKind::WorkerPlanExecution,
+                    category: "replan_event".to_string(),
+                    title: "Automatic replan requested after planned execution".to_string(),
+                    summary: detail.clone(),
+                    payload: serde_json::json!({
+                        "reason": reason.code(),
+                        "detail": detail,
+                        "completion_claimed": completion_claimed,
+                        "failed_steps": failed_steps,
+                        "executed_steps": executed_steps,
+                        "planned_steps": plan.actions.len(),
+                    }),
+                    provenance: serde_json::json!({
+                        "source": "worker.execute_plan",
+                        "timestamp": Utc::now(),
+                    }),
+                    desired_memory_type: None,
+                    confidence_hint: None,
+                    sensitivity_hint: None,
+                    ttl_secs_hint: None,
+                    high_impact: false,
+                    intent: MemoryWriteIntent::Generic,
+                });
+            }
             return Ok(PlanExecutionOutcome::ReplanRequested { reason, detail });
         }
 
@@ -2293,6 +2526,7 @@ mod tests {
                 autonomy_policy_engine_v1: true,
                 autonomy_verifier_v1: true,
                 autonomy_replanner_v1: true,
+                autonomy_memory_plane_v2: false,
             },
         );
 
@@ -2502,6 +2736,7 @@ mod tests {
                 autonomy_policy_engine_v1: true,
                 autonomy_verifier_v1: true,
                 autonomy_replanner_v1: true,
+                autonomy_memory_plane_v2: false,
             },
         );
 
@@ -2651,6 +2886,7 @@ mod tests {
             autonomy_policy_engine_v1: true,
             autonomy_verifier_v1: true,
             autonomy_replanner_v1: true,
+            autonomy_memory_plane_v2: false,
         };
 
         let err =

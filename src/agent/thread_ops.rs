@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::agent::Agent;
+use crate::agent::MemorySourceKind;
 use crate::agent::PolicyDecision as AutonomyPolicyDecision;
 use crate::agent::autonomy_telemetry::{
     PolicyDecisionKind as TelemetryPolicyDecisionKind, PolicyDecisionRecord, emit_policy_decision,
@@ -17,6 +18,8 @@ use crate::agent::autonomy_telemetry::{
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context_monitor::CompactionStrategy;
 use crate::agent::dispatcher::{AgenticLoopResult, detect_auth_awaiting, parse_auth_result};
+use crate::agent::memory_plane::{MemoryRecordWriteRequest, persist_memory_record_best_effort};
+use crate::agent::memory_write_policy::MemoryWriteIntent;
 use crate::agent::policy_engine::{
     ApprovalPolicyOutcome, HookToolPolicyOutcome, evaluate_dispatcher_tool_approval,
     evaluate_tool_call_hook, map_policy_decision_kind,
@@ -57,6 +60,51 @@ fn persist_chat_policy_decision_best_effort(
     let Some(store) = agent.store().cloned() else {
         return;
     };
+    if agent.config.autonomy_memory_plane_v2 {
+        persist_memory_record_best_effort(
+            store.clone(),
+            MemoryRecordWriteRequest {
+                owner_user_id: message.user_id.clone(),
+                goal_id: job_ctx.autonomy_goal_id,
+                plan_id: job_ctx.autonomy_plan_id,
+                plan_step_id: job_ctx.autonomy_plan_step_id,
+                job_id: Some(job_ctx.job_id),
+                thread_id: Some(thread_id),
+                source_kind: MemorySourceKind::ApprovalFlow,
+                category: "policy_decision".to_string(),
+                title: format!("Approval flow policy {:?} for {}", decision, tool_name),
+                summary: format!(
+                    "Approval flow policy {:?} on tool '{}' (call {}) via {}",
+                    decision, tool_name, tool_call_id, action_kind
+                ),
+                payload: serde_json::json!({
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "decision": decision,
+                    "reason_codes": reason_codes.clone(),
+                    "auto_approved": auto_approved,
+                    "action_kind": action_kind,
+                    "channel": message.channel.clone(),
+                }),
+                provenance: serde_json::json!({
+                    "source": "thread_ops.persist_chat_policy_decision_best_effort",
+                    "timestamp": Utc::now(),
+                }),
+                desired_memory_type: None,
+                confidence_hint: None,
+                sensitivity_hint: None,
+                ttl_secs_hint: None,
+                high_impact: false,
+                intent: MemoryWriteIntent::PolicyOutcome {
+                    denied: matches!(decision, TelemetryPolicyDecisionKind::Deny),
+                    requires_approval: matches!(
+                        decision,
+                        TelemetryPolicyDecisionKind::RequireApproval
+                    ),
+                },
+            },
+        );
+    }
     let record = AutonomyPolicyDecision {
         id: Uuid::new_v4(),
         goal_id: job_ctx.autonomy_goal_id,

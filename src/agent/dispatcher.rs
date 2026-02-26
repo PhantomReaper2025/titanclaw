@@ -15,6 +15,8 @@ use crate::agent::autonomy_telemetry::{
     PolicyDecisionKind as TelemetryPolicyDecisionKind, PolicyDecisionRecord, classify_failure,
     elapsed_ms, emit_execution_attempt, emit_policy_decision, truncate_error_preview,
 };
+use crate::agent::memory_plane::{MemoryRecordWriteRequest, persist_memory_record_best_effort};
+use crate::agent::memory_write_policy::MemoryWriteIntent;
 use crate::agent::policy_engine::{
     ApprovalPolicyOutcome, HookToolPolicyOutcome, evaluate_dispatcher_tool_approval,
     evaluate_tool_call_hook,
@@ -22,7 +24,7 @@ use crate::agent::policy_engine::{
 use crate::agent::session::{PendingApproval, Session, ThreadState};
 use crate::agent::{
     Agent, ExecutionAttempt as AutonomyExecutionAttempt,
-    ExecutionAttemptStatus as AutonomyExecutionAttemptStatus,
+    ExecutionAttemptStatus as AutonomyExecutionAttemptStatus, MemorySourceKind,
     PolicyDecision as AutonomyPolicyDecision, PolicyDecisionKind as AutonomyPolicyDecisionKind,
 };
 use crate::channels::{IncomingMessage, StatusUpdate};
@@ -135,6 +137,50 @@ fn persist_policy_decision_best_effort(
     let Some(store) = agent.store().cloned() else {
         return;
     };
+    if agent.config.autonomy_memory_plane_v2 {
+        persist_memory_record_best_effort(
+            store.clone(),
+            MemoryRecordWriteRequest {
+                owner_user_id: message.user_id.clone(),
+                goal_id: job_ctx.autonomy_goal_id,
+                plan_id: job_ctx.autonomy_plan_id,
+                plan_step_id: job_ctx.autonomy_plan_step_id,
+                job_id: Some(job_ctx.job_id),
+                thread_id: None,
+                source_kind: MemorySourceKind::DispatcherToolExecution,
+                category: "policy_decision".to_string(),
+                title: format!("Dispatcher policy {:?} for {}", decision, tool_name),
+                summary: format!(
+                    "Dispatcher policy {:?} on tool '{}' (call {})",
+                    decision, tool_name, tool_call_id
+                ),
+                payload: serde_json::json!({
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "decision": decision,
+                    "reason_codes": reason_codes.clone(),
+                    "auto_approved": auto_approved,
+                    "channel": message.channel.clone(),
+                }),
+                provenance: serde_json::json!({
+                    "source": "dispatcher.persist_policy_decision_best_effort",
+                    "timestamp": Utc::now(),
+                }),
+                desired_memory_type: None,
+                confidence_hint: None,
+                sensitivity_hint: None,
+                ttl_secs_hint: None,
+                high_impact: false,
+                intent: MemoryWriteIntent::PolicyOutcome {
+                    denied: matches!(decision, TelemetryPolicyDecisionKind::Deny),
+                    requires_approval: matches!(
+                        decision,
+                        TelemetryPolicyDecisionKind::RequireApproval
+                    ),
+                },
+            },
+        );
+    }
     let record = AutonomyPolicyDecision {
         id: Uuid::new_v4(),
         goal_id: job_ctx.autonomy_goal_id,
