@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added user-scoped Phase 2 Memory Plane v2 gateway inspection/ops endpoints (`/api/memory-plane/*`) for memory records/playbooks, playbook status updates, consolidation run listing/manual trigger, and retrieval preview, including ownership checks plus filter/sort/pagination validation and targeted handler tests.
 - Added `titanclaw memory-plane` CLI inspection/ops commands for Memory Plane v2 (records/playbooks/consolidation/retrieval preview) with user-scoped ownership checks, sort/filter/pagination validation, and parser/helper tests.
 - Completed Phase 2 Memory Plane v2 acceptance/stabilization pass: added runtime assertions for worker and approval-flow memory-plane writes (plus flag-off no-write behavior), and ran the validation matrix across memory modules, runtime modules, gateway memory-plane handlers, CLI memory-plane tests, and `cargo check`.
+- Phase 3 Tooling System v2 / reliability foundations (slice 1): added typed Tool Contract V2 and reliability profile domain structs (`src/tools/contract_v2.rs`), introduced `AutonomyReliabilityStore` in the DB layer, implemented PostgreSQL + libSQL CRUD foundations for incidents (including Phase 3 dedupe/reliability fields), tool contract overrides, and tool reliability profiles, and added schema migrations `V24`-`V27` plus libSQL schema mirror/compatibility patching for extended `autonomy_incidents` columns.
 
 ### Changed
 

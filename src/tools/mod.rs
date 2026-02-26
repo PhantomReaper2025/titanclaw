@@ -9,6 +9,7 @@
 
 pub mod builder;
 pub mod builtin;
+pub mod contract_v2;
 pub mod mcp;
 pub mod wasm;
 
@@ -19,6 +20,11 @@ pub use builder::{
     BuildPhase, BuildRequirement, BuildResult, BuildSoftwareTool, BuilderConfig, Language,
     LlmSoftwareBuilder, SoftwareBuilder, SoftwareType, Template, TemplateEngine, TemplateType,
     TestCase, TestHarness, TestResult, TestSuite, ValidationError, ValidationResult, WasmValidator,
+};
+pub use contract_v2::{
+    CircuitBreakerState, ToolContractOverrideSource, ToolContractSource, ToolContractV2Descriptor,
+    ToolContractV2Override, ToolDryRunSupport, ToolIdempotency, ToolReliabilityProfile,
+    ToolSideEffectLevel,
 };
 pub use registry::ToolRegistry;
 pub use tool::{Tool, ToolDomain, ToolError, ToolOutput, ToolStreamCallback};

@@ -740,6 +740,13 @@ CREATE TABLE IF NOT EXISTS autonomy_incidents (
     incident_type TEXT NOT NULL,
     severity TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'open',
+    fingerprint TEXT,
+    surface TEXT,
+    tool_name TEXT,
+    occurrence_count INTEGER NOT NULL DEFAULT 1,
+    first_seen_at TEXT,
+    last_seen_at TEXT,
+    last_failure_class TEXT,
     summary TEXT NOT NULL,
     details TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -757,6 +764,62 @@ CREATE INDEX IF NOT EXISTS idx_autonomy_incidents_status_created
     ON autonomy_incidents(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_autonomy_incidents_type_severity_created
     ON autonomy_incidents(incident_type, severity, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_autonomy_incidents_fingerprint_status_last_seen
+    ON autonomy_incidents(fingerprint, status, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_autonomy_incidents_tool_name_status_last_seen
+    ON autonomy_incidents(tool_name, status, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_autonomy_incidents_user_created
+    ON autonomy_incidents(user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS tool_contract_v2_overrides (
+    id TEXT PRIMARY KEY,
+    tool_name TEXT NOT NULL,
+    owner_user_id TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    descriptor_json TEXT NOT NULL,
+    source TEXT NOT NULL,
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS tool_reliability_profiles (
+    tool_name TEXT PRIMARY KEY,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    timeout_count INTEGER NOT NULL DEFAULT 0,
+    blocked_count INTEGER NOT NULL DEFAULT 0,
+    success_rate REAL NOT NULL DEFAULT 0,
+    p50_latency_ms INTEGER,
+    p95_latency_ms INTEGER,
+    common_failure_modes TEXT NOT NULL DEFAULT '[]',
+    recent_incident_count INTEGER NOT NULL DEFAULT 0,
+    reliability_score REAL NOT NULL DEFAULT 0,
+    safe_fallback_options TEXT NOT NULL DEFAULT '[]',
+    breaker_state TEXT NOT NULL DEFAULT 'closed',
+    cooldown_until TEXT,
+    last_failure_at TEXT,
+    last_success_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_contract_v2_overrides_tool_owner_unique
+    ON tool_contract_v2_overrides(tool_name, owner_user_id)
+    WHERE owner_user_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_contract_v2_overrides_tool_global_unique
+    ON tool_contract_v2_overrides(tool_name)
+    WHERE owner_user_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_tool_contract_v2_overrides_tool_owner_enabled
+    ON tool_contract_v2_overrides(tool_name, owner_user_id, enabled);
+CREATE INDEX IF NOT EXISTS idx_tool_reliability_profiles_updated
+    ON tool_reliability_profiles(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tool_reliability_profiles_score
+    ON tool_reliability_profiles(reliability_score ASC);
+CREATE INDEX IF NOT EXISTS idx_tool_reliability_profiles_breaker_state
+    ON tool_reliability_profiles(breaker_state, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS autonomy_memory_records (
     id TEXT PRIMARY KEY,

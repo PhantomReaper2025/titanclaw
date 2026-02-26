@@ -28,8 +28,8 @@ use uuid::Uuid;
 
 use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::agent::{
-    BrokenTool, ConsolidationRun, ExecutionAttempt, Goal, GoalStatus, MemoryEvent, MemoryRecord,
-    MemoryRecordStatus, Plan, PlanStatus, PlanStep, PlanStepStatus, PlanVerification,
+    BrokenTool, ConsolidationRun, ExecutionAttempt, Goal, GoalStatus, Incident, MemoryEvent,
+    MemoryRecord, MemoryRecordStatus, Plan, PlanStatus, PlanStep, PlanStepStatus, PlanVerification,
     PolicyDecision, ProceduralPlaybook, ProceduralPlaybookStatus,
 };
 use crate::context::{ActionRecord, JobContext, JobState};
@@ -39,6 +39,7 @@ use crate::history::{
     ConversationMessage, ConversationSummary, JobEventRecord, LlmCallRecord, SandboxJobRecord,
     SandboxJobSummary, SettingRow,
 };
+use crate::tools::{ToolContractV2Override, ToolReliabilityProfile};
 use crate::workspace::{MemoryChunk, MemoryDocument, WorkspaceEntry};
 use crate::workspace::{SearchConfig, SearchResult};
 
@@ -662,6 +663,125 @@ pub trait AutonomyExecutionStore: Send + Sync {
 }
 
 #[async_trait]
+pub trait AutonomyReliabilityStore: Send + Sync {
+    async fn create_incident(&self, _incident: &Incident) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy reliability store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn get_incident(&self, _id: Uuid) -> Result<Option<Incident>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy reliability store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn list_incidents_for_user(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<Incident>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy reliability store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn find_open_incident_by_fingerprint(
+        &self,
+        _user_id: &str,
+        _fingerprint: &str,
+    ) -> Result<Option<Incident>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy reliability store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn increment_incident_occurrence(
+        &self,
+        _id: Uuid,
+        _observed_at: DateTime<Utc>,
+    ) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy reliability store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn update_incident_status(
+        &self,
+        _id: Uuid,
+        _status: &str,
+        _resolved_at: Option<DateTime<Utc>>,
+    ) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy reliability store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn upsert_tool_contract_override(
+        &self,
+        _record: &ToolContractV2Override,
+    ) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy reliability store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn get_tool_contract_override(
+        &self,
+        _tool_name: &str,
+        _owner_user_id: Option<&str>,
+    ) -> Result<Option<ToolContractV2Override>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy reliability store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn list_tool_contract_overrides(
+        &self,
+        _owner_user_id: Option<&str>,
+    ) -> Result<Vec<ToolContractV2Override>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy reliability store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn delete_tool_contract_override(
+        &self,
+        _tool_name: &str,
+        _owner_user_id: Option<&str>,
+    ) -> Result<bool, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy reliability store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn upsert_tool_reliability_profile(
+        &self,
+        _profile: &ToolReliabilityProfile,
+    ) -> Result<(), DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy reliability store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn get_tool_reliability_profile(
+        &self,
+        _tool_name: &str,
+    ) -> Result<Option<ToolReliabilityProfile>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy reliability store not implemented for backend".to_string(),
+        ))
+    }
+
+    async fn list_tool_reliability_profiles(
+        &self,
+    ) -> Result<Vec<ToolReliabilityProfile>, DatabaseError> {
+        Err(DatabaseError::Query(
+            "autonomy reliability store not implemented for backend".to_string(),
+        ))
+    }
+}
+
+#[async_trait]
 pub trait AutonomyMemoryStore: Send + Sync {
     async fn create_memory_record(&self, _record: &MemoryRecord) -> Result<(), DatabaseError> {
         Err(DatabaseError::Query(
@@ -803,6 +923,7 @@ pub trait Database:
     + GoalStore
     + PlanStore
     + AutonomyExecutionStore
+    + AutonomyReliabilityStore
     + AutonomyMemoryStore
     + Send
     + Sync

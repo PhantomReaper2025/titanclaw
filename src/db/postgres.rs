@@ -16,9 +16,9 @@ use uuid::Uuid;
 
 use crate::agent::BrokenTool;
 use crate::agent::autonomy::v1::{
-    ExecutionAttempt, ExecutionAttemptStatus, Goal, GoalRiskClass, GoalSource, GoalStatus, Plan,
-    PlanStatus, PlanStep, PlanStepKind, PlanStepStatus, PlanVerification, PlanVerificationStatus,
-    PlannerKind, PolicyDecision, PolicyDecisionKind,
+    ExecutionAttempt, ExecutionAttemptStatus, Goal, GoalRiskClass, GoalSource, GoalStatus,
+    Incident, Plan, PlanStatus, PlanStep, PlanStepKind, PlanStepStatus, PlanVerification,
+    PlanVerificationStatus, PlannerKind, PolicyDecision, PolicyDecisionKind,
 };
 use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::agent::{
@@ -28,14 +28,16 @@ use crate::agent::{
 use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
-    AutonomyExecutionStore, AutonomyMemoryStore, ConversationStore, Database, GoalStore, JobStore,
-    PlanStore, RoutineStore, SandboxStore, SettingsStore, ToolFailureStore, WorkspaceStore,
+    AutonomyExecutionStore, AutonomyMemoryStore, AutonomyReliabilityStore, ConversationStore,
+    Database, GoalStore, JobStore, PlanStore, RoutineStore, SandboxStore, SettingsStore,
+    ToolFailureStore, WorkspaceStore,
 };
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::history::{
     ConversationMessage, ConversationSummary, JobEventRecord, LlmCallRecord, SandboxJobRecord,
     SandboxJobSummary, SettingRow, Store,
 };
+use crate::tools::{ToolContractV2Override, ToolReliabilityProfile};
 use crate::workspace::{
     MemoryChunk, MemoryDocument, Repository, SearchConfig, SearchResult, WorkspaceEntry,
 };
@@ -656,6 +658,383 @@ impl AutonomyExecutionStore for PgBackend {
             )
             .await?;
         rows.iter().map(row_to_plan_verification).collect()
+    }
+}
+
+#[async_trait]
+impl AutonomyReliabilityStore for PgBackend {
+    async fn create_incident(&self, incident: &Incident) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+
+        conn.execute(
+            r#"
+            INSERT INTO autonomy_incidents (
+                id, goal_id, plan_id, plan_step_id, execution_attempt_id, policy_decision_id,
+                job_id, thread_id, user_id, channel, incident_type, severity, status,
+                fingerprint, surface, tool_name, occurrence_count, first_seen_at, last_seen_at,
+                last_failure_class, summary, details, created_at, updated_at, resolved_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6,
+                $7, $8, $9, $10, $11, $12, $13,
+                $14, $15, $16, $17, $18, $19,
+                $20, $21, $22, $23, $24, $25
+            )
+            "#,
+            &[
+                &incident.id,
+                &incident.goal_id,
+                &incident.plan_id,
+                &incident.plan_step_id,
+                &incident.execution_attempt_id,
+                &incident.policy_decision_id,
+                &incident.job_id,
+                &incident.thread_id,
+                &incident.user_id,
+                &incident.channel,
+                &incident.incident_type,
+                &incident.severity,
+                &incident.status,
+                &incident.fingerprint,
+                &incident.surface,
+                &incident.tool_name,
+                &incident.occurrence_count,
+                &incident.first_seen_at,
+                &incident.last_seen_at,
+                &incident.last_failure_class,
+                &incident.summary,
+                &incident.details,
+                &incident.created_at,
+                &incident.updated_at,
+                &incident.resolved_at,
+            ],
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn get_incident(&self, id: Uuid) -> Result<Option<Incident>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt("SELECT * FROM autonomy_incidents WHERE id = $1", &[&id])
+            .await?;
+        row.map(|r| row_to_incident(&r)).transpose()
+    }
+
+    async fn list_incidents_for_user(&self, user_id: &str) -> Result<Vec<Incident>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT *
+                FROM autonomy_incidents
+                WHERE user_id = $1
+                ORDER BY COALESCE(last_seen_at, created_at) DESC, id DESC
+                "#,
+                &[&user_id],
+            )
+            .await?;
+        rows.iter().map(row_to_incident).collect()
+    }
+
+    async fn find_open_incident_by_fingerprint(
+        &self,
+        user_id: &str,
+        fingerprint: &str,
+    ) -> Result<Option<Incident>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                r#"
+                SELECT *
+                FROM autonomy_incidents
+                WHERE user_id = $1
+                  AND fingerprint = $2
+                  AND status IN ('open', 'investigating')
+                ORDER BY COALESCE(last_seen_at, updated_at, created_at) DESC, id DESC
+                LIMIT 1
+                "#,
+                &[&user_id, &fingerprint],
+            )
+            .await?;
+        row.map(|r| row_to_incident(&r)).transpose()
+    }
+
+    async fn increment_incident_occurrence(
+        &self,
+        id: Uuid,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            r#"
+            UPDATE autonomy_incidents
+            SET
+                occurrence_count = COALESCE(NULLIF(occurrence_count, 0), 1) + 1,
+                updated_at = $2,
+                first_seen_at = COALESCE(first_seen_at, created_at, $2),
+                last_seen_at = $2
+            WHERE id = $1
+            "#,
+            &[&id, &observed_at],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn update_incident_status(
+        &self,
+        id: Uuid,
+        status: &str,
+        resolved_at: Option<DateTime<Utc>>,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        conn.execute(
+            r#"
+            UPDATE autonomy_incidents
+            SET status = $2,
+                updated_at = NOW(),
+                resolved_at = $3
+            WHERE id = $1
+            "#,
+            &[&id, &status, &resolved_at],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_tool_contract_override(
+        &self,
+        record: &ToolContractV2Override,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        let source = enum_json_string(&record.source, "tool_contract_override_source")?;
+        let descriptor_json = serde_json::to_value(&record.descriptor)
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+
+        conn.execute(
+            r#"
+            DELETE FROM tool_contract_v2_overrides
+            WHERE tool_name = $1
+              AND (
+                    (owner_user_id = $2)
+                 OR (owner_user_id IS NULL AND $2 IS NULL)
+              )
+            "#,
+            &[&record.tool_name, &record.owner_user_id],
+        )
+        .await?;
+
+        conn.execute(
+            r#"
+            INSERT INTO tool_contract_v2_overrides (
+                id, tool_name, owner_user_id, enabled, descriptor_json, source, notes,
+                created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "#,
+            &[
+                &record.id,
+                &record.tool_name,
+                &record.owner_user_id,
+                &record.enabled,
+                &descriptor_json,
+                &source,
+                &record.notes,
+                &record.created_at,
+                &record.updated_at,
+            ],
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn get_tool_contract_override(
+        &self,
+        tool_name: &str,
+        owner_user_id: Option<&str>,
+    ) -> Result<Option<ToolContractV2Override>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = match owner_user_id {
+            Some(owner) => {
+                conn.query_opt(
+                    r#"
+                    SELECT * FROM tool_contract_v2_overrides
+                    WHERE tool_name = $1 AND owner_user_id = $2
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT 1
+                    "#,
+                    &[&tool_name, &owner],
+                )
+                .await?
+            }
+            None => {
+                conn.query_opt(
+                    r#"
+                    SELECT * FROM tool_contract_v2_overrides
+                    WHERE tool_name = $1 AND owner_user_id IS NULL
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT 1
+                    "#,
+                    &[&tool_name],
+                )
+                .await?
+            }
+        };
+        row.map(|r| row_to_tool_contract_override(&r)).transpose()
+    }
+
+    async fn list_tool_contract_overrides(
+        &self,
+        owner_user_id: Option<&str>,
+    ) -> Result<Vec<ToolContractV2Override>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = match owner_user_id {
+            Some(owner) => {
+                conn.query(
+                    r#"
+                    SELECT *
+                    FROM tool_contract_v2_overrides
+                    WHERE owner_user_id = $1
+                    ORDER BY updated_at DESC, tool_name ASC, id DESC
+                    "#,
+                    &[&owner],
+                )
+                .await?
+            }
+            None => {
+                conn.query(
+                    r#"
+                    SELECT *
+                    FROM tool_contract_v2_overrides
+                    ORDER BY updated_at DESC, tool_name ASC, id DESC
+                    "#,
+                    &[],
+                )
+                .await?
+            }
+        };
+        rows.iter().map(row_to_tool_contract_override).collect()
+    }
+
+    async fn delete_tool_contract_override(
+        &self,
+        tool_name: &str,
+        owner_user_id: Option<&str>,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let deleted = conn
+            .execute(
+                r#"
+                DELETE FROM tool_contract_v2_overrides
+                WHERE tool_name = $1
+                  AND (
+                        (owner_user_id = $2)
+                     OR (owner_user_id IS NULL AND $2 IS NULL)
+                  )
+                "#,
+                &[&tool_name, &owner_user_id],
+            )
+            .await?;
+        Ok(deleted > 0)
+    }
+
+    async fn upsert_tool_reliability_profile(
+        &self,
+        profile: &ToolReliabilityProfile,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.conn().await?;
+        let breaker_state = enum_json_string(&profile.breaker_state, "circuit_breaker_state")?;
+
+        conn.execute(
+            r#"
+            INSERT INTO tool_reliability_profiles (
+                tool_name, window_start, window_end, sample_count, success_count, failure_count,
+                timeout_count, blocked_count, success_rate, p50_latency_ms, p95_latency_ms,
+                common_failure_modes, recent_incident_count, reliability_score,
+                safe_fallback_options, breaker_state, cooldown_until, last_failure_at,
+                last_success_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6,
+                $7, $8, $9, $10, $11,
+                $12, $13, $14,
+                $15, $16, $17, $18,
+                $19, $20
+            )
+            ON CONFLICT (tool_name) DO UPDATE SET
+                window_start = EXCLUDED.window_start,
+                window_end = EXCLUDED.window_end,
+                sample_count = EXCLUDED.sample_count,
+                success_count = EXCLUDED.success_count,
+                failure_count = EXCLUDED.failure_count,
+                timeout_count = EXCLUDED.timeout_count,
+                blocked_count = EXCLUDED.blocked_count,
+                success_rate = EXCLUDED.success_rate,
+                p50_latency_ms = EXCLUDED.p50_latency_ms,
+                p95_latency_ms = EXCLUDED.p95_latency_ms,
+                common_failure_modes = EXCLUDED.common_failure_modes,
+                recent_incident_count = EXCLUDED.recent_incident_count,
+                reliability_score = EXCLUDED.reliability_score,
+                safe_fallback_options = EXCLUDED.safe_fallback_options,
+                breaker_state = EXCLUDED.breaker_state,
+                cooldown_until = EXCLUDED.cooldown_until,
+                last_failure_at = EXCLUDED.last_failure_at,
+                last_success_at = EXCLUDED.last_success_at,
+                updated_at = EXCLUDED.updated_at
+            "#,
+            &[
+                &profile.tool_name,
+                &profile.window_start,
+                &profile.window_end,
+                &profile.sample_count,
+                &profile.success_count,
+                &profile.failure_count,
+                &profile.timeout_count,
+                &profile.blocked_count,
+                &(profile.success_rate as f64),
+                &profile.p50_latency_ms,
+                &profile.p95_latency_ms,
+                &profile.common_failure_modes,
+                &profile.recent_incident_count,
+                &(profile.reliability_score as f64),
+                &profile.safe_fallback_options,
+                &breaker_state,
+                &profile.cooldown_until,
+                &profile.last_failure_at,
+                &profile.last_success_at,
+                &profile.updated_at,
+            ],
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn get_tool_reliability_profile(
+        &self,
+        tool_name: &str,
+    ) -> Result<Option<ToolReliabilityProfile>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT * FROM tool_reliability_profiles WHERE tool_name = $1",
+                &[&tool_name],
+            )
+            .await?;
+        row.map(|r| row_to_tool_reliability_profile(&r)).transpose()
+    }
+
+    async fn list_tool_reliability_profiles(
+        &self,
+    ) -> Result<Vec<ToolReliabilityProfile>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT * FROM tool_reliability_profiles ORDER BY updated_at DESC, tool_name ASC",
+                &[],
+            )
+            .await?;
+        rows.iter().map(row_to_tool_reliability_profile).collect()
     }
 }
 
@@ -1453,6 +1832,84 @@ fn row_to_plan_verification(row: &Row) -> Result<PlanVerification, DatabaseError
         checks: row.get("checks"),
         evidence: row.get("evidence"),
         created_at: row.get("created_at"),
+    })
+}
+
+fn row_to_incident(row: &Row) -> Result<Incident, DatabaseError> {
+    Ok(Incident {
+        id: row.get("id"),
+        goal_id: row.get("goal_id"),
+        plan_id: row.get("plan_id"),
+        plan_step_id: row.get("plan_step_id"),
+        execution_attempt_id: row.get("execution_attempt_id"),
+        policy_decision_id: row.get("policy_decision_id"),
+        job_id: row.get("job_id"),
+        thread_id: row.get("thread_id"),
+        user_id: row.get("user_id"),
+        channel: row.get("channel"),
+        incident_type: row.get("incident_type"),
+        severity: row.get("severity"),
+        status: row.get("status"),
+        fingerprint: row.try_get("fingerprint").unwrap_or(None),
+        surface: row.try_get("surface").unwrap_or(None),
+        tool_name: row.try_get("tool_name").unwrap_or(None),
+        occurrence_count: row.try_get("occurrence_count").unwrap_or(1),
+        first_seen_at: row.try_get("first_seen_at").unwrap_or(None),
+        last_seen_at: row.try_get("last_seen_at").unwrap_or(None),
+        last_failure_class: row.try_get("last_failure_class").unwrap_or(None),
+        summary: row.get("summary"),
+        details: row.get("details"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        resolved_at: row.get("resolved_at"),
+    })
+}
+
+fn row_to_tool_contract_override(row: &Row) -> Result<ToolContractV2Override, DatabaseError> {
+    let source: String = row.get("source");
+    let descriptor_json: Value = row.get("descriptor_json");
+    let descriptor = serde_json::from_value(descriptor_json)
+        .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+
+    Ok(ToolContractV2Override {
+        id: row.get("id"),
+        tool_name: row.get("tool_name"),
+        owner_user_id: row.get("owner_user_id"),
+        enabled: row.get("enabled"),
+        descriptor,
+        source: enum_json_parse(&source, "tool_contract_override_source")?,
+        notes: row.get("notes"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn row_to_tool_reliability_profile(row: &Row) -> Result<ToolReliabilityProfile, DatabaseError> {
+    let breaker_state: String = row.get("breaker_state");
+    let success_rate: f64 = row.get("success_rate");
+    let reliability_score: f64 = row.get("reliability_score");
+
+    Ok(ToolReliabilityProfile {
+        tool_name: row.get("tool_name"),
+        window_start: row.get("window_start"),
+        window_end: row.get("window_end"),
+        sample_count: row.get("sample_count"),
+        success_count: row.get("success_count"),
+        failure_count: row.get("failure_count"),
+        timeout_count: row.get("timeout_count"),
+        blocked_count: row.get("blocked_count"),
+        success_rate: success_rate as f32,
+        p50_latency_ms: row.get("p50_latency_ms"),
+        p95_latency_ms: row.get("p95_latency_ms"),
+        common_failure_modes: row.get("common_failure_modes"),
+        recent_incident_count: row.get("recent_incident_count"),
+        reliability_score: reliability_score as f32,
+        safe_fallback_options: row.get("safe_fallback_options"),
+        breaker_state: enum_json_parse(&breaker_state, "circuit_breaker_state")?,
+        cooldown_until: row.get("cooldown_until"),
+        last_failure_at: row.get("last_failure_at"),
+        last_success_at: row.get("last_success_at"),
+        updated_at: row.get("updated_at"),
     })
 }
 

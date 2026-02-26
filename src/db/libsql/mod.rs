@@ -28,13 +28,17 @@ use crate::agent::routine::{
     NotifyConfig, Routine, RoutineAction, RoutineGuardrails, RoutineRun, RunStatus, Trigger,
 };
 use crate::agent::{
-    ConsolidationRun, ExecutionAttempt, Goal, GoalStatus, MemoryEvent, MemoryRecord,
+    ConsolidationRun, ExecutionAttempt, Goal, GoalStatus, Incident, MemoryEvent, MemoryRecord,
     MemoryRecordStatus, Plan, PlanStatus, PlanStep, PlanStepStatus, PlanVerification,
     PolicyDecision, ProceduralPlaybook, ProceduralPlaybookStatus,
 };
 use crate::context::JobState;
-use crate::db::{AutonomyExecutionStore, AutonomyMemoryStore, Database, GoalStore, PlanStore};
+use crate::db::{
+    AutonomyExecutionStore, AutonomyMemoryStore, AutonomyReliabilityStore, Database, GoalStore,
+    PlanStore,
+};
 use crate::error::DatabaseError;
+use crate::tools::{ToolContractV2Override, ToolReliabilityProfile};
 use crate::workspace::MemoryDocument;
 
 use crate::db::libsql_migrations;
@@ -380,6 +384,58 @@ async fn ensure_agent_jobs_autonomy_link_columns(conn: &Connection) -> Result<()
     Ok(())
 }
 
+async fn ensure_autonomy_incidents_phase3_columns(conn: &Connection) -> Result<(), DatabaseError> {
+    for column in [
+        "fingerprint TEXT",
+        "surface TEXT",
+        "tool_name TEXT",
+        "occurrence_count INTEGER NOT NULL DEFAULT 1",
+        "first_seen_at TEXT",
+        "last_seen_at TEXT",
+        "last_failure_class TEXT",
+    ] {
+        let sql = format!("ALTER TABLE autonomy_incidents ADD COLUMN {}", column);
+        if let Err(e) = conn.execute(&sql, ()).await {
+            let msg = e.to_string().to_lowercase();
+            if msg.contains("duplicate column name") || msg.contains("no such table") {
+                continue;
+            }
+            return Err(DatabaseError::Migration(format!(
+                "Failed to add autonomy_incidents.{}: {}",
+                column.split_whitespace().next().unwrap_or(column),
+                e
+            )));
+        }
+    }
+
+    if let Err(e) = conn
+        .execute(
+            r#"
+            UPDATE autonomy_incidents
+            SET
+                occurrence_count = CASE
+                    WHEN occurrence_count IS NULL OR occurrence_count = 0 THEN 1
+                    ELSE occurrence_count
+                END,
+                first_seen_at = COALESCE(first_seen_at, created_at),
+                last_seen_at = COALESCE(last_seen_at, updated_at)
+            "#,
+            (),
+        )
+        .await
+    {
+        let msg = e.to_string().to_lowercase();
+        if !msg.contains("no such table") && !msg.contains("no such column") {
+            return Err(DatabaseError::Migration(format!(
+                "Failed to backfill autonomy_incidents Phase 3 columns: {}",
+                e
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 #[async_trait]
 impl Database for LibSqlBackend {
     async fn run_migrations(&self) -> Result<(), DatabaseError> {
@@ -393,6 +449,7 @@ impl Database for LibSqlBackend {
         // `ADD COLUMN IF NOT EXISTS`, so patch missing columns before the
         // consolidated schema runs and creates indexes that depend on them.
         ensure_agent_jobs_autonomy_link_columns(&conn).await?;
+        ensure_autonomy_incidents_phase3_columns(&conn).await?;
         conn.execute_batch(libsql_migrations::SCHEMA)
             .await
             .map_err(|e| DatabaseError::Migration(format!("libSQL migration failed: {}", e)))?;
@@ -1194,6 +1251,520 @@ impl AutonomyExecutionStore for LibSqlBackend {
 }
 
 #[async_trait]
+impl AutonomyReliabilityStore for LibSqlBackend {
+    async fn create_incident(&self, incident: &Incident) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+
+        conn.execute(
+            r#"
+            INSERT INTO autonomy_incidents (
+                id, goal_id, plan_id, plan_step_id, execution_attempt_id, policy_decision_id,
+                job_id, thread_id, user_id, channel, incident_type, severity, status,
+                fingerprint, surface, tool_name, occurrence_count, first_seen_at, last_seen_at,
+                last_failure_class, summary, details, created_at, updated_at, resolved_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6,
+                ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17, ?18, ?19,
+                ?20, ?21, ?22, ?23, ?24, ?25
+            )
+            "#,
+            params![
+                incident.id.to_string(),
+                opt_text_owned(incident.goal_id.map(|id| id.to_string())),
+                opt_text_owned(incident.plan_id.map(|id| id.to_string())),
+                opt_text_owned(incident.plan_step_id.map(|id| id.to_string())),
+                opt_text_owned(incident.execution_attempt_id.map(|id| id.to_string())),
+                opt_text_owned(incident.policy_decision_id.map(|id| id.to_string())),
+                opt_text_owned(incident.job_id.map(|id| id.to_string())),
+                opt_text_owned(incident.thread_id.map(|id| id.to_string())),
+                incident.user_id.as_str(),
+                opt_text(incident.channel.as_deref()),
+                incident.incident_type.as_str(),
+                incident.severity.as_str(),
+                incident.status.as_str(),
+                opt_text(incident.fingerprint.as_deref()),
+                opt_text(incident.surface.as_deref()),
+                opt_text(incident.tool_name.as_deref()),
+                incident.occurrence_count as i64,
+                fmt_opt_ts(&incident.first_seen_at),
+                fmt_opt_ts(&incident.last_seen_at),
+                opt_text(incident.last_failure_class.as_deref()),
+                incident.summary.as_str(),
+                incident.details.to_string(),
+                fmt_ts(&incident.created_at),
+                fmt_ts(&incident.updated_at),
+                fmt_opt_ts(&incident.resolved_at),
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn get_incident(&self, id: Uuid) -> Result<Option<Incident>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    id, goal_id, plan_id, plan_step_id, execution_attempt_id, policy_decision_id,
+                    job_id, thread_id, user_id, channel, incident_type, severity, status,
+                    fingerprint, surface, tool_name, occurrence_count, first_seen_at, last_seen_at,
+                    last_failure_class, summary, details, created_at, updated_at, resolved_at
+                FROM autonomy_incidents
+                WHERE id = ?1
+                "#,
+                params![id.to_string()],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            Some(row) => Ok(Some(row_to_incident_libsql(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn list_incidents_for_user(&self, user_id: &str) -> Result<Vec<Incident>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    id, goal_id, plan_id, plan_step_id, execution_attempt_id, policy_decision_id,
+                    job_id, thread_id, user_id, channel, incident_type, severity, status,
+                    fingerprint, surface, tool_name, occurrence_count, first_seen_at, last_seen_at,
+                    last_failure_class, summary, details, created_at, updated_at, resolved_at
+                FROM autonomy_incidents
+                WHERE user_id = ?1
+                ORDER BY COALESCE(last_seen_at, created_at) DESC, id DESC
+                "#,
+                params![user_id],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut incidents = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            incidents.push(row_to_incident_libsql(&row)?);
+        }
+        Ok(incidents)
+    }
+
+    async fn find_open_incident_by_fingerprint(
+        &self,
+        user_id: &str,
+        fingerprint: &str,
+    ) -> Result<Option<Incident>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    id, goal_id, plan_id, plan_step_id, execution_attempt_id, policy_decision_id,
+                    job_id, thread_id, user_id, channel, incident_type, severity, status,
+                    fingerprint, surface, tool_name, occurrence_count, first_seen_at, last_seen_at,
+                    last_failure_class, summary, details, created_at, updated_at, resolved_at
+                FROM autonomy_incidents
+                WHERE user_id = ?1
+                  AND fingerprint = ?2
+                  AND status IN ('open', 'investigating')
+                ORDER BY COALESCE(last_seen_at, updated_at, created_at) DESC, id DESC
+                LIMIT 1
+                "#,
+                params![user_id, fingerprint],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            Some(row) => Ok(Some(row_to_incident_libsql(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn increment_incident_occurrence(
+        &self,
+        id: Uuid,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let observed = fmt_ts(&observed_at);
+
+        conn.execute(
+            r#"
+            UPDATE autonomy_incidents
+            SET
+                occurrence_count = CASE
+                    WHEN occurrence_count IS NULL OR occurrence_count = 0 THEN 2
+                    ELSE occurrence_count + 1
+                END,
+                updated_at = ?2,
+                first_seen_at = COALESCE(first_seen_at, created_at, ?2),
+                last_seen_at = ?2
+            WHERE id = ?1
+            "#,
+            params![id.to_string(), observed.as_str()],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn update_incident_status(
+        &self,
+        id: Uuid,
+        status: &str,
+        resolved_at: Option<DateTime<Utc>>,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let now = fmt_ts(&Utc::now());
+
+        conn.execute(
+            r#"
+            UPDATE autonomy_incidents
+            SET status = ?2,
+                updated_at = ?3,
+                resolved_at = ?4
+            WHERE id = ?1
+            "#,
+            params![
+                id.to_string(),
+                status,
+                now.as_str(),
+                fmt_opt_ts(&resolved_at)
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn upsert_tool_contract_override(
+        &self,
+        record: &ToolContractV2Override,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let source = enum_to_snake_case(&record.source)?;
+        let descriptor_json = serde_json::to_string(&record.descriptor)
+            .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+
+        conn.execute(
+            r#"
+            DELETE FROM tool_contract_v2_overrides
+            WHERE tool_name = ?1
+              AND (
+                    (owner_user_id = ?2)
+                 OR (owner_user_id IS NULL AND ?2 IS NULL)
+              )
+            "#,
+            params![
+                record.tool_name.as_str(),
+                opt_text(record.owner_user_id.as_deref())
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        conn.execute(
+            r#"
+            INSERT INTO tool_contract_v2_overrides (
+                id, tool_name, owner_user_id, enabled, descriptor_json, source, notes,
+                created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                record.id.to_string(),
+                record.tool_name.as_str(),
+                opt_text(record.owner_user_id.as_deref()),
+                if record.enabled { 1_i64 } else { 0_i64 },
+                descriptor_json,
+                source,
+                opt_text(record.notes.as_deref()),
+                fmt_ts(&record.created_at),
+                fmt_ts(&record.updated_at),
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn get_tool_contract_override(
+        &self,
+        tool_name: &str,
+        owner_user_id: Option<&str>,
+    ) -> Result<Option<ToolContractV2Override>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = match owner_user_id {
+            Some(owner) => {
+                conn.query(
+                    r#"
+                    SELECT
+                        id, tool_name, owner_user_id, enabled, descriptor_json, source, notes,
+                        created_at, updated_at
+                    FROM tool_contract_v2_overrides
+                    WHERE tool_name = ?1 AND owner_user_id = ?2
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT 1
+                    "#,
+                    params![tool_name, owner],
+                )
+                .await
+            }
+            None => {
+                conn.query(
+                    r#"
+                    SELECT
+                        id, tool_name, owner_user_id, enabled, descriptor_json, source, notes,
+                        created_at, updated_at
+                    FROM tool_contract_v2_overrides
+                    WHERE tool_name = ?1 AND owner_user_id IS NULL
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT 1
+                    "#,
+                    params![tool_name],
+                )
+                .await
+            }
+        }
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            Some(row) => Ok(Some(row_to_tool_contract_override_libsql(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn list_tool_contract_overrides(
+        &self,
+        owner_user_id: Option<&str>,
+    ) -> Result<Vec<ToolContractV2Override>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = match owner_user_id {
+            Some(owner) => {
+                conn.query(
+                    r#"
+                    SELECT
+                        id, tool_name, owner_user_id, enabled, descriptor_json, source, notes,
+                        created_at, updated_at
+                    FROM tool_contract_v2_overrides
+                    WHERE owner_user_id = ?1
+                    ORDER BY updated_at DESC, tool_name ASC, id DESC
+                    "#,
+                    params![owner],
+                )
+                .await
+            }
+            None => {
+                conn.query(
+                    r#"
+                    SELECT
+                        id, tool_name, owner_user_id, enabled, descriptor_json, source, notes,
+                        created_at, updated_at
+                    FROM tool_contract_v2_overrides
+                    ORDER BY updated_at DESC, tool_name ASC, id DESC
+                    "#,
+                    (),
+                )
+                .await
+            }
+        }
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut overrides = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            overrides.push(row_to_tool_contract_override_libsql(&row)?);
+        }
+        Ok(overrides)
+    }
+
+    async fn delete_tool_contract_override(
+        &self,
+        tool_name: &str,
+        owner_user_id: Option<&str>,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.connect().await?;
+        let deleted = conn
+            .execute(
+                r#"
+                DELETE FROM tool_contract_v2_overrides
+                WHERE tool_name = ?1
+                  AND (
+                        (owner_user_id = ?2)
+                     OR (owner_user_id IS NULL AND ?2 IS NULL)
+                  )
+                "#,
+                params![tool_name, opt_text(owner_user_id)],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(deleted > 0)
+    }
+
+    async fn upsert_tool_reliability_profile(
+        &self,
+        profile: &ToolReliabilityProfile,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let breaker_state = enum_to_snake_case(&profile.breaker_state)?;
+
+        conn.execute(
+            r#"
+            INSERT INTO tool_reliability_profiles (
+                tool_name, window_start, window_end, sample_count, success_count, failure_count,
+                timeout_count, blocked_count, success_rate, p50_latency_ms, p95_latency_ms,
+                common_failure_modes, recent_incident_count, reliability_score,
+                safe_fallback_options, breaker_state, cooldown_until, last_failure_at,
+                last_success_at, updated_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6,
+                ?7, ?8, ?9, ?10, ?11,
+                ?12, ?13, ?14,
+                ?15, ?16, ?17, ?18,
+                ?19, ?20
+            )
+            ON CONFLICT(tool_name) DO UPDATE SET
+                window_start = excluded.window_start,
+                window_end = excluded.window_end,
+                sample_count = excluded.sample_count,
+                success_count = excluded.success_count,
+                failure_count = excluded.failure_count,
+                timeout_count = excluded.timeout_count,
+                blocked_count = excluded.blocked_count,
+                success_rate = excluded.success_rate,
+                p50_latency_ms = excluded.p50_latency_ms,
+                p95_latency_ms = excluded.p95_latency_ms,
+                common_failure_modes = excluded.common_failure_modes,
+                recent_incident_count = excluded.recent_incident_count,
+                reliability_score = excluded.reliability_score,
+                safe_fallback_options = excluded.safe_fallback_options,
+                breaker_state = excluded.breaker_state,
+                cooldown_until = excluded.cooldown_until,
+                last_failure_at = excluded.last_failure_at,
+                last_success_at = excluded.last_success_at,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                profile.tool_name.as_str(),
+                fmt_ts(&profile.window_start),
+                fmt_ts(&profile.window_end),
+                profile.sample_count,
+                profile.success_count,
+                profile.failure_count,
+                profile.timeout_count,
+                profile.blocked_count,
+                profile.success_rate as f64,
+                profile.p50_latency_ms,
+                profile.p95_latency_ms,
+                profile.common_failure_modes.to_string(),
+                profile.recent_incident_count,
+                profile.reliability_score as f64,
+                profile.safe_fallback_options.to_string(),
+                breaker_state,
+                fmt_opt_ts(&profile.cooldown_until),
+                fmt_opt_ts(&profile.last_failure_at),
+                fmt_opt_ts(&profile.last_success_at),
+                fmt_ts(&profile.updated_at),
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn get_tool_reliability_profile(
+        &self,
+        tool_name: &str,
+    ) -> Result<Option<ToolReliabilityProfile>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    tool_name, window_start, window_end, sample_count, success_count, failure_count,
+                    timeout_count, blocked_count, success_rate, p50_latency_ms, p95_latency_ms,
+                    common_failure_modes, recent_incident_count, reliability_score,
+                    safe_fallback_options, breaker_state, cooldown_until, last_failure_at,
+                    last_success_at, updated_at
+                FROM tool_reliability_profiles
+                WHERE tool_name = ?1
+                "#,
+                params![tool_name],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            Some(row) => Ok(Some(row_to_tool_reliability_profile_libsql(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn list_tool_reliability_profiles(
+        &self,
+    ) -> Result<Vec<ToolReliabilityProfile>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    tool_name, window_start, window_end, sample_count, success_count, failure_count,
+                    timeout_count, blocked_count, success_rate, p50_latency_ms, p95_latency_ms,
+                    common_failure_modes, recent_incident_count, reliability_score,
+                    safe_fallback_options, breaker_state, cooldown_until, last_failure_at,
+                    last_success_at, updated_at
+                FROM tool_reliability_profiles
+                ORDER BY updated_at DESC, tool_name ASC
+                "#,
+                (),
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut profiles = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            profiles.push(row_to_tool_reliability_profile_libsql(&row)?);
+        }
+        Ok(profiles)
+    }
+}
+
+#[async_trait]
 impl AutonomyMemoryStore for LibSqlBackend {
     async fn create_memory_record(&self, record: &MemoryRecord) -> Result<(), DatabaseError> {
         let conn = self.connect().await?;
@@ -1944,6 +2515,82 @@ pub(crate) fn row_to_plan_verification_libsql(
         checks: get_json(row, 11),
         evidence: get_json(row, 12),
         created_at: get_ts(row, 13),
+    })
+}
+
+pub(crate) fn row_to_incident_libsql(row: &libsql::Row) -> Result<Incident, DatabaseError> {
+    Ok(Incident {
+        id: get_text(row, 0).parse().unwrap_or_default(),
+        goal_id: get_opt_uuid(row, 1),
+        plan_id: get_opt_uuid(row, 2),
+        plan_step_id: get_opt_uuid(row, 3),
+        execution_attempt_id: get_opt_uuid(row, 4),
+        policy_decision_id: get_opt_uuid(row, 5),
+        job_id: get_opt_uuid(row, 6),
+        thread_id: get_opt_uuid(row, 7),
+        user_id: get_text(row, 8),
+        channel: get_opt_text(row, 9),
+        incident_type: get_text(row, 10),
+        severity: get_text(row, 11),
+        status: get_text(row, 12),
+        fingerprint: get_opt_text(row, 13),
+        surface: get_opt_text(row, 14),
+        tool_name: get_opt_text(row, 15),
+        occurrence_count: get_i64(row, 16) as i32,
+        first_seen_at: get_opt_ts(row, 17),
+        last_seen_at: get_opt_ts(row, 18),
+        last_failure_class: get_opt_text(row, 19),
+        summary: get_text(row, 20),
+        details: get_json(row, 21),
+        created_at: get_ts(row, 22),
+        updated_at: get_ts(row, 23),
+        resolved_at: get_opt_ts(row, 24),
+    })
+}
+
+pub(crate) fn row_to_tool_contract_override_libsql(
+    row: &libsql::Row,
+) -> Result<ToolContractV2Override, DatabaseError> {
+    let descriptor = serde_json::from_value(get_json(row, 4))
+        .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+
+    Ok(ToolContractV2Override {
+        id: get_text(row, 0).parse().unwrap_or_default(),
+        tool_name: get_text(row, 1),
+        owner_user_id: get_opt_text(row, 2),
+        enabled: get_i64(row, 3) != 0,
+        descriptor,
+        source: enum_from_snake_case(&get_text(row, 5), "ToolContractOverrideSource")?,
+        notes: get_opt_text(row, 6),
+        created_at: get_ts(row, 7),
+        updated_at: get_ts(row, 8),
+    })
+}
+
+pub(crate) fn row_to_tool_reliability_profile_libsql(
+    row: &libsql::Row,
+) -> Result<ToolReliabilityProfile, DatabaseError> {
+    Ok(ToolReliabilityProfile {
+        tool_name: get_text(row, 0),
+        window_start: get_ts(row, 1),
+        window_end: get_ts(row, 2),
+        sample_count: get_i64(row, 3),
+        success_count: get_i64(row, 4),
+        failure_count: get_i64(row, 5),
+        timeout_count: get_i64(row, 6),
+        blocked_count: get_i64(row, 7),
+        success_rate: get_opt_f32(row, 8).unwrap_or_default(),
+        p50_latency_ms: row.get::<i64>(9).ok(),
+        p95_latency_ms: row.get::<i64>(10).ok(),
+        common_failure_modes: get_json(row, 11),
+        recent_incident_count: get_i64(row, 12),
+        reliability_score: get_opt_f32(row, 13).unwrap_or_default(),
+        safe_fallback_options: get_json(row, 14),
+        breaker_state: enum_from_snake_case(&get_text(row, 15), "CircuitBreakerState")?,
+        cooldown_until: get_opt_ts(row, 16),
+        last_failure_at: get_opt_ts(row, 17),
+        last_success_at: get_opt_ts(row, 18),
+        updated_at: get_ts(row, 19),
     })
 }
 

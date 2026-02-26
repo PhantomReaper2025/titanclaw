@@ -268,6 +268,14 @@ pub mod v1 {
         pub incident_type: String,
         pub severity: String,
         pub status: String,
+        pub fingerprint: Option<String>,
+        pub surface: Option<String>,
+        pub tool_name: Option<String>,
+        #[serde(default = "default_incident_occurrence_count")]
+        pub occurrence_count: i32,
+        pub first_seen_at: Option<DateTime<Utc>>,
+        pub last_seen_at: Option<DateTime<Utc>>,
+        pub last_failure_class: Option<String>,
         pub summary: String,
         #[serde(default)]
         pub details: Value,
@@ -285,5 +293,9 @@ pub mod v1 {
         #[serde(default)]
         pub payload: Value,
         pub created_at: DateTime<Utc>,
+    }
+
+    fn default_incident_occurrence_count() -> i32 {
+        1
     }
 }

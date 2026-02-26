@@ -46,6 +46,7 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 | Memory Plane v2 web inspection/ops APIs (user-scoped) | ✅ | Added gateway memory-plane endpoints for user-scoped records/playbooks inspection and status updates plus consolidation run listing/manual trigger and retrieval preview debugging (`/api/memory-plane/*`), with ownership checks, filters/sort/pagination validation, and targeted gateway tests. |
 | Memory Plane v2 CLI inspection/ops parity | ✅ | Added `titanclaw memory-plane` CLI subcommands for records (`list|show`), playbooks (`list|show|set-status`), consolidation (`runs|run`), and retrieval (`preview`) with user-scoped ownership checks and sort/filter/pagination validation aligned with the gateway, plus parser/helper tests in `src/cli/memory_plane.rs`. |
 | Memory Plane v2 Phase 2 acceptance + stabilization | ✅ | Ran a Phase 2 validation matrix covering memory write policy, consolidator, retrieval composer, worker/thread/scheduler/routine runtime paths, gateway memory-plane handlers, CLI memory-plane parser/helpers, and `cargo check`; added runtime acceptance assertions for worker memory-plane writes (`worker_step_outcome` / `verifier_outcome` / `replan_event`), approval-flow memory writes in `thread_ops`, and a worker flag-off path proving no memory-plane writes when `AUTONOMY_MEMORY_PLANE_V2=false`. |
+| Tooling System v2 / Reliability foundations (Phase 3 slice 1) | 🚧 | Added typed Tool Contract V2 / reliability profile domain structs (`src/tools/contract_v2.rs`), introduced `AutonomyReliabilityStore` in the DB supertrait composition, implemented PostgreSQL + libSQL CRUD foundations for incidents (including Phase 3 dedupe/reliability fields), tool contract overrides, and tool reliability profiles, and added schema migrations `V24`-`V27` plus libSQL schema mirror + compatibility patching for extended `autonomy_incidents` columns. Runtime resolver/ranking/incident-detector/critic loop integrations remain pending later Phase 3 slices. |
 
 ## Execution TODO (Live)
 
@@ -78,6 +79,7 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 - [x] Memory Plane v2 gateway inspection/ops APIs (records/playbooks/consolidation runs/manual trigger/retrieval preview, user-scoped with tests)
 - [x] Memory Plane v2 CLI inspection/ops parity (`memory-plane` records/playbooks/consolidation/retrieval commands with parser/helper tests)
 - [x] Memory Plane v2 acceptance/stability test pass + completion mark (runtime memory-write assertions, gateway/CLI suites, module tests, `cargo check`)
+- [x] Phase 3 slice 1: Tooling/Reliability persistence foundations (`src/tools/contract_v2.rs`, `AutonomyReliabilityStore`, incidents/contract overrides/reliability profile CRUD + `V24`-`V27` and libSQL mirror/compat path)
 - [x] Persist job-level autonomy linkage IDs in `agent_jobs` across Postgres/libSQL (`V17` + libSQL schema compatibility path)
 - [x] Read-only gateway inspection endpoints for autonomy goals/plans (user-scoped)
 - [x] Gateway create endpoints for autonomy goals/plans (`POST /api/goals`, `POST /api/plans`, user-scoped)
