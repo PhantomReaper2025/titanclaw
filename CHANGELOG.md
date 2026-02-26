@@ -39,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expanded the Phase 2 `MemoryConsolidator` deterministic promotion path to process routine playbook-candidate episodic records into `autonomy_procedural_playbooks` (create on first candidate, update on repeated candidates with success/confidence/source-id tracking) while archiving the source candidate and recording `GeneratePlaybook` consolidation events.
 - Added a flag-gated `MemoryRetrievalComposer` for Phase 2 Memory Plane v2 with task-class inference, task-aware memory/playbook selection, and transient retrieval-context prompt injection into worker initial planning + automatic replanning via the `PlannerV1` wrapper (`AUTONOMY_MEMORY_RETRIEVAL_V2`, fail-open on retrieval errors).
 - Added user-scoped Phase 2 Memory Plane v2 gateway inspection/ops endpoints (`/api/memory-plane/*`) for memory records/playbooks, playbook status updates, consolidation run listing/manual trigger, and retrieval preview, including ownership checks plus filter/sort/pagination validation and targeted handler tests.
+- Added `titanclaw memory-plane` CLI inspection/ops commands for Memory Plane v2 (records/playbooks/consolidation/retrieval preview) with user-scoped ownership checks, sort/filter/pagination validation, and parser/helper tests.
 
 ### Changed
 

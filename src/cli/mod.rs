@@ -16,6 +16,7 @@ mod doctor;
 mod goal;
 mod mcp;
 pub mod memory;
+mod memory_plane;
 pub mod oauth_defaults;
 mod pairing;
 mod plan;
@@ -32,6 +33,7 @@ pub use memory::MemoryCommand;
 #[cfg(feature = "postgres")]
 pub use memory::run_memory_command;
 pub use memory::run_memory_command_with_db;
+pub use memory_plane::{MemoryPlaneCommand, run_memory_plane_command};
 pub use pairing::{PairingCommand, run_pairing_command, run_pairing_command_with_store};
 pub use plan::{PlanCommand, run_plan_command};
 pub use plan_step::{PlanStepCommand, run_plan_step_command};
@@ -103,6 +105,10 @@ pub enum Command {
     /// Query and manage workspace memory
     #[command(subcommand)]
     Memory(MemoryCommand),
+
+    /// Inspect and operate the structured Memory Plane v2 (internal/advanced)
+    #[command(subcommand)]
+    MemoryPlane(MemoryPlaneCommand),
 
     /// DM pairing (approve inbound requests from unknown senders)
     #[command(subcommand)]
