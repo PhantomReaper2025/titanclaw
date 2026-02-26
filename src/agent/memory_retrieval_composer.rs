@@ -11,7 +11,7 @@ use crate::agent::{
 use crate::db::Database;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RetrievalTaskClass {
+pub(crate) enum RetrievalTaskClass {
     Coding,
     Troubleshooting,
     Research,
@@ -21,7 +21,7 @@ pub(super) enum RetrievalTaskClass {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct MemoryRetrievalRequest {
+pub(crate) struct MemoryRetrievalRequest {
     pub user_id: String,
     pub goal_id: Option<Uuid>,
     pub plan_id: Option<Uuid>,
@@ -32,7 +32,7 @@ pub(super) struct MemoryRetrievalRequest {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct MemoryRetrievalBundle {
+pub(crate) struct MemoryRetrievalBundle {
     pub working_context: Vec<MemoryRecord>,
     pub episodic_hits: Vec<MemoryRecord>,
     pub semantic_hits: Vec<MemoryRecord>,
@@ -42,10 +42,10 @@ pub(super) struct MemoryRetrievalBundle {
     pub debug_meta: serde_json::Value,
 }
 
-pub(super) struct MemoryRetrievalComposer;
+pub(crate) struct MemoryRetrievalComposer;
 
 impl MemoryRetrievalComposer {
-    pub(super) fn infer_task_class(
+    pub(crate) fn infer_task_class(
         category: Option<&str>,
         title: &str,
         description: &str,
@@ -96,7 +96,7 @@ impl MemoryRetrievalComposer {
         RetrievalTaskClass::General
     }
 
-    pub(super) async fn compose(
+    pub(crate) async fn compose(
         store: Arc<dyn Database>,
         req: MemoryRetrievalRequest,
     ) -> Result<MemoryRetrievalBundle, String> {

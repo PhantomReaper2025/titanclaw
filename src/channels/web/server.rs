@@ -29,9 +29,15 @@ use tower_http::cors::{AllowHeaders, CorsLayer};
 use url::Url;
 use uuid::Uuid;
 
+use crate::agent::memory_consolidator::{MemoryConsolidator, MemoryConsolidatorConfig};
+use crate::agent::memory_retrieval_composer::{
+    MemoryRetrievalComposer, MemoryRetrievalRequest, RetrievalTaskClass,
+};
 use crate::agent::{
-    Goal, GoalRiskClass, GoalSource, GoalStatus, Plan, PlanStatus, PlanStep, PlanStepKind,
-    PlanStepStatus, PlanVerificationStatus, PlannerKind, SessionManager,
+    ConsolidationRunStatus, Goal, GoalRiskClass, GoalSource, GoalStatus, MemoryRecord,
+    MemoryRecordStatus, MemoryType, Plan, PlanStatus, PlanStep, PlanStepKind, PlanStepStatus,
+    PlanVerificationStatus, PlannerKind, ProceduralPlaybook, ProceduralPlaybookStatus,
+    SessionManager,
 };
 use crate::channels::IncomingMessage;
 use crate::channels::web::auth::{AuthState, auth_middleware};
@@ -271,6 +277,39 @@ pub async fn start_server(
         .route(
             "/api/plan-steps/{id}/status",
             post(plan_step_status_update_handler),
+        )
+        // Memory Plane v2 (inspection + ops)
+        .route(
+            "/api/memory-plane/records",
+            get(memory_plane_records_list_handler),
+        )
+        .route(
+            "/api/memory-plane/records/{id}",
+            get(memory_plane_record_detail_handler),
+        )
+        .route(
+            "/api/memory-plane/playbooks",
+            get(memory_plane_playbooks_list_handler),
+        )
+        .route(
+            "/api/memory-plane/playbooks/{id}",
+            get(memory_plane_playbook_detail_handler),
+        )
+        .route(
+            "/api/memory-plane/playbooks/{id}/status",
+            post(memory_plane_playbook_status_update_handler),
+        )
+        .route(
+            "/api/memory-plane/consolidation/runs",
+            get(memory_plane_consolidation_runs_list_handler),
+        )
+        .route(
+            "/api/memory-plane/consolidation/run",
+            post(memory_plane_consolidation_run_handler),
+        )
+        .route(
+            "/api/memory-plane/retrieval/preview",
+            post(memory_plane_retrieval_preview_handler),
         )
         // Logs
         .route("/api/logs/events", get(logs_events_handler))
@@ -2981,6 +3020,56 @@ struct PlanVerificationsListQuery {
     limit: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct MemoryPlaneRecordsListQuery {
+    #[serde(rename = "type")]
+    memory_type: Option<MemoryType>,
+    status: Option<MemoryRecordStatus>,
+    goal_id: Option<String>,
+    plan_id: Option<String>,
+    category: Option<String>,
+    sort: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct MemoryPlanePlaybooksListQuery {
+    task_class: Option<String>,
+    status: Option<ProceduralPlaybookStatus>,
+    sort: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct MemoryPlaneConsolidationRunsListQuery {
+    status: Option<ConsolidationRunStatus>,
+    sort: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct MemoryPlanePlaybookStatusUpdateRequest {
+    status: ProceduralPlaybookStatus,
+}
+
+#[derive(Deserialize, Default)]
+struct MemoryPlaneConsolidationRunRequest {
+    batch_size: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct MemoryPlaneRetrievalPreviewRequest {
+    task_class: Option<String>,
+    goal_id: Option<String>,
+    plan_id: Option<String>,
+    job_id: Option<String>,
+    query: Option<String>,
+    limit_budget: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum GoalListSort {
     UpdatedDesc,
@@ -3001,6 +3090,29 @@ enum PlanListSort {
 enum PlanVerificationListSort {
     CreatedDesc,
     CreatedAsc,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MemoryRecordListSort {
+    CreatedDesc,
+    CreatedAsc,
+    UpdatedDesc,
+    UpdatedAsc,
+    ConfidenceDesc,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProceduralPlaybookListSort {
+    UpdatedDesc,
+    UpdatedAsc,
+    ConfidenceDesc,
+    SuccessDesc,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConsolidationRunListSort {
+    StartedDesc,
+    StartedAsc,
 }
 
 fn parse_goal_list_sort(raw: Option<&str>) -> Result<GoalListSort, (StatusCode, String)> {
@@ -3061,6 +3173,172 @@ fn parse_plan_list_sort(raw: Option<&str>) -> Result<PlanListSort, (StatusCode, 
             StatusCode::BAD_REQUEST,
             format!(
                 "invalid plan sort '{}'; expected revision_desc|revision_asc|updated_desc|updated_asc",
+                other
+            ),
+        )),
+    }
+}
+
+fn parse_memory_record_list_sort(
+    raw: Option<&str>,
+) -> Result<MemoryRecordListSort, (StatusCode, String)> {
+    match raw
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+        .unwrap_or("created_desc")
+    {
+        "created_desc" => Ok(MemoryRecordListSort::CreatedDesc),
+        "created_asc" => Ok(MemoryRecordListSort::CreatedAsc),
+        "updated_desc" => Ok(MemoryRecordListSort::UpdatedDesc),
+        "updated_asc" => Ok(MemoryRecordListSort::UpdatedAsc),
+        "confidence_desc" => Ok(MemoryRecordListSort::ConfidenceDesc),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid memory record sort '{}'; expected created_desc|created_asc|updated_desc|updated_asc|confidence_desc",
+                other
+            ),
+        )),
+    }
+}
+
+fn apply_memory_record_list_sort(records: &mut [MemoryRecord], sort: MemoryRecordListSort) {
+    match sort {
+        MemoryRecordListSort::CreatedDesc => records.sort_by_key(|r| {
+            (
+                std::cmp::Reverse(r.created_at),
+                std::cmp::Reverse(r.updated_at),
+                std::cmp::Reverse(r.id),
+            )
+        }),
+        MemoryRecordListSort::CreatedAsc => {
+            records.sort_by_key(|r| (r.created_at, r.updated_at, r.id))
+        }
+        MemoryRecordListSort::UpdatedDesc => records.sort_by_key(|r| {
+            (
+                std::cmp::Reverse(r.updated_at),
+                std::cmp::Reverse(r.created_at),
+                std::cmp::Reverse(r.id),
+            )
+        }),
+        MemoryRecordListSort::UpdatedAsc => {
+            records.sort_by_key(|r| (r.updated_at, r.created_at, r.id))
+        }
+        MemoryRecordListSort::ConfidenceDesc => records.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.id.cmp(&a.id))
+        }),
+    }
+}
+
+fn parse_procedural_playbook_list_sort(
+    raw: Option<&str>,
+) -> Result<ProceduralPlaybookListSort, (StatusCode, String)> {
+    match raw
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+        .unwrap_or("updated_desc")
+    {
+        "updated_desc" => Ok(ProceduralPlaybookListSort::UpdatedDesc),
+        "updated_asc" => Ok(ProceduralPlaybookListSort::UpdatedAsc),
+        "confidence_desc" => Ok(ProceduralPlaybookListSort::ConfidenceDesc),
+        "success_desc" => Ok(ProceduralPlaybookListSort::SuccessDesc),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid playbook sort '{}'; expected updated_desc|updated_asc|confidence_desc|success_desc",
+                other
+            ),
+        )),
+    }
+}
+
+fn apply_procedural_playbook_list_sort(
+    playbooks: &mut [ProceduralPlaybook],
+    sort: ProceduralPlaybookListSort,
+) {
+    match sort {
+        ProceduralPlaybookListSort::UpdatedDesc => playbooks.sort_by_key(|p| {
+            (
+                std::cmp::Reverse(p.updated_at),
+                std::cmp::Reverse(p.created_at),
+                std::cmp::Reverse(p.id),
+            )
+        }),
+        ProceduralPlaybookListSort::UpdatedAsc => {
+            playbooks.sort_by_key(|p| (p.updated_at, p.created_at, p.id))
+        }
+        ProceduralPlaybookListSort::ConfidenceDesc => playbooks.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+                .then_with(|| b.id.cmp(&a.id))
+        }),
+        ProceduralPlaybookListSort::SuccessDesc => playbooks.sort_by_key(|p| {
+            (
+                std::cmp::Reverse(p.success_count),
+                std::cmp::Reverse(p.updated_at),
+                std::cmp::Reverse(p.id),
+            )
+        }),
+    }
+}
+
+fn parse_consolidation_run_list_sort(
+    raw: Option<&str>,
+) -> Result<ConsolidationRunListSort, (StatusCode, String)> {
+    match raw
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+        .unwrap_or("started_desc")
+    {
+        "started_desc" => Ok(ConsolidationRunListSort::StartedDesc),
+        "started_asc" => Ok(ConsolidationRunListSort::StartedAsc),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid consolidation run sort '{}'; expected started_desc|started_asc",
+                other
+            ),
+        )),
+    }
+}
+
+fn apply_consolidation_run_list_sort(
+    runs: &mut [crate::agent::ConsolidationRun],
+    sort: ConsolidationRunListSort,
+) {
+    match sort {
+        ConsolidationRunListSort::StartedDesc => {
+            runs.sort_by_key(|r| (std::cmp::Reverse(r.started_at), std::cmp::Reverse(r.id)))
+        }
+        ConsolidationRunListSort::StartedAsc => runs.sort_by_key(|r| (r.started_at, r.id)),
+    }
+}
+
+fn parse_retrieval_task_class(
+    raw: Option<&str>,
+) -> Result<RetrievalTaskClass, (StatusCode, String)> {
+    match raw
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+        .unwrap_or("general")
+    {
+        "coding" => Ok(RetrievalTaskClass::Coding),
+        "troubleshooting" => Ok(RetrievalTaskClass::Troubleshooting),
+        "research" => Ok(RetrievalTaskClass::Research),
+        "routine_automation" | "routine" => Ok(RetrievalTaskClass::RoutineAutomation),
+        "system_admin" | "admin" => Ok(RetrievalTaskClass::SystemAdmin),
+        "general" => Ok(RetrievalTaskClass::General),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid retrieval task_class '{}'; expected coding|troubleshooting|research|routine_automation|system_admin|general",
                 other
             ),
         )),
@@ -3228,6 +3506,42 @@ async fn load_owned_plan(
     }
 
     Ok(plan)
+}
+
+async fn load_owned_memory_record(
+    state: &GatewayState,
+    store: &dyn Database,
+    record_id: Uuid,
+) -> Result<MemoryRecord, (StatusCode, String)> {
+    let record = store
+        .get_memory_record(record_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Memory record not found".to_string()))?;
+
+    if record.owner_user_id != state.user_id {
+        return Err((StatusCode::NOT_FOUND, "Memory record not found".to_string()));
+    }
+
+    Ok(record)
+}
+
+async fn load_owned_procedural_playbook(
+    state: &GatewayState,
+    store: &dyn Database,
+    playbook_id: Uuid,
+) -> Result<ProceduralPlaybook, (StatusCode, String)> {
+    let playbook = store
+        .get_procedural_playbook(playbook_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Playbook not found".to_string()))?;
+
+    if playbook.owner_user_id != state.user_id {
+        return Err((StatusCode::NOT_FOUND, "Playbook not found".to_string()));
+    }
+
+    Ok(playbook)
 }
 
 async fn load_owned_goal(
@@ -4294,6 +4608,319 @@ async fn plan_step_status_update_handler(
     Ok(Json(serde_json::json!({ "step": updated })))
 }
 
+async fn memory_plane_records_list_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(query): Query<MemoryPlaneRecordsListQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let sort = parse_memory_record_list_sort(query.sort.as_deref())?;
+
+    let goal_id = query
+        .goal_id
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid goal ID".to_string()))?;
+    let plan_id = query
+        .plan_id
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plan ID".to_string()))?;
+
+    let mut records = if let Some(goal_id) = goal_id {
+        store
+            .list_memory_records_for_goal(goal_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        store
+            .list_memory_records_for_user(&state.user_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    records.retain(|r| r.owner_user_id == state.user_id);
+    if let Some(memory_type) = query.memory_type {
+        records.retain(|r| r.memory_type == memory_type);
+    }
+    if let Some(status) = query.status {
+        records.retain(|r| r.status == status);
+    }
+    if let Some(goal_id) = goal_id {
+        records.retain(|r| r.goal_id == Some(goal_id));
+    }
+    if let Some(plan_id) = plan_id {
+        records.retain(|r| r.plan_id == Some(plan_id));
+    }
+    if let Some(category) = query
+        .category
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let category = category.to_ascii_lowercase();
+        records.retain(|r| r.category.to_ascii_lowercase() == category);
+    }
+    apply_memory_record_list_sort(&mut records, sort);
+    if let Some(offset) = query.offset
+        && offset > 0
+    {
+        records = records.into_iter().skip(offset).collect();
+    }
+    if let Some(limit) = query.limit {
+        if limit == 0 {
+            return Err((StatusCode::BAD_REQUEST, "limit must be >= 1".to_string()));
+        }
+        records.truncate(limit);
+    }
+
+    Ok(Json(serde_json::json!({ "memory_records": records })))
+}
+
+async fn memory_plane_record_detail_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let record_id = Uuid::parse_str(&id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid memory record ID".to_string(),
+        )
+    })?;
+    let record = load_owned_memory_record(state.as_ref(), store.as_ref(), record_id).await?;
+    let events = store
+        .list_memory_events_for_record(record.id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "memory_record": record,
+        "memory_events": events
+    })))
+}
+
+async fn memory_plane_playbooks_list_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(query): Query<MemoryPlanePlaybooksListQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let sort = parse_procedural_playbook_list_sort(query.sort.as_deref())?;
+
+    let mut playbooks = store
+        .list_procedural_playbooks_for_user(&state.user_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Some(status) = query.status {
+        playbooks.retain(|p| p.status == status);
+    }
+    if let Some(task_class) = query
+        .task_class
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let task_class = task_class.to_ascii_lowercase();
+        playbooks.retain(|p| p.task_class.to_ascii_lowercase() == task_class);
+    }
+    apply_procedural_playbook_list_sort(&mut playbooks, sort);
+    if let Some(offset) = query.offset
+        && offset > 0
+    {
+        playbooks = playbooks.into_iter().skip(offset).collect();
+    }
+    if let Some(limit) = query.limit {
+        if limit == 0 {
+            return Err((StatusCode::BAD_REQUEST, "limit must be >= 1".to_string()));
+        }
+        playbooks.truncate(limit);
+    }
+
+    Ok(Json(serde_json::json!({ "playbooks": playbooks })))
+}
+
+async fn memory_plane_playbook_detail_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let playbook_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid playbook ID".to_string()))?;
+    let playbook =
+        load_owned_procedural_playbook(state.as_ref(), store.as_ref(), playbook_id).await?;
+    Ok(Json(serde_json::json!({ "playbook": playbook })))
+}
+
+async fn memory_plane_playbook_status_update_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(body): Json<MemoryPlanePlaybookStatusUpdateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let playbook_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid playbook ID".to_string()))?;
+    let _ = load_owned_procedural_playbook(state.as_ref(), store.as_ref(), playbook_id).await?;
+    store
+        .update_procedural_playbook_status(playbook_id, body.status)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let updated =
+        load_owned_procedural_playbook(state.as_ref(), store.as_ref(), playbook_id).await?;
+    Ok(Json(serde_json::json!({ "playbook": updated })))
+}
+
+async fn memory_plane_consolidation_runs_list_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(query): Query<MemoryPlaneConsolidationRunsListQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let sort = parse_consolidation_run_list_sort(query.sort.as_deref())?;
+
+    let mut runs = store
+        .list_consolidation_runs_for_user(None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    runs.retain(|r| {
+        r.owner_user_id
+            .as_deref()
+            .is_none_or(|u| u == state.user_id)
+    });
+    if let Some(status) = query.status {
+        runs.retain(|r| r.status == status);
+    }
+    apply_consolidation_run_list_sort(&mut runs, sort);
+    if let Some(offset) = query.offset
+        && offset > 0
+    {
+        runs = runs.into_iter().skip(offset).collect();
+    }
+    if let Some(limit) = query.limit {
+        if limit == 0 {
+            return Err((StatusCode::BAD_REQUEST, "limit must be >= 1".to_string()));
+        }
+        runs.truncate(limit);
+    }
+
+    Ok(Json(serde_json::json!({ "consolidation_runs": runs })))
+}
+
+async fn memory_plane_consolidation_run_handler(
+    State(state): State<Arc<GatewayState>>,
+    body: Option<Json<MemoryPlaneConsolidationRunRequest>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let batch_size = body
+        .map(|Json(b)| b.batch_size.unwrap_or(50))
+        .unwrap_or(50)
+        .clamp(1, 500);
+
+    let consolidator = MemoryConsolidator::new(
+        MemoryConsolidatorConfig {
+            enabled: true,
+            interval: std::time::Duration::from_secs(60),
+            batch_size,
+        },
+        store.clone(),
+    );
+    let run = consolidator
+        .run_once()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(serde_json::json!({
+        "triggered": true,
+        "consolidation_run": run
+    })))
+}
+
+async fn memory_plane_retrieval_preview_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<MemoryPlaneRetrievalPreviewRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+    let task_class = parse_retrieval_task_class(body.task_class.as_deref())?;
+    let goal_id = body
+        .goal_id
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid goal ID".to_string()))?;
+    let plan_id = body
+        .plan_id
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plan ID".to_string()))?;
+    let job_id = body
+        .job_id
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
+    let query = body
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("memory retrieval preview")
+        .to_string();
+    let limit_budget = body.limit_budget.unwrap_or(12);
+    if limit_budget == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "limit_budget must be >= 1".to_string(),
+        ));
+    }
+
+    let bundle = MemoryRetrievalComposer::compose(
+        store.clone(),
+        MemoryRetrievalRequest {
+            user_id: state.user_id.clone(),
+            goal_id,
+            plan_id,
+            job_id,
+            task_class,
+            query,
+            limit_budget,
+        },
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(serde_json::json!({
+        "working_context": bundle.working_context,
+        "episodic_hits": bundle.episodic_hits,
+        "semantic_hits": bundle.semantic_hits,
+        "procedural_playbooks": bundle.procedural_playbooks,
+        "prompt_context_block": bundle.prompt_context_block,
+        "debug_meta": bundle.debug_meta,
+    })))
+}
+
 // --- Routines handlers ---
 
 async fn routines_list_handler(
@@ -4763,7 +5390,9 @@ struct GatewayStatusResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::PlanVerification;
+    use crate::agent::{
+        ConsolidationAction, MemoryEvent, MemorySensitivity, MemorySourceKind, PlanVerification,
+    };
     use crate::db::Database;
     use serde_json::json;
 
@@ -4799,6 +5428,71 @@ mod tests {
             kernel_orchestrator: None,
             chat_rate_limiter: RateLimiter::new(30, 60),
         })
+    }
+
+    fn sample_memory_record_for_test(
+        owner_user_id: &str,
+        memory_type: MemoryType,
+        status: MemoryRecordStatus,
+        category: &str,
+        title: &str,
+        summary: &str,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> MemoryRecord {
+        MemoryRecord {
+            id: Uuid::new_v4(),
+            owner_user_id: owner_user_id.to_string(),
+            goal_id: None,
+            plan_id: None,
+            plan_step_id: None,
+            job_id: None,
+            thread_id: None,
+            memory_type,
+            source_kind: MemorySourceKind::RoutineRun,
+            category: category.to_string(),
+            title: title.to_string(),
+            summary: summary.to_string(),
+            payload: json!({}),
+            provenance: json!({"source":"test"}),
+            confidence: 0.8,
+            sensitivity: MemorySensitivity::Internal,
+            ttl_secs: None,
+            status,
+            workspace_doc_path: None,
+            workspace_document_id: None,
+            created_at,
+            updated_at: created_at,
+            expires_at: None,
+        }
+    }
+
+    fn sample_playbook_for_test(
+        owner_user_id: &str,
+        name: &str,
+        task_class: &str,
+        status: ProceduralPlaybookStatus,
+        success_count: i32,
+        confidence: f32,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> ProceduralPlaybook {
+        ProceduralPlaybook {
+            id: Uuid::new_v4(),
+            owner_user_id: owner_user_id.to_string(),
+            name: name.to_string(),
+            task_class: task_class.to_string(),
+            trigger_signals: json!({}),
+            steps_template: json!({}),
+            tool_preferences: json!({}),
+            constraints: json!({}),
+            success_count,
+            failure_count: 0,
+            confidence,
+            status,
+            requires_approval: false,
+            source_memory_record_ids: json!([]),
+            created_at: updated_at,
+            updated_at,
+        }
     }
 
     async fn seed_goal_and_plan(store: &dyn Database, owner_user_id: &str) -> (Goal, Plan) {
@@ -5844,5 +6538,359 @@ mod tests {
         .unwrap_err();
         assert_eq!(plans_sort_err.0, StatusCode::BAD_REQUEST);
         assert!(plans_sort_err.1.contains("invalid plan sort"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_plane_records_list_and_detail_handlers_enforce_filters_and_ownership() {
+        let (_dir, store) = make_test_store().await;
+        let alice_state = make_test_gateway_state("alice", store.clone());
+        let bob_state = make_test_gateway_state("bob", store.clone());
+        let now = chrono::Utc::now();
+
+        let alice_active = sample_memory_record_for_test(
+            "alice",
+            MemoryType::Episodic,
+            MemoryRecordStatus::Active,
+            "routine_run_summary",
+            "Cleanup ok",
+            "Routine succeeded",
+            now,
+        );
+        let alice_archived = sample_memory_record_for_test(
+            "alice",
+            MemoryType::Episodic,
+            MemoryRecordStatus::Archived,
+            "routine_run_summary",
+            "Old cleanup",
+            "Old archived summary",
+            now - chrono::TimeDelta::minutes(1),
+        );
+        let bob_active = sample_memory_record_for_test(
+            "bob",
+            MemoryType::Episodic,
+            MemoryRecordStatus::Active,
+            "routine_run_summary",
+            "Bob cleanup",
+            "Should not be visible to alice",
+            now - chrono::TimeDelta::minutes(2),
+        );
+        for record in [&alice_active, &alice_archived, &bob_active] {
+            store
+                .create_memory_record(record)
+                .await
+                .expect("seed memory record");
+        }
+        store
+            .record_memory_event(&MemoryEvent {
+                id: Uuid::new_v4(),
+                memory_record_id: alice_active.id,
+                event_kind: "consolidated".to_string(),
+                actor: "test".to_string(),
+                reason_codes: vec!["seed".to_string()],
+                action: Some(ConsolidationAction::PromoteSemantic),
+                before: json!({"status":"active"}),
+                after: json!({"status":"active"}),
+                created_at: now,
+            })
+            .await
+            .expect("seed memory event");
+
+        let Json(body) = memory_plane_records_list_handler(
+            State(alice_state.clone()),
+            Query(MemoryPlaneRecordsListQuery {
+                memory_type: Some(MemoryType::Episodic),
+                status: Some(MemoryRecordStatus::Active),
+                goal_id: None,
+                plan_id: None,
+                category: Some("routine_run_summary".to_string()),
+                sort: Some("created_desc".to_string()),
+                offset: Some(0),
+                limit: Some(10),
+            }),
+        )
+        .await
+        .expect("list memory records");
+        let records = body["memory_records"].as_array().expect("records array");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["id"], json!(alice_active.id));
+        assert_eq!(records[0]["owner_user_id"], json!("alice"));
+
+        let Json(detail_body) = memory_plane_record_detail_handler(
+            State(alice_state.clone()),
+            Path(alice_active.id.to_string()),
+        )
+        .await
+        .expect("memory record detail");
+        assert_eq!(detail_body["memory_record"]["id"], json!(alice_active.id));
+        let events = detail_body["memory_events"]
+            .as_array()
+            .expect("events array");
+        assert_eq!(events.len(), 1);
+
+        let limit_err = memory_plane_records_list_handler(
+            State(alice_state),
+            Query(MemoryPlaneRecordsListQuery {
+                memory_type: None,
+                status: None,
+                goal_id: None,
+                plan_id: None,
+                category: None,
+                sort: None,
+                offset: None,
+                limit: Some(0),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(limit_err.0, StatusCode::BAD_REQUEST);
+        assert!(limit_err.1.contains("limit must be >= 1"));
+
+        let err =
+            memory_plane_record_detail_handler(State(bob_state), Path(alice_active.id.to_string()))
+                .await
+                .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1, "Memory record not found");
+    }
+
+    #[tokio::test]
+    async fn test_memory_plane_playbook_handlers_support_filters_status_updates_and_ownership() {
+        let (_dir, store) = make_test_store().await;
+        let alice_state = make_test_gateway_state("alice", store.clone());
+        let bob_state = make_test_gateway_state("bob", store.clone());
+        let now = chrono::Utc::now();
+
+        let alice_active = sample_playbook_for_test(
+            "alice",
+            "Routine: cleanup",
+            "routine_automation",
+            ProceduralPlaybookStatus::Active,
+            4,
+            0.91,
+            now,
+        );
+        let alice_draft = sample_playbook_for_test(
+            "alice",
+            "Routine: scan",
+            "routine_automation",
+            ProceduralPlaybookStatus::Draft,
+            2,
+            0.72,
+            now - chrono::TimeDelta::minutes(1),
+        );
+        let bob_active = sample_playbook_for_test(
+            "bob",
+            "Routine: bob-task",
+            "routine_automation",
+            ProceduralPlaybookStatus::Active,
+            9,
+            0.99,
+            now - chrono::TimeDelta::minutes(2),
+        );
+        for playbook in [&alice_active, &alice_draft, &bob_active] {
+            store
+                .create_or_update_procedural_playbook(playbook)
+                .await
+                .expect("seed playbook");
+        }
+
+        let Json(body) = memory_plane_playbooks_list_handler(
+            State(alice_state.clone()),
+            Query(MemoryPlanePlaybooksListQuery {
+                task_class: Some("routine_automation".to_string()),
+                status: Some(ProceduralPlaybookStatus::Active),
+                sort: Some("success_desc".to_string()),
+                offset: None,
+                limit: Some(5),
+            }),
+        )
+        .await
+        .expect("list playbooks");
+        let playbooks = body["playbooks"].as_array().expect("playbooks array");
+        assert_eq!(playbooks.len(), 1);
+        assert_eq!(playbooks[0]["id"], json!(alice_active.id));
+
+        let Json(update_body) = memory_plane_playbook_status_update_handler(
+            State(alice_state.clone()),
+            Path(alice_active.id.to_string()),
+            Json(MemoryPlanePlaybookStatusUpdateRequest {
+                status: ProceduralPlaybookStatus::Paused,
+            }),
+        )
+        .await
+        .expect("update playbook status");
+        assert_eq!(update_body["playbook"]["status"], json!("paused"));
+
+        let Json(detail_body) = memory_plane_playbook_detail_handler(
+            State(alice_state),
+            Path(alice_active.id.to_string()),
+        )
+        .await
+        .expect("playbook detail");
+        assert_eq!(detail_body["playbook"]["status"], json!("paused"));
+
+        let err = memory_plane_playbook_status_update_handler(
+            State(bob_state),
+            Path(alice_active.id.to_string()),
+            Json(MemoryPlanePlaybookStatusUpdateRequest {
+                status: ProceduralPlaybookStatus::Retired,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1, "Playbook not found");
+    }
+
+    #[tokio::test]
+    async fn test_memory_plane_consolidation_run_and_runs_list_handlers() {
+        let (_dir, store) = make_test_store().await;
+        let state = make_test_gateway_state("alice", store.clone());
+        let now = chrono::Utc::now();
+
+        store
+            .create_memory_record(&sample_memory_record_for_test(
+                "alice",
+                MemoryType::Episodic,
+                MemoryRecordStatus::Active,
+                "routine_run_summary",
+                "Nightly cleanup",
+                "Routine completed successfully",
+                now,
+            ))
+            .await
+            .expect("seed routine summary");
+
+        let Json(run_body) = memory_plane_consolidation_run_handler(
+            State(state.clone()),
+            Some(Json(MemoryPlaneConsolidationRunRequest {
+                batch_size: Some(5),
+            })),
+        )
+        .await
+        .expect("manual consolidation run");
+        assert_eq!(run_body["triggered"], json!(true));
+        assert_eq!(run_body["consolidation_run"]["status"], json!("completed"));
+        assert_eq!(run_body["consolidation_run"]["processed_count"], json!(1));
+
+        let Json(list_body) = memory_plane_consolidation_runs_list_handler(
+            State(state),
+            Query(MemoryPlaneConsolidationRunsListQuery {
+                status: Some(ConsolidationRunStatus::Completed),
+                sort: Some("started_desc".to_string()),
+                offset: Some(0),
+                limit: Some(5),
+            }),
+        )
+        .await
+        .expect("list consolidation runs");
+        let runs = list_body["consolidation_runs"]
+            .as_array()
+            .expect("runs array");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["status"], json!("completed"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_plane_retrieval_preview_handler_returns_bundle_and_validates_inputs() {
+        let (_dir, store) = make_test_store().await;
+        let state = make_test_gateway_state("alice", store.clone());
+        let now = chrono::Utc::now();
+
+        store
+            .create_memory_record(&sample_memory_record_for_test(
+                "alice",
+                MemoryType::Episodic,
+                MemoryRecordStatus::Active,
+                "routine_run_summary",
+                "Cleanup completed",
+                "Routine completed successfully",
+                now,
+            ))
+            .await
+            .expect("seed episodic");
+        store
+            .create_memory_record(&sample_memory_record_for_test(
+                "alice",
+                MemoryType::Semantic,
+                MemoryRecordStatus::Active,
+                "semantic_summary",
+                "Cleanup policy",
+                "Prefer dry-run before deletion",
+                now - chrono::TimeDelta::minutes(1),
+            ))
+            .await
+            .expect("seed semantic");
+        store
+            .create_or_update_procedural_playbook(&sample_playbook_for_test(
+                "alice",
+                "Routine: cleanup",
+                "routine_automation",
+                ProceduralPlaybookStatus::Active,
+                3,
+                0.85,
+                now,
+            ))
+            .await
+            .expect("seed playbook");
+
+        let Json(body) = memory_plane_retrieval_preview_handler(
+            State(state.clone()),
+            Json(MemoryPlaneRetrievalPreviewRequest {
+                task_class: Some("routine_automation".to_string()),
+                goal_id: None,
+                plan_id: None,
+                job_id: None,
+                query: Some("Need routine cleanup guidance".to_string()),
+                limit_budget: Some(8),
+            }),
+        )
+        .await
+        .expect("retrieval preview");
+        assert!(
+            body["prompt_context_block"]
+                .as_str()
+                .expect("prompt block string")
+                .contains("Routine: cleanup")
+        );
+        assert_eq!(
+            body["procedural_playbooks"]
+                .as_array()
+                .expect("playbooks")
+                .len(),
+            1
+        );
+
+        let task_err = memory_plane_retrieval_preview_handler(
+            State(state.clone()),
+            Json(MemoryPlaneRetrievalPreviewRequest {
+                task_class: Some("bad".to_string()),
+                goal_id: None,
+                plan_id: None,
+                job_id: None,
+                query: None,
+                limit_budget: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(task_err.0, StatusCode::BAD_REQUEST);
+        assert!(task_err.1.contains("invalid retrieval task_class"));
+
+        let budget_err = memory_plane_retrieval_preview_handler(
+            State(state),
+            Json(MemoryPlaneRetrievalPreviewRequest {
+                task_class: Some("general".to_string()),
+                goal_id: None,
+                plan_id: None,
+                job_id: None,
+                query: None,
+                limit_budget: Some(0),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(budget_err.0, StatusCode::BAD_REQUEST);
+        assert!(budget_err.1.contains("limit_budget must be >= 1"));
     }
 }
