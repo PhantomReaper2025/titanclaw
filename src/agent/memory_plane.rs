@@ -25,6 +25,7 @@ pub enum MemoryType {
 #[serde(rename_all = "snake_case")]
 pub enum MemorySourceKind {
     WorkerPlanExecution,
+    SchedulerSubtask,
     DispatcherToolExecution,
     ApprovalFlow,
     RoutineRun,

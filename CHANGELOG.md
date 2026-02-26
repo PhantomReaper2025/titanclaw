@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Internal Memory Plane v2 groundwork: typed memory-plane domain models (`src/agent/memory_plane.rs`), new `AutonomyMemoryStore` DB subtrait, dual-backend Postgres/libSQL CRUD foundations for memory records/events/procedural playbooks/consolidation runs, and schema migrations `V19`-`V23` plus libSQL schema mirror updates.
 - Internal Phase 2 Memory Plane v2 config/decision scaffolding: default-off runtime rollout flags (`AUTONOMY_MEMORY_PLANE_V2`, `AUTONOMY_MEMORY_RETRIEVAL_V2`, `AUTONOMY_MEMORY_CONSOLIDATION_V2` + tuning knobs) and a deterministic `MemoryWritePolicyEngine` classifier module with unit tests.
 - Initial Phase 2 Memory Plane v2 runtime write integration (flag-gated): worker step/verifier/replan events and worker/chat policy decisions can now be mirrored into `autonomy_memory_records` via a shared classifier-backed helper when `AUTONOMY_MEMORY_PLANE_V2=true` (best-effort/fail-open persistence).
+- Expanded Phase 2 Memory Plane v2 flag-gated runtime writes to scheduler/routine paths: scheduler tool-subtask outcomes (with local-fallback/remote-path hints) and routine-run summaries now persist memory records, and repeated successful routine runs seed procedural playbook-candidate records.
 
 ### Changed
 

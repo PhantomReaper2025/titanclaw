@@ -9,6 +9,9 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::agent::MemorySourceKind;
+use crate::agent::memory_plane::{MemoryRecordWriteRequest, persist_memory_record_best_effort};
+use crate::agent::memory_write_policy::MemoryWriteIntent;
 use crate::agent::policy_engine::{
     ApprovalPolicyOutcome, evaluate_dispatcher_tool_approval, evaluate_worker_tool_approval,
 };
@@ -112,6 +115,14 @@ impl Scheduler {
             jobs: Arc::new(RwLock::new(HashMap::new())),
             subtasks: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    pub(crate) fn autonomy_memory_plane_v2_enabled(&self) -> bool {
+        self.config.autonomy_memory_plane_v2
+    }
+
+    pub(crate) fn autonomy_memory_playbook_min_repetitions(&self) -> u32 {
+        self.config.autonomy_memory_playbook_min_repetitions
     }
 
     /// Schedule a job for execution.
@@ -243,6 +254,11 @@ impl Scheduler {
                 let safety = self.safety.clone();
                 let swarm_handle = self.swarm_handle.clone();
                 let swarm_results = self.swarm_results.clone();
+                let store = self.store.clone();
+                let memory_plane_v2_enabled = self.config.autonomy_memory_plane_v2;
+                let episodic_ttl_days = self.config.autonomy_memory_episodic_ttl_days;
+                let swarm_path_available =
+                    self.swarm_handle.is_some() && self.swarm_results.is_some();
                 let task_id_for_remote = task_id;
                 let tool_name_for_remote = tool_name.clone();
                 let params_for_remote = params.clone();
@@ -251,6 +267,9 @@ impl Scheduler {
 
                 tokio::spawn(async move {
                     let mut used_local_fallback = false;
+                    let memory_context_manager = context_manager.clone();
+                    let tool_name_memory = tool_name_for_remote.clone();
+                    let params_memory = params_for_remote.clone();
                     let result = if let (Some(handle), Some(router)) = (swarm_handle, swarm_results)
                     {
                         match decide_offload(
@@ -459,6 +478,90 @@ impl Scheduler {
                     };
                     if used_local_fallback {
                         metrics.local_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    if memory_plane_v2_enabled {
+                        if let Some(store) = store {
+                            let job_ctx = memory_context_manager
+                                .get_context(tool_parent_id)
+                                .await
+                                .ok();
+                            let (owner_user_id, goal_id, plan_id, plan_step_id) = match job_ctx {
+                                Some(ctx) => (
+                                    ctx.user_id,
+                                    ctx.autonomy_goal_id,
+                                    ctx.autonomy_plan_id,
+                                    ctx.autonomy_plan_step_id,
+                                ),
+                                None => ("default".to_string(), None, None, None),
+                            };
+                            let (success, duration_ms, result_preview) = match &result {
+                                Ok(output) => (
+                                    true,
+                                    Some(output.duration.as_millis() as u64),
+                                    serde_json::to_string(&output.result)
+                                        .ok()
+                                        .map(|s| truncate_chars(&s, 400)),
+                                ),
+                                Err(err) => {
+                                    (false, None, Some(truncate_chars(&err.to_string(), 400)))
+                                }
+                            };
+                            let params_preview = serde_json::to_string(&params_memory)
+                                .ok()
+                                .map(|s| truncate_chars(&s, 400));
+                            let now = chrono::Utc::now();
+                            persist_memory_record_best_effort(
+                                store,
+                                MemoryRecordWriteRequest {
+                                    owner_user_id,
+                                    goal_id,
+                                    plan_id,
+                                    plan_step_id,
+                                    job_id: Some(tool_parent_id),
+                                    thread_id: None,
+                                    source_kind: MemorySourceKind::SchedulerSubtask,
+                                    category: "scheduler_subtask_outcome".to_string(),
+                                    title: format!(
+                                        "Scheduler subtask {} ({})",
+                                        if success { "succeeded" } else { "failed" },
+                                        tool_name_memory
+                                    ),
+                                    summary: format!(
+                                        "Tool subtask '{}' {}{}",
+                                        tool_name_memory,
+                                        if success { "succeeded" } else { "failed" },
+                                        if used_local_fallback {
+                                            " with local fallback"
+                                        } else if swarm_path_available {
+                                            " via remote path"
+                                        } else {
+                                            ""
+                                        }
+                                    ),
+                                    payload: serde_json::json!({
+                                        "task_id": task_id_for_remote,
+                                        "tool_name": tool_name_memory,
+                                        "used_local_fallback": used_local_fallback,
+                                        "swarm_path_available": swarm_path_available,
+                                        "success": success,
+                                        "duration_ms": duration_ms,
+                                        "params_preview": params_preview,
+                                        "result_preview": result_preview,
+                                    }),
+                                    provenance: serde_json::json!({
+                                        "source": "scheduler.spawn_subtask",
+                                        "timestamp": now,
+                                    }),
+                                    desired_memory_type: None,
+                                    confidence_hint: Some(if success { 0.9 } else { 0.75 }),
+                                    sensitivity_hint: None,
+                                    ttl_secs_hint: Some((episodic_ttl_days as i64) * 24 * 60 * 60),
+                                    high_impact: false,
+                                    intent: MemoryWriteIntent::Generic,
+                                },
+                            );
+                        }
                     }
 
                     // Send result (ignore if receiver dropped)
@@ -799,6 +902,18 @@ async fn decide_offload(
         Ok(true) => OffloadDecision::RemotePreferred,
         Ok(false) | Err(_) => OffloadDecision::LocalOnly,
     }
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 #[cfg(test)]

@@ -20,9 +20,12 @@ use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
 use crate::agent::Scheduler;
+use crate::agent::memory_plane::{MemoryRecordWriteRequest, persist_memory_record_best_effort};
+use crate::agent::memory_write_policy::MemoryWriteIntent;
 use crate::agent::routine::{
     NotifyConfig, Routine, RoutineAction, RoutineRun, RunStatus, Trigger, next_cron_fire,
 };
+use crate::agent::{MemorySourceKind, MemoryType};
 use crate::channels::{IncomingMessage, OutgoingResponse};
 use crate::config::RoutineConfig;
 use crate::context::{ContextManager, JobState};
@@ -378,6 +381,106 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
         .await
     {
         tracing::error!(routine = %routine.name, "Failed to update runtime state: {}", e);
+    }
+
+    if ctx.scheduler.autonomy_memory_plane_v2_enabled() {
+        let now_ts = Utc::now();
+        let summary_text = summary.clone().unwrap_or_else(|| {
+            format!(
+                "Routine '{}' completed with status {}",
+                routine.name, status
+            )
+        });
+        let action_type = match &routine.action {
+            RoutineAction::Lightweight { .. } => "lightweight",
+            RoutineAction::FullJob { .. } => "full_job",
+        };
+
+        persist_memory_record_best_effort(
+            Arc::clone(&ctx.store),
+            MemoryRecordWriteRequest {
+                owner_user_id: routine.user_id.clone(),
+                goal_id: None,
+                plan_id: None,
+                plan_step_id: None,
+                job_id: run.job_id,
+                thread_id: None,
+                source_kind: MemorySourceKind::RoutineRun,
+                category: "routine_run_summary".to_string(),
+                title: format!("Routine '{}' {}", routine.name, status),
+                summary: truncate(&summary_text, 240),
+                payload: serde_json::json!({
+                    "routine_id": routine.id,
+                    "routine_name": routine.name,
+                    "routine_run_id": run.id,
+                    "status": status.to_string(),
+                    "trigger_type": run.trigger_type,
+                    "trigger_detail": run.trigger_detail,
+                    "action_type": action_type,
+                    "tokens_used": tokens,
+                    "result_summary": summary,
+                }),
+                provenance: serde_json::json!({
+                    "source": "routine_engine.execute_routine",
+                    "timestamp": now_ts,
+                    "routine_run_id": run.id,
+                }),
+                desired_memory_type: None,
+                confidence_hint: Some(if status == RunStatus::Ok { 0.88 } else { 0.76 }),
+                sensitivity_hint: None,
+                ttl_secs_hint: None,
+                high_impact: false,
+                intent: MemoryWriteIntent::RoutineSummary {
+                    successful: status == RunStatus::Ok,
+                },
+            },
+        );
+
+        let next_run_count = routine.run_count.saturating_add(1);
+        if status == RunStatus::Ok
+            && next_run_count >= ctx.scheduler.autonomy_memory_playbook_min_repetitions() as u64
+        {
+            persist_memory_record_best_effort(
+                Arc::clone(&ctx.store),
+                MemoryRecordWriteRequest {
+                    owner_user_id: routine.user_id.clone(),
+                    goal_id: None,
+                    plan_id: None,
+                    plan_step_id: None,
+                    job_id: run.job_id,
+                    thread_id: None,
+                    source_kind: MemorySourceKind::RoutineRun,
+                    category: "routine_playbook_candidate".to_string(),
+                    title: format!("Playbook candidate from routine '{}'", routine.name),
+                    summary: truncate(&summary_text, 240),
+                    payload: serde_json::json!({
+                        "routine_id": routine.id,
+                        "routine_name": routine.name,
+                        "routine_run_id": run.id,
+                        "task_class": "routine_automation",
+                        "trigger_type": run.trigger_type,
+                        "action_type": action_type,
+                        "observed_success_count": next_run_count,
+                        "candidate_steps_hint": {
+                            "action_type": action_type,
+                            "max_concurrent": routine.guardrails.max_concurrent,
+                        },
+                        "result_summary": summary,
+                    }),
+                    provenance: serde_json::json!({
+                        "source": "routine_engine.execute_routine",
+                        "timestamp": now_ts,
+                        "routine_run_id": run.id,
+                    }),
+                    desired_memory_type: Some(MemoryType::Procedural),
+                    confidence_hint: Some(0.72),
+                    sensitivity_hint: None,
+                    ttl_secs_hint: None,
+                    high_impact: false,
+                    intent: MemoryWriteIntent::Generic,
+                },
+            );
+        }
     }
 
     // Send notifications based on config
