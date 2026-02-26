@@ -579,6 +579,20 @@ impl AutonomyExecutionStore for PgBackend {
         rows.iter().map(row_to_execution_attempt).collect()
     }
 
+    async fn list_execution_attempts_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<ExecutionAttempt>, DatabaseError> {
+        let conn = self.store.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT * FROM autonomy_execution_attempts WHERE user_id = $1 ORDER BY started_at DESC, id DESC",
+                &[&user_id],
+            )
+            .await?;
+        rows.iter().map(row_to_execution_attempt).collect()
+    }
+
     async fn list_policy_decisions_for_goal(
         &self,
         goal_id: Uuid,

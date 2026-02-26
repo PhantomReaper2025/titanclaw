@@ -1117,6 +1117,38 @@ impl AutonomyExecutionStore for LibSqlBackend {
         Ok(attempts)
     }
 
+    async fn list_execution_attempts_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<ExecutionAttempt>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT
+                    id, goal_id, plan_id, plan_step_id, job_id, thread_id, user_id, channel,
+                    tool_name, tool_call_id, tool_args, status, failure_class, retry_count,
+                    started_at, finished_at, elapsed_ms, result_summary, error_preview
+                FROM autonomy_execution_attempts
+                WHERE user_id = ?1
+                ORDER BY started_at DESC, id DESC
+                "#,
+                params![user_id],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut attempts = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            attempts.push(row_to_execution_attempt_libsql(&row)?);
+        }
+        Ok(attempts)
+    }
+
     async fn list_policy_decisions_for_goal(
         &self,
         goal_id: Uuid,

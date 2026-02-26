@@ -43,6 +43,7 @@ pub mod shadow_engine;
 pub mod submission;
 pub mod task;
 mod thread_ops;
+pub(crate) mod tool_reliability;
 pub mod undo;
 mod verifier_v1;
 pub mod worker;
