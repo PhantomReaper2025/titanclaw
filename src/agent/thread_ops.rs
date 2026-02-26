@@ -1750,6 +1750,27 @@ mod tests {
         .expect("timed out waiting for policy decisions")
     }
 
+    async fn wait_for_memory_records_for_user(
+        db: &dyn crate::db::Database,
+        user_id: &str,
+        min_count: usize,
+    ) -> Vec<crate::agent::MemoryRecord> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = db
+                    .list_memory_records_for_user(user_id)
+                    .await
+                    .expect("list memory records for user");
+                if rows.len() >= min_count {
+                    break rows;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for memory records")
+    }
+
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn test_process_approval_rechecks_hook_and_blocks_execution() {
@@ -1762,6 +1783,7 @@ mod tests {
 
         let mut config = AgentConfig::resolve(&Settings::default()).expect("config");
         config.autonomy_policy_engine_v1 = true;
+        config.autonomy_memory_plane_v2 = true;
 
         let agent = Agent::new(
             config,
@@ -1854,6 +1876,19 @@ mod tests {
             }),
             "expected approval_resume_hook deny policy record"
         );
+
+        let memory_rows = wait_for_memory_records_for_user(harness.db.as_ref(), "user-1", 2).await;
+        assert!(
+            memory_rows
+                .iter()
+                .filter(|r| {
+                    r.source_kind == crate::agent::MemorySourceKind::ApprovalFlow
+                        && r.category == "policy_decision"
+                })
+                .count()
+                >= 2,
+            "expected approval flow policy_decision memory records"
+        );
     }
 
     #[cfg(feature = "libsql")]
@@ -1864,6 +1899,7 @@ mod tests {
 
         let mut config = AgentConfig::resolve(&Settings::default()).expect("config");
         config.autonomy_policy_engine_v1 = true;
+        config.autonomy_memory_plane_v2 = true;
 
         let agent = Agent::new(
             config,
@@ -1948,6 +1984,16 @@ mod tests {
                     && d.auto_approved == Some(false)
             }),
             "expected rejection policy decision record"
+        );
+
+        let memory_rows = wait_for_memory_records_for_user(harness.db.as_ref(), "user-2", 1).await;
+        assert!(
+            memory_rows.iter().any(|r| {
+                r.source_kind == crate::agent::MemorySourceKind::ApprovalFlow
+                    && r.category == "policy_decision"
+                    && r.summary.contains("approval_resume_decision")
+            }),
+            "expected approval rejection memory-plane policy record"
         );
     }
 }

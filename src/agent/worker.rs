@@ -2591,6 +2591,27 @@ mod tests {
         }
     }
 
+    async fn wait_for_memory_records_for_user(
+        db: &dyn crate::db::Database,
+        user_id: &str,
+        min_count: usize,
+    ) -> Vec<crate::agent::MemoryRecord> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = db
+                    .list_memory_records_for_user(user_id)
+                    .await
+                    .expect("list memory records for user");
+                if rows.len() >= min_count {
+                    break rows;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for memory records")
+    }
+
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn test_execute_plan_verifier_block_returns_replan_request_and_persists_verification() {
@@ -2630,7 +2651,7 @@ mod tests {
                 autonomy_policy_engine_v1: true,
                 autonomy_verifier_v1: true,
                 autonomy_replanner_v1: true,
-                autonomy_memory_plane_v2: false,
+                autonomy_memory_plane_v2: true,
                 autonomy_memory_retrieval_v2: false,
             },
         );
@@ -2765,6 +2786,29 @@ mod tests {
             crate::agent::PlanVerificationStatus::Inconclusive
         );
         assert_eq!(verifications[0].completion_claimed, true);
+
+        let memory_rows = wait_for_memory_records_for_user(harness.db.as_ref(), "user-1", 3).await;
+        assert!(
+            memory_rows.iter().any(|r| {
+                r.source_kind == crate::agent::MemorySourceKind::WorkerPlanExecution
+                    && r.category == "worker_step_outcome"
+            }),
+            "expected worker_step_outcome memory record"
+        );
+        assert!(
+            memory_rows.iter().any(|r| {
+                r.source_kind == crate::agent::MemorySourceKind::WorkerPlanExecution
+                    && r.category == "verifier_outcome"
+            }),
+            "expected verifier_outcome memory record"
+        );
+        assert!(
+            memory_rows.iter().any(|r| {
+                r.source_kind == crate::agent::MemorySourceKind::WorkerPlanExecution
+                    && r.category == "replan_event"
+            }),
+            "expected replan_event memory record"
+        );
     }
 
     #[cfg(feature = "libsql")]
@@ -3042,6 +3086,16 @@ mod tests {
                 .reason_codes
                 .iter()
                 .any(|c| c == "tool_requires_approval")
+        );
+
+        let memory_rows = harness
+            .db
+            .list_memory_records_for_user("user-1")
+            .await
+            .expect("list memory records");
+        assert!(
+            memory_rows.is_empty(),
+            "memory-plane writes should remain disabled when AUTONOMY_MEMORY_PLANE_V2 is false"
         );
     }
 }
