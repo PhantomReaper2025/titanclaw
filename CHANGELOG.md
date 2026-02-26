@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Internal Phase 2 Memory Plane v2 config/decision scaffolding: default-off runtime rollout flags (`AUTONOMY_MEMORY_PLANE_V2`, `AUTONOMY_MEMORY_RETRIEVAL_V2`, `AUTONOMY_MEMORY_CONSOLIDATION_V2` + tuning knobs) and a deterministic `MemoryWritePolicyEngine` classifier module with unit tests.
 - Initial Phase 2 Memory Plane v2 runtime write integration (flag-gated): worker step/verifier/replan events and worker/chat policy decisions can now be mirrored into `autonomy_memory_records` via a shared classifier-backed helper when `AUTONOMY_MEMORY_PLANE_V2=true` (best-effort/fail-open persistence).
 - Expanded Phase 2 Memory Plane v2 flag-gated runtime writes to scheduler/routine paths: scheduler tool-subtask outcomes (with local-fallback/remote-path hints) and routine-run summaries now persist memory records, and repeated successful routine runs seed procedural playbook-candidate records.
+- Added a flag-gated, supervised `MemoryConsolidator` loop for Phase 2 Memory Plane v2 that records consolidation runs/events, processes active episodic memory records in batches, and performs an initial deterministic routine-summary -> semantic-summary promotion path with source demote/archive handling.
 
 ### Changed
 

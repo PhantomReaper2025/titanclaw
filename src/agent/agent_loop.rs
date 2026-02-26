@@ -15,6 +15,7 @@ use tokio::sync::watch;
 
 use crate::agent::context_monitor::ContextMonitor;
 use crate::agent::heartbeat::spawn_heartbeat;
+use crate::agent::memory_consolidator::{MemoryConsolidator, MemoryConsolidatorConfig};
 use crate::agent::profile_onboarding::ProfileOnboardingManager;
 use crate::agent::profile_synthesizer::{ProfileSynthesisConfig, ProfileSynthesizer};
 use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
@@ -186,6 +187,7 @@ pub struct Agent {
     pub(super) shadow_engine: Option<Arc<ShadowEngine>>,
     pub(super) profile_onboarding: Option<Arc<ProfileOnboardingManager>>,
     pub(super) profile_synthesizer: Option<Arc<ProfileSynthesizer>>,
+    pub(super) memory_consolidator: Option<Arc<MemoryConsolidator>>,
 }
 
 impl Agent {
@@ -224,6 +226,16 @@ impl Agent {
                 deps.cheap_llm.clone().unwrap_or_else(|| deps.llm.clone()),
             )
         });
+        let memory_consolidator = deps.store.as_ref().map(|store| {
+            MemoryConsolidator::new(
+                MemoryConsolidatorConfig {
+                    enabled: config.autonomy_memory_consolidation_v2,
+                    interval: config.autonomy_memory_consolidation_interval,
+                    batch_size: config.autonomy_memory_consolidation_batch_size,
+                },
+                Arc::clone(store),
+            )
+        });
         let context_manager = context_manager
             .unwrap_or_else(|| Arc::new(ContextManager::new(config.max_parallel_jobs)));
 
@@ -256,6 +268,7 @@ impl Agent {
             shadow_engine,
             profile_onboarding,
             profile_synthesizer,
+            memory_consolidator,
         }
     }
 
@@ -520,6 +533,30 @@ impl Agent {
         } else {
             None
         };
+
+        let memory_consolidator_handle =
+            if let Some(consolidator) = self.memory_consolidator.clone() {
+                if consolidator.enabled() {
+                    let interval = consolidator.interval();
+                    Some(spawn_supervised_background_task(
+                        "memory_consolidator",
+                        background_shutdown_rx.clone(),
+                        move || {
+                            let consolidator = Arc::clone(&consolidator);
+                            tokio::spawn(async move {
+                                loop {
+                                    tokio::time::sleep(interval).await;
+                                    consolidator.tick().await;
+                                }
+                            })
+                        },
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
         // Spawn session pruning task
         let session_mgr = self.session_manager.clone();
@@ -907,6 +944,13 @@ impl Agent {
             }
         }
         if let Some(handle) = shadow_prune_handle {
+            let mut handle = handle;
+            let _ = tokio::time::timeout(Duration::from_secs(2), &mut handle).await;
+            if !handle.is_finished() {
+                handle.abort();
+            }
+        }
+        if let Some(handle) = memory_consolidator_handle {
             let mut handle = handle;
             let _ = tokio::time::timeout(Duration::from_secs(2), &mut handle).await;
             if !handle.is_finished() {
