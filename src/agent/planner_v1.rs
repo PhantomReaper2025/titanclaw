@@ -4,7 +4,7 @@
 //! validation + normalized plan trace formatting around it.
 
 use crate::error::{Error, WorkerError};
-use crate::llm::{ActionPlan, Reasoning, ReasoningContext};
+use crate::llm::{ActionPlan, ChatMessage, Reasoning, ReasoningContext};
 
 #[derive(Debug, Clone)]
 pub(super) struct PlannerOutput {
@@ -15,17 +15,47 @@ pub(super) struct PlannerOutput {
 pub(super) struct PlannerV1;
 
 impl PlannerV1 {
+    #[allow(dead_code)]
     pub(super) async fn plan_initial(
         reasoning: &Reasoning,
         reason_ctx: &ReasoningContext,
     ) -> Result<PlannerOutput, Error> {
-        let action_plan = reasoning.plan(reason_ctx).await?;
+        Self::plan_initial_with_retrieval(reasoning, reason_ctx, None).await
+    }
+
+    pub(super) async fn plan_initial_with_retrieval(
+        reasoning: &Reasoning,
+        reason_ctx: &ReasoningContext,
+        retrieval_context_block: Option<&str>,
+    ) -> Result<PlannerOutput, Error> {
+        let mut planning_ctx = clone_reasoning_context(reason_ctx);
+        if let Some(block) = retrieval_context_block
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+        {
+            planning_ctx.messages.push(ChatMessage::system(format!(
+                "Retrieved memory context for planning (Phase 2, best-effort):\n{}",
+                block
+            )));
+        }
+
+        let action_plan = reasoning.plan(&planning_ctx).await?;
         validate_action_plan(&action_plan)?;
         let plan_trace_summary = render_plan_trace_summary(&action_plan);
         Ok(PlannerOutput {
             action_plan,
             plan_trace_summary,
         })
+    }
+}
+
+fn clone_reasoning_context(reason_ctx: &ReasoningContext) -> ReasoningContext {
+    ReasoningContext {
+        messages: reason_ctx.messages.clone(),
+        available_tools: reason_ctx.available_tools.clone(),
+        job_description: reason_ctx.job_description.clone(),
+        current_state: reason_ctx.current_state.clone(),
+        metadata: reason_ctx.metadata.clone(),
     }
 }
 
@@ -70,7 +100,7 @@ pub(super) fn render_plan_trace_summary(plan: &ActionPlan) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::ActionPlan;
+    use crate::llm::{ActionPlan, ChatMessage};
 
     fn sample_plan() -> ActionPlan {
         serde_json::from_value(serde_json::json!({
@@ -109,5 +139,29 @@ mod tests {
         plan.confidence = 1.5;
         let err = validate_action_plan(&plan).unwrap_err();
         assert!(err.to_string().contains("invalid confidence"));
+    }
+
+    #[test]
+    fn test_clone_reasoning_context_preserves_original_and_allows_injected_message() {
+        let mut ctx = ReasoningContext::new();
+        ctx.messages.push(ChatMessage::user("hello"));
+        ctx.job_description = Some("job".to_string());
+        ctx.current_state = Some("state".to_string());
+        ctx.metadata
+            .insert("thread_id".to_string(), "t1".to_string());
+
+        let mut cloned = clone_reasoning_context(&ctx);
+        cloned
+            .messages
+            .push(ChatMessage::system("retrieved memory"));
+
+        assert_eq!(ctx.messages.len(), 1);
+        assert_eq!(cloned.messages.len(), 2);
+        assert_eq!(cloned.job_description.as_deref(), Some("job"));
+        assert_eq!(cloned.current_state.as_deref(), Some("state"));
+        assert_eq!(
+            cloned.metadata.get("thread_id").map(String::as_str),
+            Some("t1")
+        );
     }
 }

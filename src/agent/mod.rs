@@ -24,6 +24,7 @@ pub mod kernel_monitor;
 pub mod kernel_orchestrator;
 mod memory_consolidator;
 pub mod memory_plane;
+mod memory_retrieval_composer;
 mod memory_write_policy;
 mod planner_v1;
 mod policy_engine;

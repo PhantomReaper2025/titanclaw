@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expanded Phase 2 Memory Plane v2 flag-gated runtime writes to scheduler/routine paths: scheduler tool-subtask outcomes (with local-fallback/remote-path hints) and routine-run summaries now persist memory records, and repeated successful routine runs seed procedural playbook-candidate records.
 - Added a flag-gated, supervised `MemoryConsolidator` loop for Phase 2 Memory Plane v2 that records consolidation runs/events, processes active episodic memory records in batches, and performs an initial deterministic routine-summary -> semantic-summary promotion path with source demote/archive handling.
 - Expanded the Phase 2 `MemoryConsolidator` deterministic promotion path to process routine playbook-candidate episodic records into `autonomy_procedural_playbooks` (create on first candidate, update on repeated candidates with success/confidence/source-id tracking) while archiving the source candidate and recording `GeneratePlaybook` consolidation events.
+- Added a flag-gated `MemoryRetrievalComposer` for Phase 2 Memory Plane v2 with task-class inference, task-aware memory/playbook selection, and transient retrieval-context prompt injection into worker initial planning + automatic replanning via the `PlannerV1` wrapper (`AUTONOMY_MEMORY_RETRIEVAL_V2`, fail-open on retrieval errors).
 
 ### Changed
 

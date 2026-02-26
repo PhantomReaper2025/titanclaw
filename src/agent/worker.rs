@@ -9,6 +9,9 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::agent::memory_plane::{MemoryRecordWriteRequest, persist_memory_record_best_effort};
+use crate::agent::memory_retrieval_composer::{
+    MemoryRetrievalComposer, MemoryRetrievalRequest, RetrievalTaskClass,
+};
 use crate::agent::memory_write_policy::MemoryWriteIntent;
 use crate::agent::planner_v1::PlannerV1;
 use crate::agent::policy_engine::{
@@ -56,6 +59,7 @@ pub struct WorkerDeps {
     pub autonomy_verifier_v1: bool,
     pub autonomy_replanner_v1: bool,
     pub autonomy_memory_plane_v2: bool,
+    pub autonomy_memory_retrieval_v2: bool,
 }
 
 /// Worker that executes a single job.
@@ -308,8 +312,87 @@ impl Worker {
         self.deps.autonomy_memory_plane_v2
     }
 
+    fn autonomy_memory_retrieval_v2(&self) -> bool {
+        self.deps.autonomy_memory_retrieval_v2
+    }
+
     fn autonomy_replanner_v1(&self) -> bool {
         self.deps.autonomy_replanner_v1
+    }
+
+    async fn build_planner_memory_retrieval_context(
+        &self,
+        reason_ctx: &ReasoningContext,
+        goal_id_hint: Option<Uuid>,
+        plan_id_hint: Option<Uuid>,
+    ) -> Option<String> {
+        if !self.autonomy_memory_retrieval_v2() {
+            return None;
+        }
+        let store = self.store()?.clone();
+        let job_ctx = match self.context_manager().get_context(self.job_id).await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                tracing::warn!(
+                    job = %self.job_id,
+                    "Memory retrieval composer skipped (job context load failed): {}",
+                    e
+                );
+                return None;
+            }
+        };
+
+        let task_class = MemoryRetrievalComposer::infer_task_class(
+            job_ctx.category.as_deref(),
+            &job_ctx.title,
+            &job_ctx.description,
+        );
+        let query = match reason_ctx.job_description.as_deref() {
+            Some(job_desc) if !job_desc.trim().is_empty() => {
+                format!("{}\n{}", job_ctx.title, job_desc.trim())
+            }
+            _ => format!("{}\n{}", job_ctx.title, job_ctx.description),
+        };
+
+        let req = MemoryRetrievalRequest {
+            user_id: job_ctx.user_id.clone(),
+            goal_id: goal_id_hint.or(job_ctx.autonomy_goal_id),
+            plan_id: plan_id_hint.or(job_ctx.autonomy_plan_id),
+            job_id: Some(self.job_id),
+            task_class: match task_class {
+                RetrievalTaskClass::General => {
+                    // Bias planned worker execution toward coding retrieval when
+                    // no clearer task signal is available.
+                    RetrievalTaskClass::Coding
+                }
+                other => other,
+            },
+            query,
+            limit_budget: 12,
+        };
+
+        match MemoryRetrievalComposer::compose(store, req).await {
+            Ok(bundle) if !bundle.prompt_context_block.trim().is_empty() => {
+                tracing::debug!(
+                    job = %self.job_id,
+                    working_hits = bundle.working_context.len(),
+                    episodic_hits = bundle.episodic_hits.len(),
+                    semantic_hits = bundle.semantic_hits.len(),
+                    playbooks = bundle.procedural_playbooks.len(),
+                    "Built Memory Plane v2 retrieval context for planner"
+                );
+                Some(bundle.prompt_context_block)
+            }
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(
+                    job = %self.job_id,
+                    "Memory retrieval composer failed (continuing without retrieval context): {}",
+                    e
+                );
+                None
+            }
+        }
     }
 
     async fn persist_action_plan(
@@ -887,7 +970,16 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
         // Generate plan if planning is enabled
         let plan = if self.use_planning() {
-            match PlannerV1::plan_initial(reasoning, reason_ctx).await {
+            let retrieval_context_block = self
+                .build_planner_memory_retrieval_context(reason_ctx, None, None)
+                .await;
+            match PlannerV1::plan_initial_with_retrieval(
+                reasoning,
+                reason_ctx,
+                retrieval_context_block.as_deref(),
+            )
+            .await
+            {
                 Ok(planner_out) => {
                     let crate::agent::planner_v1::PlannerOutput {
                         action_plan: p,
@@ -1034,7 +1126,19 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                                 reason, &detail,
                             )));
 
-                        let planner_out = match PlannerV1::plan_initial(reasoning, reason_ctx).await
+                        let retrieval_context_block = self
+                            .build_planner_memory_retrieval_context(
+                                reason_ctx,
+                                Some(previous_persisted.goal_id),
+                                Some(previous_persisted.plan_id),
+                            )
+                            .await;
+                        let planner_out = match PlannerV1::plan_initial_with_retrieval(
+                            reasoning,
+                            reason_ctx,
+                            retrieval_context_block.as_deref(),
+                        )
+                        .await
                         {
                             Ok(out) => out,
                             Err(e) => {
@@ -2527,6 +2631,7 @@ mod tests {
                 autonomy_verifier_v1: true,
                 autonomy_replanner_v1: true,
                 autonomy_memory_plane_v2: false,
+                autonomy_memory_retrieval_v2: false,
             },
         );
 
@@ -2737,6 +2842,7 @@ mod tests {
                 autonomy_verifier_v1: true,
                 autonomy_replanner_v1: true,
                 autonomy_memory_plane_v2: false,
+                autonomy_memory_retrieval_v2: false,
             },
         );
 
@@ -2887,6 +2993,7 @@ mod tests {
             autonomy_verifier_v1: true,
             autonomy_replanner_v1: true,
             autonomy_memory_plane_v2: false,
+            autonomy_memory_retrieval_v2: false,
         };
 
         let err =
