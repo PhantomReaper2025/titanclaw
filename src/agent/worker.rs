@@ -9,6 +9,7 @@ use futures::future::join_all;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::agent::execution_critic::{CriticAction, CriticStepInput, ExecutionCritic};
 use crate::agent::incident_detector::{
     PolicyDeniedIncidentRequest, ToolFailureIncidentRequest,
     record_policy_denied_incident_best_effort, record_tool_failure_incident_best_effort,
@@ -2256,7 +2257,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     .await;
             }
 
-            let step_replan_request = result
+            let mut step_replan_request = result
                 .as_ref()
                 .err()
                 .and_then(classify_replan_reason_for_step_error)
@@ -2276,6 +2277,35 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                         ),
                     )
                 });
+            let critic_decision = ExecutionCritic::evaluate_step(CriticStepInput {
+                step_index: i,
+                total_steps: plan.actions.len(),
+                tool_name: &selected_tool_name,
+                elapsed_ms,
+                result: &result,
+            });
+            if let CriticAction::Replan { reason } = critic_decision.action {
+                let detail = critic_decision.detail.clone().unwrap_or_else(|| {
+                    format!(
+                        "Execution critic requested replan after step {}/{} ({})",
+                        i + 1,
+                        plan.actions.len(),
+                        action.tool_name
+                    )
+                });
+                match step_replan_request.as_ref() {
+                    None => {
+                        step_replan_request = Some((reason, detail));
+                    }
+                    Some((existing_reason, _))
+                        if reason == ReplanReason::PolicyDenied
+                            && *existing_reason != ReplanReason::PolicyDenied =>
+                    {
+                        step_replan_request = Some((reason, detail));
+                    }
+                    _ => {}
+                }
+            }
 
             // Process the result
             let completed = self
@@ -2305,6 +2335,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                             "detail": detail,
                             "step_index": i,
                             "tool_name": action.tool_name,
+                            "critic_reason_codes": critic_decision.reason_codes,
                         }),
                         provenance: serde_json::json!({
                             "source": "worker.execute_plan",

@@ -18,6 +18,7 @@ pub mod compaction;
 pub mod context_monitor;
 pub mod cost_guard;
 mod dispatcher;
+mod execution_critic;
 mod heartbeat;
 mod incident_detector;
 pub mod job_monitor;
