@@ -50,7 +50,7 @@ pub(super) fn evaluate_dispatcher_tool_approval(
     session_auto_approved: bool,
     contract_v2: Option<&ToolContractV2Descriptor>,
 ) -> ApprovalPolicyOutcome {
-    let contract_reason_codes = contract_requires_approval_reason_codes(contract_v2);
+    let contract_reason_codes = contract_requires_approval_reason_codes(contract_v2, params);
     let contract_requires_approval = !contract_reason_codes.is_empty();
     if !tool.requires_approval() && !contract_requires_approval {
         return ApprovalPolicyOutcome::NoApprovalRequired;
@@ -79,13 +79,14 @@ pub(super) fn evaluate_dispatcher_tool_approval(
 
 pub(super) fn evaluate_worker_tool_approval(
     tool: &dyn Tool,
+    params: &serde_json::Value,
     contract_v2: Option<&ToolContractV2Descriptor>,
 ) -> ApprovalPolicyOutcome {
     let mut reason_codes = Vec::new();
     if tool.requires_approval() {
         reason_codes.push("tool_requires_approval".to_string());
     }
-    reason_codes.extend(contract_requires_approval_reason_codes(contract_v2));
+    reason_codes.extend(contract_requires_approval_reason_codes(contract_v2, params));
     reason_codes.sort();
     reason_codes.dedup();
 
@@ -98,10 +99,13 @@ pub(super) fn evaluate_worker_tool_approval(
 
 fn contract_requires_approval_reason_codes(
     contract_v2: Option<&ToolContractV2Descriptor>,
+    params: &serde_json::Value,
 ) -> Vec<String> {
     let Some(contract) = contract_v2 else {
         return Vec::new();
     };
+
+    let dry_run_requested = params_request_dry_run(params);
 
     let mut reason_codes = Vec::new();
     if contract.requires_approval_default {
@@ -110,10 +114,24 @@ fn contract_requires_approval_reason_codes(
     match contract.side_effect_level {
         ToolSideEffectLevel::ReadOnly | ToolSideEffectLevel::WorkspaceWrite => {}
         ToolSideEffectLevel::SystemMutation => {
-            reason_codes.push("contract_v2_system_mutation".to_string());
+            if !dry_run_requested
+                || matches!(
+                    contract.dry_run_support,
+                    crate::tools::ToolDryRunSupport::None
+                )
+            {
+                reason_codes.push("contract_v2_system_mutation".to_string());
+            }
         }
         ToolSideEffectLevel::ExternalMutation => {
-            reason_codes.push("contract_v2_external_mutation".to_string());
+            if !dry_run_requested
+                || matches!(
+                    contract.dry_run_support,
+                    crate::tools::ToolDryRunSupport::None
+                )
+            {
+                reason_codes.push("contract_v2_external_mutation".to_string());
+            }
         }
         ToolSideEffectLevel::Financial => {
             reason_codes.push("contract_v2_financial".to_string());
@@ -122,7 +140,65 @@ fn contract_requires_approval_reason_codes(
             reason_codes.push("contract_v2_credential".to_string());
         }
     }
+    if matches!(
+        contract.side_effect_level,
+        ToolSideEffectLevel::SystemMutation | ToolSideEffectLevel::ExternalMutation
+    ) {
+        match contract.dry_run_support {
+            crate::tools::ToolDryRunSupport::None => {
+                reason_codes.push("contract_v2_non_simulatable_high_impact".to_string());
+            }
+            crate::tools::ToolDryRunSupport::Native
+            | crate::tools::ToolDryRunSupport::Simulated
+                if !dry_run_requested =>
+            {
+                reason_codes.push("contract_v2_dry_run_not_requested".to_string());
+            }
+            _ => {}
+        }
+    }
     reason_codes
+}
+
+fn params_request_dry_run(params: &serde_json::Value) -> bool {
+    if params
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if params
+        .get("simulate")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if params
+        .get("simulation")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if params
+        .get("preview_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    params
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "dry_run" | "simulate"
+            )
+        })
+        .unwrap_or(false)
 }
 
 pub(super) async fn evaluate_tool_call_hook(
@@ -251,7 +327,7 @@ mod tests {
             needs_approval: true,
             force_explicit_for_params: false,
         };
-        match evaluate_worker_tool_approval(&tool, None) {
+        match evaluate_worker_tool_approval(&tool, &serde_json::json!({}), None) {
             ApprovalPolicyOutcome::RequireApproval { reason_codes } => {
                 assert_eq!(reason_codes, vec!["tool_requires_approval"]);
             }
@@ -329,11 +405,88 @@ mod tests {
             updated_at: Utc::now(),
         };
 
-        match evaluate_worker_tool_approval(&tool, Some(&contract)) {
+        match evaluate_worker_tool_approval(&tool, &serde_json::json!({}), Some(&contract)) {
             ApprovalPolicyOutcome::RequireApproval { reason_codes } => {
                 assert!(reason_codes.contains(&"contract_v2_financial".to_string()));
                 assert!(
                     reason_codes.contains(&"contract_v2_requires_approval_default".to_string())
+                );
+            }
+            _ => panic!("unexpected outcome"),
+        }
+    }
+
+    #[test]
+    fn test_dispatcher_contract_v2_allows_dry_run_for_simulatable_external_mutation() {
+        let tool = TestTool {
+            needs_approval: false,
+            force_explicit_for_params: false,
+        };
+        let contract = ToolContractV2Descriptor {
+            tool_name: "http".to_string(),
+            version: 2,
+            domain: "orchestrator".to_string(),
+            side_effect_level: ToolSideEffectLevel::ExternalMutation,
+            idempotency: ToolIdempotency::Unknown,
+            dry_run_support: ToolDryRunSupport::Simulated,
+            requires_approval_default: false,
+            preconditions: serde_json::json!({}),
+            postconditions: serde_json::json!({}),
+            timeout_ms_hint: Some(30_000),
+            retry_guidance: serde_json::json!({}),
+            compensation_hint: None,
+            fallback_candidates: Vec::new(),
+            risk_tags: vec!["external_mutation".to_string()],
+            source: ToolContractSource::Inferred,
+            updated_at: Utc::now(),
+        };
+
+        match evaluate_dispatcher_tool_approval(
+            &tool,
+            &serde_json::json!({"dry_run": true}),
+            false,
+            Some(&contract),
+        ) {
+            ApprovalPolicyOutcome::NoApprovalRequired => {}
+            _ => panic!("expected dry-run external mutation to pass preflight without approval"),
+        }
+    }
+
+    #[test]
+    fn test_dispatcher_contract_v2_flags_non_simulatable_high_impact() {
+        let tool = TestTool {
+            needs_approval: false,
+            force_explicit_for_params: false,
+        };
+        let contract = ToolContractV2Descriptor {
+            tool_name: "system_tool".to_string(),
+            version: 2,
+            domain: "orchestrator".to_string(),
+            side_effect_level: ToolSideEffectLevel::SystemMutation,
+            idempotency: ToolIdempotency::Unknown,
+            dry_run_support: ToolDryRunSupport::None,
+            requires_approval_default: false,
+            preconditions: serde_json::json!({}),
+            postconditions: serde_json::json!({}),
+            timeout_ms_hint: Some(30_000),
+            retry_guidance: serde_json::json!({}),
+            compensation_hint: None,
+            fallback_candidates: Vec::new(),
+            risk_tags: vec!["system_mutation".to_string()],
+            source: ToolContractSource::Inferred,
+            updated_at: Utc::now(),
+        };
+
+        match evaluate_dispatcher_tool_approval(
+            &tool,
+            &serde_json::json!({}),
+            false,
+            Some(&contract),
+        ) {
+            ApprovalPolicyOutcome::RequireApproval { reason_codes } => {
+                assert!(reason_codes.contains(&"contract_v2_system_mutation".to_string()));
+                assert!(
+                    reason_codes.contains(&"contract_v2_non_simulatable_high_impact".to_string())
                 );
             }
             _ => panic!("unexpected outcome"),

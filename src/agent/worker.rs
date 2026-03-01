@@ -1739,7 +1739,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             .resolve_tool_contract_v2(tool_name, deps.store.as_deref(), Some(&job_ctx.user_id))
             .await;
         if let ApprovalPolicyOutcome::RequireApproval { reason_codes } =
-            evaluate_worker_tool_approval(tool.as_ref(), contract_v2.as_ref())
+            evaluate_worker_tool_approval(tool.as_ref(), params, contract_v2.as_ref())
         {
             if deps.autonomy_policy_engine_v1 {
                 persist_worker_policy_decision_best_effort(
