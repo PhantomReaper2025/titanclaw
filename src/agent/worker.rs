@@ -25,6 +25,7 @@ use crate::agent::policy_engine::{
 use crate::agent::replanner_v1::{ReplanBudgets, ReplanReason, ReplanRuntimeState, ReplannerV1};
 use crate::agent::scheduler::WorkerMessage;
 use crate::agent::task::TaskOutput;
+use crate::agent::tool_reliability::recompute_tool_reliability_profile_best_effort;
 use crate::agent::verifier_v1::{VerificationNextAction, VerificationRequest, VerifierV1};
 use crate::agent::{
     Evidence as AutonomyEvidence, EvidenceKind as AutonomyEvidenceKind,
@@ -271,6 +272,14 @@ fn persist_worker_policy_decision_best_effort(
     tokio::spawn(async move {
         match store.record_policy_decision(&record).await {
             Ok(()) => {
+                if let Some(tool_name) = record.tool_name.clone() {
+                    recompute_tool_reliability_profile_best_effort(
+                        store.clone(),
+                        record.user_id.clone(),
+                        tool_name,
+                        "worker.policy_decision",
+                    );
+                }
                 if incident_should_emit {
                     record_policy_denied_incident_best_effort(
                         store.clone(),
@@ -791,7 +800,17 @@ impl Worker {
                 "Failed to persist worker execution attempt: {}",
                 e
             );
-        } else if !matches!(attempt.status, AutonomyExecutionAttemptStatus::Succeeded) {
+            return;
+        }
+
+        recompute_tool_reliability_profile_best_effort(
+            store.clone(),
+            attempt.user_id.clone(),
+            attempt.tool_name.clone(),
+            "worker.execution_attempt",
+        );
+
+        if !matches!(attempt.status, AutonomyExecutionAttemptStatus::Succeeded) {
             let failure_label = attempt
                 .failure_class
                 .clone()
@@ -2687,6 +2706,26 @@ mod tests {
         .expect("timed out waiting for memory records")
     }
 
+    async fn wait_for_tool_profile(
+        db: &dyn crate::db::Database,
+        tool_name: &str,
+    ) -> crate::tools::ToolReliabilityProfile {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(profile) = db
+                    .get_tool_reliability_profile(tool_name)
+                    .await
+                    .expect("get tool profile")
+                {
+                    break profile;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for tool reliability profile")
+    }
+
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn test_execute_plan_verifier_block_returns_replan_request_and_persists_verification() {
@@ -3072,6 +3111,10 @@ mod tests {
             }),
             "expected tool_failure incident linked to failed missing_tool attempt"
         );
+
+        let missing_tool_profile = wait_for_tool_profile(harness.db.as_ref(), "missing_tool").await;
+        assert_eq!(missing_tool_profile.tool_name, "missing_tool");
+        assert!(missing_tool_profile.sample_count >= 1);
 
         assert_eq!(scripted_llm.complete_calls(), 2);
         assert_eq!(scripted_llm.complete_with_tools_calls(), 1);

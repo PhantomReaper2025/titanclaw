@@ -3,7 +3,6 @@
 //! This module is intentionally conservative: it computes and persists
 //! reliability profiles from existing persisted autonomy execution/policy/
 //! incident records without changing runtime routing behavior yet.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -99,6 +98,29 @@ impl ToolReliabilityService {
         self.store.upsert_tool_reliability_profile(&profile).await?;
         Ok(Some(profile))
     }
+}
+
+pub(crate) fn recompute_tool_reliability_profile_best_effort(
+    store: Arc<dyn Database>,
+    user_id: String,
+    tool_name: String,
+    source: &'static str,
+) {
+    tokio::spawn(async move {
+        let service = ToolReliabilityService::new(store);
+        if let Err(e) = service
+            .recompute_profile_for_tool(&user_id, &tool_name, Utc::now())
+            .await
+        {
+            tracing::warn!(
+                user = %user_id,
+                tool = %tool_name,
+                source = source,
+                "Failed to recompute tool reliability profile: {}",
+                e
+            );
+        }
+    });
 }
 
 fn within_window(ts: DateTime<Utc>, start: DateTime<Utc>) -> bool {

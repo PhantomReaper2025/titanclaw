@@ -29,6 +29,7 @@ use crate::agent::policy_engine::{
 };
 use crate::agent::session::{Session, Thread, ThreadState};
 use crate::agent::submission::SubmissionResult;
+use crate::agent::tool_reliability::recompute_tool_reliability_profile_best_effort;
 use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
@@ -134,6 +135,14 @@ fn persist_chat_policy_decision_best_effort(
     tokio::spawn(async move {
         match store.record_policy_decision(&record).await {
             Ok(()) => {
+                if let Some(tool_name) = record.tool_name.clone() {
+                    recompute_tool_reliability_profile_best_effort(
+                        store.clone(),
+                        record.user_id.clone(),
+                        tool_name,
+                        "thread_ops.policy_decision",
+                    );
+                }
                 if incident_should_emit {
                     record_policy_denied_incident_best_effort(
                         store.clone(),

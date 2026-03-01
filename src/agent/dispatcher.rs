@@ -26,6 +26,7 @@ use crate::agent::policy_engine::{
     evaluate_tool_call_hook,
 };
 use crate::agent::session::{PendingApproval, Session, ThreadState};
+use crate::agent::tool_reliability::recompute_tool_reliability_profile_best_effort;
 use crate::agent::{
     Agent, ExecutionAttempt as AutonomyExecutionAttempt,
     ExecutionAttemptStatus as AutonomyExecutionAttemptStatus, MemorySourceKind,
@@ -210,6 +211,14 @@ fn persist_policy_decision_best_effort(
     tokio::spawn(async move {
         match store.record_policy_decision(&record).await {
             Ok(()) => {
+                if let Some(tool_name) = record.tool_name.clone() {
+                    recompute_tool_reliability_profile_best_effort(
+                        store.clone(),
+                        record.user_id.clone(),
+                        tool_name,
+                        "dispatcher.policy_decision",
+                    );
+                }
                 if incident_should_emit {
                     record_policy_denied_incident_best_effort(
                         store.clone(),
@@ -291,6 +300,12 @@ fn persist_execution_attempt_best_effort(
     tokio::spawn(async move {
         match store.record_execution_attempt(&record).await {
             Ok(()) => {
+                recompute_tool_reliability_profile_best_effort(
+                    store.clone(),
+                    record.user_id.clone(),
+                    record.tool_name.clone(),
+                    "dispatcher.execution_attempt",
+                );
                 if incident_should_emit {
                     let failure_label = record
                         .failure_class
