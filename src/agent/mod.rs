@@ -19,6 +19,7 @@ pub mod context_monitor;
 pub mod cost_guard;
 mod dispatcher;
 mod heartbeat;
+mod incident_detector;
 pub mod job_monitor;
 pub mod kernel_monitor;
 pub mod kernel_orchestrator;

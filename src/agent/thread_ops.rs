@@ -18,6 +18,9 @@ use crate::agent::autonomy_telemetry::{
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context_monitor::CompactionStrategy;
 use crate::agent::dispatcher::{AgenticLoopResult, detect_auth_awaiting, parse_auth_result};
+use crate::agent::incident_detector::{
+    PolicyDeniedIncidentRequest, record_policy_denied_incident_best_effort,
+};
 use crate::agent::memory_plane::{MemoryRecordWriteRequest, persist_memory_record_best_effort};
 use crate::agent::memory_write_policy::MemoryWriteIntent;
 use crate::agent::policy_engine::{
@@ -125,12 +128,50 @@ fn persist_chat_policy_decision_best_effort(
         evidence_required: serde_json::json!({}),
         created_at: Utc::now(),
     };
+    let incident_job_id = Some(job_ctx.job_id);
+    let incident_thread_id = Some(thread_id);
+    let incident_should_emit = matches!(record.decision, crate::agent::PolicyDecisionKind::Deny);
     tokio::spawn(async move {
-        if let Err(e) = store.record_policy_decision(&record).await {
-            tracing::warn!(
-                "Failed to persist autonomy policy decision from approval flow: {}",
-                e
-            );
+        match store.record_policy_decision(&record).await {
+            Ok(()) => {
+                if incident_should_emit {
+                    record_policy_denied_incident_best_effort(
+                        store.clone(),
+                        PolicyDeniedIncidentRequest {
+                            goal_id: record.goal_id,
+                            plan_id: record.plan_id,
+                            plan_step_id: record.plan_step_id,
+                            policy_decision_id: Some(record.id),
+                            job_id: incident_job_id,
+                            thread_id: incident_thread_id,
+                            user_id: record.user_id.clone(),
+                            channel: Some(record.channel.clone()),
+                            tool_name: record.tool_name.clone(),
+                            reason_codes: record.reason_codes.clone(),
+                            action_kind: record.action_kind.clone(),
+                            surface: "approval_flow",
+                            summary: format!(
+                                "Approval flow policy denied tool '{}' ({})",
+                                record.tool_name.as_deref().unwrap_or("unknown"),
+                                record.action_kind
+                            ),
+                            details: serde_json::json!({
+                                "tool_call_id": record.tool_call_id,
+                                "reason_codes": record.reason_codes,
+                                "decision": record.decision,
+                            }),
+                            observed_at: record.created_at,
+                        },
+                    )
+                    .await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to persist autonomy policy decision from approval flow: {}",
+                    e
+                );
+            }
         }
     });
 }
@@ -1771,6 +1812,27 @@ mod tests {
         .expect("timed out waiting for memory records")
     }
 
+    async fn wait_for_incidents_for_user(
+        db: &dyn crate::db::Database,
+        user_id: &str,
+        min_count: usize,
+    ) -> Vec<crate::agent::Incident> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = db
+                    .list_incidents_for_user(user_id)
+                    .await
+                    .expect("list incidents for user");
+                if rows.len() >= min_count {
+                    break rows;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for incidents")
+    }
+
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn test_process_approval_rechecks_hook_and_blocks_execution() {
@@ -1875,6 +1937,25 @@ mod tests {
                     && d.decision == crate::agent::PolicyDecisionKind::Deny
             }),
             "expected approval_resume_hook deny policy record"
+        );
+        let deny_policy = policy_rows
+            .iter()
+            .find(|d| {
+                d.tool_name.as_deref() == Some("shell")
+                    && d.tool_call_id.as_deref() == Some("call-1")
+                    && d.action_kind == "approval_resume_hook"
+                    && d.decision == crate::agent::PolicyDecisionKind::Deny
+            })
+            .expect("deny policy row for approval resume hook");
+
+        let incidents = wait_for_incidents_for_user(harness.db.as_ref(), "user-1", 1).await;
+        assert!(
+            incidents.iter().any(|i| {
+                i.policy_decision_id == Some(deny_policy.id)
+                    && i.tool_name.as_deref() == Some("shell")
+                    && i.incident_type == "policy_denial"
+            }),
+            "expected policy_denial incident linked to deny policy decision"
         );
 
         let memory_rows = wait_for_memory_records_for_user(harness.db.as_ref(), "user-1", 2).await;

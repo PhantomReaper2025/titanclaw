@@ -15,6 +15,10 @@ use crate::agent::autonomy_telemetry::{
     PolicyDecisionKind as TelemetryPolicyDecisionKind, PolicyDecisionRecord, classify_failure,
     elapsed_ms, emit_execution_attempt, emit_policy_decision, truncate_error_preview,
 };
+use crate::agent::incident_detector::{
+    PolicyDeniedIncidentRequest, ToolFailureIncidentRequest,
+    record_policy_denied_incident_best_effort, record_tool_failure_incident_best_effort,
+};
 use crate::agent::memory_plane::{MemoryRecordWriteRequest, persist_memory_record_best_effort};
 use crate::agent::memory_write_policy::MemoryWriteIntent;
 use crate::agent::policy_engine::{
@@ -201,9 +205,46 @@ fn persist_policy_decision_best_effort(
         evidence_required: serde_json::json!({}),
         created_at: Utc::now(),
     };
+    let incident_job_id = Some(job_ctx.job_id);
+    let incident_should_emit = matches!(record.decision, AutonomyPolicyDecisionKind::Deny);
     tokio::spawn(async move {
-        if let Err(e) = store.record_policy_decision(&record).await {
-            tracing::warn!("Failed to persist autonomy policy decision: {}", e);
+        match store.record_policy_decision(&record).await {
+            Ok(()) => {
+                if incident_should_emit {
+                    record_policy_denied_incident_best_effort(
+                        store.clone(),
+                        PolicyDeniedIncidentRequest {
+                            goal_id: record.goal_id,
+                            plan_id: record.plan_id,
+                            plan_step_id: record.plan_step_id,
+                            policy_decision_id: Some(record.id),
+                            job_id: incident_job_id,
+                            thread_id: None,
+                            user_id: record.user_id.clone(),
+                            channel: Some(record.channel.clone()),
+                            tool_name: record.tool_name.clone(),
+                            reason_codes: record.reason_codes.clone(),
+                            action_kind: record.action_kind.clone(),
+                            surface: "dispatcher",
+                            summary: format!(
+                                "Dispatcher policy denied tool '{}' ({})",
+                                record.tool_name.as_deref().unwrap_or("unknown"),
+                                record.action_kind
+                            ),
+                            details: serde_json::json!({
+                                "tool_call_id": record.tool_call_id,
+                                "reason_codes": record.reason_codes,
+                                "decision": record.decision,
+                            }),
+                            observed_at: record.created_at,
+                        },
+                    )
+                    .await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to persist autonomy policy decision: {}", e);
+            }
         }
     });
 }
@@ -246,9 +287,48 @@ fn persist_execution_attempt_best_effort(
         result_summary: None,
         error_preview,
     };
+    let incident_should_emit = !matches!(record.status, AutonomyExecutionAttemptStatus::Succeeded);
     tokio::spawn(async move {
-        if let Err(e) = store.record_execution_attempt(&record).await {
-            tracing::warn!("Failed to persist autonomy execution attempt: {}", e);
+        match store.record_execution_attempt(&record).await {
+            Ok(()) => {
+                if incident_should_emit {
+                    let failure_label = record
+                        .failure_class
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    record_tool_failure_incident_best_effort(
+                        store.clone(),
+                        ToolFailureIncidentRequest {
+                            goal_id: record.goal_id,
+                            plan_id: record.plan_id,
+                            plan_step_id: record.plan_step_id,
+                            execution_attempt_id: Some(record.id),
+                            job_id: record.job_id,
+                            thread_id: record.thread_id,
+                            user_id: record.user_id.clone(),
+                            channel: Some(record.channel.clone()),
+                            tool_name: record.tool_name.clone(),
+                            failure_class: record.failure_class.clone(),
+                            surface: "dispatcher",
+                            summary: format!(
+                                "Dispatcher tool '{}' failed ({})",
+                                record.tool_name, failure_label
+                            ),
+                            details: serde_json::json!({
+                                "tool_call_id": record.tool_call_id,
+                                "error_preview": record.error_preview,
+                                "elapsed_ms": record.elapsed_ms,
+                                "status": record.status,
+                            }),
+                            observed_at: record.finished_at.unwrap_or(record.started_at),
+                        },
+                    )
+                    .await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to persist autonomy execution attempt: {}", e);
+            }
         }
     });
 }

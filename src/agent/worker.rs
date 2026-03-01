@@ -8,6 +8,10 @@ use futures::future::join_all;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::agent::incident_detector::{
+    PolicyDeniedIncidentRequest, ToolFailureIncidentRequest,
+    record_policy_denied_incident_best_effort, record_tool_failure_incident_best_effort,
+};
 use crate::agent::memory_plane::{MemoryRecordWriteRequest, persist_memory_record_best_effort};
 use crate::agent::memory_retrieval_composer::{
     MemoryRetrievalComposer, MemoryRetrievalRequest, RetrievalTaskClass,
@@ -262,9 +266,46 @@ fn persist_worker_policy_decision_best_effort(
         evidence_required,
         created_at: Utc::now(),
     };
+    let incident_job_id = Some(job_ctx.job_id);
+    let incident_should_emit = matches!(record.decision, AutonomyPolicyDecisionKind::Deny);
     tokio::spawn(async move {
-        if let Err(e) = store.record_policy_decision(&record).await {
-            tracing::warn!("Failed to persist worker autonomy policy decision: {}", e);
+        match store.record_policy_decision(&record).await {
+            Ok(()) => {
+                if incident_should_emit {
+                    record_policy_denied_incident_best_effort(
+                        store.clone(),
+                        PolicyDeniedIncidentRequest {
+                            goal_id: record.goal_id,
+                            plan_id: record.plan_id,
+                            plan_step_id: record.plan_step_id,
+                            policy_decision_id: Some(record.id),
+                            job_id: incident_job_id,
+                            thread_id: None,
+                            user_id: record.user_id.clone(),
+                            channel: Some(record.channel.clone()),
+                            tool_name: record.tool_name.clone(),
+                            reason_codes: record.reason_codes.clone(),
+                            action_kind: record.action_kind.clone(),
+                            surface: "worker",
+                            summary: format!(
+                                "Worker policy denied tool '{}' ({})",
+                                record.tool_name.as_deref().unwrap_or("unknown"),
+                                record.action_kind
+                            ),
+                            details: serde_json::json!({
+                                "tool_call_id": record.tool_call_id,
+                                "reason_codes": record.reason_codes,
+                                "decision": record.decision,
+                            }),
+                            observed_at: record.created_at,
+                        },
+                    )
+                    .await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to persist worker autonomy policy decision: {}", e);
+            }
         }
     });
 }
@@ -750,6 +791,40 @@ impl Worker {
                 "Failed to persist worker execution attempt: {}",
                 e
             );
+        } else if !matches!(attempt.status, AutonomyExecutionAttemptStatus::Succeeded) {
+            let failure_label = attempt
+                .failure_class
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            record_tool_failure_incident_best_effort(
+                store.clone(),
+                ToolFailureIncidentRequest {
+                    goal_id: attempt.goal_id,
+                    plan_id: attempt.plan_id,
+                    plan_step_id: attempt.plan_step_id,
+                    execution_attempt_id: Some(attempt.id),
+                    job_id: attempt.job_id,
+                    thread_id: attempt.thread_id,
+                    user_id: attempt.user_id.clone(),
+                    channel: Some(attempt.channel.clone()),
+                    tool_name: attempt.tool_name.clone(),
+                    failure_class: attempt.failure_class.clone(),
+                    surface: "worker",
+                    summary: format!(
+                        "Worker tool '{}' failed ({})",
+                        attempt.tool_name, failure_label
+                    ),
+                    details: serde_json::json!({
+                        "tool_call_id": attempt.tool_call_id,
+                        "error_preview": attempt.error_preview,
+                        "elapsed_ms": attempt.elapsed_ms,
+                        "status": attempt.status,
+                        "retry_count": attempt.retry_count,
+                    }),
+                    observed_at: attempt.finished_at.unwrap_or(attempt.started_at),
+                },
+            )
+            .await;
         }
     }
 
@@ -2966,6 +3041,37 @@ mod tests {
             crate::agent::PlanVerificationStatus::Passed
         );
         assert!(rev2_verifications[0].completion_claimed);
+
+        let attempts = harness
+            .db
+            .list_execution_attempts_for_user("user-1")
+            .await
+            .expect("list execution attempts");
+        let failed_attempt = attempts
+            .iter()
+            .find(|a| {
+                a.tool_name == "missing_tool"
+                    && matches!(
+                        a.status,
+                        crate::agent::ExecutionAttemptStatus::Failed
+                            | crate::agent::ExecutionAttemptStatus::Timeout
+                    )
+            })
+            .expect("failed attempt for missing_tool");
+
+        let incidents = harness
+            .db
+            .list_incidents_for_user("user-1")
+            .await
+            .expect("list incidents");
+        assert!(
+            incidents.iter().any(|i| {
+                i.execution_attempt_id == Some(failed_attempt.id)
+                    && i.tool_name.as_deref() == Some("missing_tool")
+                    && i.incident_type == "tool_failure"
+            }),
+            "expected tool_failure incident linked to failed missing_tool attempt"
+        );
 
         assert_eq!(scripted_llm.complete_calls(), 2);
         assert_eq!(scripted_llm.complete_with_tools_calls(), 1);
