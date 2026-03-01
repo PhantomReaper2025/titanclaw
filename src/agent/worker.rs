@@ -46,7 +46,10 @@ use crate::llm::{
     ActionPlan, ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult, ToolSelection,
 };
 use crate::safety::SafetyLayer;
-use crate::tools::{CircuitBreakerState, ToolRegistry, ToolReliabilityProfile};
+use crate::tools::{
+    CircuitBreakerState, ToolContractV2Descriptor, ToolIdempotency, ToolRegistry,
+    ToolReliabilityProfile, ToolSideEffectLevel,
+};
 
 /// Shared dependencies for worker execution.
 ///
@@ -142,6 +145,53 @@ fn parse_profile_fallback_tools(raw: &serde_json::Value) -> Vec<String> {
         }
     }
     Vec::new()
+}
+
+fn parse_contract_fallback_tools(contract: Option<&ToolContractV2Descriptor>) -> Vec<String> {
+    contract
+        .map(|c| {
+            c.fallback_candidates
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn merge_fallback_candidates(
+    primary_tool: &str,
+    profile_fallbacks: &[String],
+    contract_fallbacks: &[String],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    seen.insert(primary_tool.to_string());
+    for candidate in profile_fallbacks.iter().chain(contract_fallbacks.iter()) {
+        if seen.insert(candidate.clone()) {
+            out.push(candidate.clone());
+        }
+    }
+    out
+}
+
+fn contract_routing_bonus(contract: Option<&ToolContractV2Descriptor>) -> f32 {
+    let Some(contract) = contract else {
+        return 0.0;
+    };
+    let side_effect_bias = match contract.side_effect_level {
+        ToolSideEffectLevel::ReadOnly => 0.04,
+        ToolSideEffectLevel::WorkspaceWrite => 0.0,
+        ToolSideEffectLevel::SystemMutation | ToolSideEffectLevel::ExternalMutation => -0.04,
+        ToolSideEffectLevel::Financial | ToolSideEffectLevel::Credential => -0.1,
+    };
+    let idempotency_bias = match contract.idempotency {
+        ToolIdempotency::SafeRetry => 0.03,
+        ToolIdempotency::Unknown => 0.0,
+        ToolIdempotency::UnsafeRetry => -0.03,
+    };
+    side_effect_bias + idempotency_bias
 }
 
 fn profile_breaker_is_open(profile: &ToolReliabilityProfile, now: chrono::DateTime<Utc>) -> bool {
@@ -496,7 +546,11 @@ impl Worker {
         }
     }
 
-    async fn rank_plan_step_tool_candidates(&self, primary_tool: &str) -> Vec<String> {
+    async fn rank_plan_step_tool_candidates(
+        &self,
+        primary_tool: &str,
+        user_id: Option<&str>,
+    ) -> Vec<String> {
         let mut candidates = vec![primary_tool.to_string()];
         if !self.autonomy_tool_routing_v2() {
             return candidates;
@@ -518,13 +572,20 @@ impl Worker {
             }
         };
 
-        if let Some(profile) = primary_profile.as_ref() {
-            let mut seen: HashSet<String> = HashSet::new();
-            seen.insert(primary_tool.to_string());
-            for fallback in parse_profile_fallback_tools(&profile.safe_fallback_options) {
-                if seen.insert(fallback.clone()) {
-                    candidates.push(fallback);
-                }
+        let primary_contract = self
+            .tools()
+            .resolve_tool_contract_v2(primary_tool, Some(store.as_ref()), user_id)
+            .await;
+        let profile_fallbacks = primary_profile
+            .as_ref()
+            .map(|profile| parse_profile_fallback_tools(&profile.safe_fallback_options))
+            .unwrap_or_default();
+        let contract_fallbacks = parse_contract_fallback_tools(primary_contract.as_ref());
+        let merged =
+            merge_fallback_candidates(primary_tool, &profile_fallbacks, &contract_fallbacks);
+        for tool_name in merged {
+            if self.tools().has(&tool_name).await {
+                candidates.push(tool_name);
             }
         }
 
@@ -559,7 +620,12 @@ impl Worker {
             if is_open {
                 continue;
             }
-            let score = profile.as_ref().map(|p| p.reliability_score).unwrap_or(0.5);
+            let fallback_contract = self
+                .tools()
+                .resolve_tool_contract_v2(fallback, Some(store.as_ref()), user_id)
+                .await;
+            let score = profile.as_ref().map(|p| p.reliability_score).unwrap_or(0.5)
+                + contract_routing_bonus(fallback_contract.as_ref());
             fallback_scored.push((fallback.clone(), score));
         }
 
@@ -589,8 +655,14 @@ impl Worker {
         parameters: &serde_json::Value,
         persisted_plan: Option<&PersistedPlanRun>,
     ) -> StepExecutionOutcome {
+        let routing_user_id = self
+            .context_manager()
+            .get_context(self.job_id)
+            .await
+            .ok()
+            .map(|ctx| ctx.user_id);
         let candidates = self
-            .rank_plan_step_tool_candidates(requested_tool_name)
+            .rank_plan_step_tool_candidates(requested_tool_name, routing_user_id.as_deref())
             .await;
         let step_call_prefix = format!("plan_{}_{}", self.job_id, step_index);
 
@@ -2680,8 +2752,8 @@ mod tests {
 
     use super::{
         PersistedPlanRun, PlanExecutionOutcome, ReplanReason, Worker, WorkerDeps,
-        classify_replan_reason_for_step_error, classify_step_evidence,
-        parse_profile_fallback_tools,
+        classify_replan_reason_for_step_error, classify_step_evidence, contract_routing_bonus,
+        merge_fallback_candidates, parse_contract_fallback_tools, parse_profile_fallback_tools,
     };
 
     #[test]
@@ -2820,6 +2892,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_contract_fallback_tools_and_merge_candidates() {
+        let now = Utc::now();
+        let contract = ToolContractV2Descriptor {
+            tool_name: "missing_tool".to_string(),
+            version: 2,
+            domain: "orchestrator".to_string(),
+            side_effect_level: ToolSideEffectLevel::ReadOnly,
+            idempotency: ToolIdempotency::SafeRetry,
+            dry_run_support: ToolDryRunSupport::Simulated,
+            requires_approval_default: false,
+            preconditions: serde_json::json!({}),
+            postconditions: serde_json::json!({}),
+            timeout_ms_hint: Some(10_000),
+            retry_guidance: serde_json::json!({}),
+            compensation_hint: None,
+            fallback_candidates: vec![
+                "noop_tool".to_string(),
+                "read_file".to_string(),
+                "noop_tool".to_string(),
+            ],
+            risk_tags: vec!["read_only".to_string()],
+            source: ToolContractSource::Inferred,
+            updated_at: now,
+        };
+        let from_contract = parse_contract_fallback_tools(Some(&contract));
+        assert_eq!(
+            from_contract,
+            vec![
+                "noop_tool".to_string(),
+                "read_file".to_string(),
+                "noop_tool".to_string()
+            ]
+        );
+        let merged = merge_fallback_candidates(
+            "missing_tool",
+            &vec!["noop_tool".to_string(), "memory_search".to_string()],
+            &from_contract,
+        );
+        assert_eq!(
+            merged,
+            vec![
+                "noop_tool".to_string(),
+                "memory_search".to_string(),
+                "read_file".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_contract_routing_bonus_prefers_safe_read_only_tools() {
+        let now = Utc::now();
+        let safe_contract = ToolContractV2Descriptor {
+            tool_name: "read_file".to_string(),
+            version: 2,
+            domain: "orchestrator".to_string(),
+            side_effect_level: ToolSideEffectLevel::ReadOnly,
+            idempotency: ToolIdempotency::SafeRetry,
+            dry_run_support: ToolDryRunSupport::None,
+            requires_approval_default: false,
+            preconditions: serde_json::json!({}),
+            postconditions: serde_json::json!({}),
+            timeout_ms_hint: Some(10_000),
+            retry_guidance: serde_json::json!({}),
+            compensation_hint: None,
+            fallback_candidates: Vec::new(),
+            risk_tags: vec!["read_only".to_string()],
+            source: ToolContractSource::Inferred,
+            updated_at: now,
+        };
+        let risky_contract = ToolContractV2Descriptor {
+            tool_name: "payment".to_string(),
+            version: 2,
+            domain: "orchestrator".to_string(),
+            side_effect_level: ToolSideEffectLevel::Financial,
+            idempotency: ToolIdempotency::UnsafeRetry,
+            dry_run_support: ToolDryRunSupport::None,
+            requires_approval_default: true,
+            preconditions: serde_json::json!({}),
+            postconditions: serde_json::json!({}),
+            timeout_ms_hint: Some(10_000),
+            retry_guidance: serde_json::json!({}),
+            compensation_hint: None,
+            fallback_candidates: Vec::new(),
+            risk_tags: vec!["financial".to_string()],
+            source: ToolContractSource::ManualOverride,
+            updated_at: now,
+        };
+        assert!(contract_routing_bonus(Some(&safe_contract)) > 0.0);
+        assert!(contract_routing_bonus(Some(&risky_contract)) < 0.0);
+    }
+
     struct NoopTool;
 
     #[async_trait]
@@ -2847,6 +3011,38 @@ mod tests {
         ) -> Result<ToolOutput, crate::tools::ToolError> {
             Ok(ToolOutput::success(
                 serde_json::json!({"ok": true}),
+                Duration::from_millis(1),
+            ))
+        }
+    }
+
+    struct FallbackTool;
+
+    #[async_trait]
+    impl Tool for FallbackTool {
+        fn name(&self) -> &str {
+            "fallback_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Fallback test tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type":"object",
+                "properties": {},
+                "additionalProperties": true
+            })
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &crate::context::JobContext,
+        ) -> Result<ToolOutput, crate::tools::ToolError> {
+            Ok(ToolOutput::success(
+                serde_json::json!({"fallback": true}),
                 Duration::from_millis(1),
             ))
         }
@@ -3558,6 +3754,158 @@ mod tests {
         assert!(
             !attempts.iter().any(|a| a.tool_name == "missing_tool"),
             "primary open-breaker tool should not be attempted when fallback is available"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_worker_routing_uses_contract_fallback_candidates_when_profile_fallback_missing() {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(NoopTool)).await;
+        tools.register(Arc::new(FallbackTool)).await;
+
+        let scripted_llm = Arc::new(SequenceLlm::new(vec![
+            ScriptedLlmResponse::Complete(
+                serde_json::json!({
+                    "goal": "Use contract fallback tool",
+                    "actions": [{
+                        "tool_name": "noop_tool",
+                        "parameters": {},
+                        "reasoning": "Primary tool is degraded and should route via contract fallback candidate",
+                        "expected_outcome": "Contract fallback should execute"
+                    }],
+                    "estimated_cost": null,
+                    "estimated_time_secs": 5,
+                    "confidence": 0.8
+                })
+                .to_string(),
+            ),
+            ScriptedLlmResponse::CompleteWithTools("The job is complete.".to_string()),
+        ]));
+        let llm: Arc<dyn LlmProvider> = scripted_llm.clone();
+
+        let harness = TestHarnessBuilder::new()
+            .with_tools(Arc::clone(&tools))
+            .with_llm(Arc::clone(&llm))
+            .build()
+            .await;
+
+        let now = Utc::now();
+        harness
+            .db
+            .upsert_tool_reliability_profile(&crate::tools::ToolReliabilityProfile {
+                tool_name: "noop_tool".to_string(),
+                window_start: now - chrono::Duration::minutes(30),
+                window_end: now,
+                sample_count: 10,
+                success_count: 1,
+                failure_count: 9,
+                timeout_count: 4,
+                blocked_count: 0,
+                success_rate: 0.1,
+                p50_latency_ms: Some(3000),
+                p95_latency_ms: Some(8000),
+                common_failure_modes: serde_json::json!([]),
+                recent_incident_count: 3,
+                reliability_score: 0.1,
+                safe_fallback_options: serde_json::json!([]),
+                breaker_state: CircuitBreakerState::Open,
+                cooldown_until: Some(now + chrono::Duration::minutes(30)),
+                last_failure_at: Some(now - chrono::Duration::minutes(1)),
+                last_success_at: None,
+                updated_at: now,
+            })
+            .await
+            .expect("seed noop_tool profile");
+        harness
+            .db
+            .upsert_tool_contract_override(&ToolContractV2Override {
+                id: Uuid::new_v4(),
+                tool_name: "noop_tool".to_string(),
+                owner_user_id: Some("user-1".to_string()),
+                enabled: true,
+                descriptor: ToolContractV2Descriptor {
+                    tool_name: "noop_tool".to_string(),
+                    version: 2,
+                    domain: "orchestrator".to_string(),
+                    side_effect_level: ToolSideEffectLevel::ReadOnly,
+                    idempotency: ToolIdempotency::SafeRetry,
+                    dry_run_support: ToolDryRunSupport::Simulated,
+                    requires_approval_default: false,
+                    preconditions: serde_json::json!({}),
+                    postconditions: serde_json::json!({}),
+                    timeout_ms_hint: Some(15_000),
+                    retry_guidance: serde_json::json!({}),
+                    compensation_hint: None,
+                    fallback_candidates: vec!["fallback_tool".to_string()],
+                    risk_tags: vec!["read_only".to_string()],
+                    source: ToolContractSource::ManualOverride,
+                    updated_at: now,
+                },
+                source: ToolContractOverrideSource::Manual,
+                notes: Some("Route to fallback_tool when noop_tool is degraded".to_string()),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("seed contract fallback override");
+
+        let context_manager = Arc::new(ContextManager::new(4));
+        let job_id = context_manager
+            .create_job_for_user(
+                "user-1",
+                "Contract fallback test",
+                "Use contract fallback candidate",
+            )
+            .await
+            .expect("create job");
+        context_manager
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(JobState::InProgress, Some("test setup".to_string()))
+            })
+            .await
+            .expect("update context")
+            .expect("transition to in_progress");
+
+        let worker = Worker::new(
+            job_id,
+            WorkerDeps {
+                context_manager: Arc::clone(&context_manager),
+                llm: Arc::clone(&llm),
+                safety: harness.deps.safety.clone(),
+                tools: Arc::clone(&tools),
+                store: Some(harness.db.clone()),
+                hooks: Arc::new(HookRegistry::new()),
+                timeout: Duration::from_secs(10),
+                use_planning: true,
+                autonomy_policy_engine_v1: true,
+                autonomy_verifier_v1: true,
+                autonomy_replanner_v1: true,
+                autonomy_tool_routing_v2: true,
+                autonomy_memory_plane_v2: false,
+                autonomy_memory_retrieval_v2: false,
+            },
+        );
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(crate::agent::scheduler::WorkerMessage::Start)
+            .await
+            .expect("send start");
+        worker.run(rx).await.expect("worker run");
+
+        let attempts = harness
+            .db
+            .list_execution_attempts_for_user("user-1")
+            .await
+            .expect("list execution attempts");
+        assert!(
+            attempts.iter().any(|a| a.tool_name == "fallback_tool"
+                && matches!(a.status, crate::agent::ExecutionAttemptStatus::Succeeded)),
+            "expected successful contract fallback attempt on fallback_tool"
+        );
+        assert!(
+            !attempts.iter().any(|a| a.tool_name == "noop_tool"),
+            "primary open-breaker tool should not be attempted when contract fallback candidate is available"
         );
     }
 

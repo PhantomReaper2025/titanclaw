@@ -486,7 +486,10 @@ impl Agent {
                         }
 
                         if reflex_allowed {
-                            match self.resolve_chat_tool_routing(&tool_name).await {
+                            match self
+                                .resolve_chat_tool_routing(&tool_name, Some(&message.user_id))
+                                .await
+                            {
                                 ChatToolRoutingDecision::Use {
                                     tool_name: routed_tool_name,
                                     routed_from,
@@ -1193,7 +1196,9 @@ impl Agent {
             let job_ctx =
                 JobContext::with_user(&message.user_id, "chat", "Interactive chat session");
             let mut approved_params = pending.parameters.clone();
-            let execution_tool_name = match self.resolve_chat_tool_routing(&pending.tool_name).await
+            let execution_tool_name = match self
+                .resolve_chat_tool_routing(&pending.tool_name, Some(&message.user_id))
+                .await
             {
                 ChatToolRoutingDecision::Use {
                     tool_name,

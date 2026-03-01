@@ -3,7 +3,7 @@
 //! Extracted from `agent_loop.rs` to keep the core agentic tool execution
 //! loop (LLM call -> tool calls -> repeat) in its own focused module.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -37,7 +37,8 @@ use crate::context::JobContext;
 use crate::error::Error;
 use crate::llm::{ChatMessage, Reasoning, ReasoningContext, RespondResult};
 use crate::tools::{
-    CircuitBreakerState, ToolContractV2Descriptor, ToolReliabilityProfile, ToolStreamCallback,
+    CircuitBreakerState, ToolContractV2Descriptor, ToolIdempotency, ToolReliabilityProfile,
+    ToolSideEffectLevel, ToolStreamCallback,
 };
 
 const TOOL_RESULT_CHUNK_CHARS: usize = 700;
@@ -168,6 +169,53 @@ fn parse_profile_fallback_tools(raw: &serde_json::Value) -> Vec<String> {
         }
     }
     Vec::new()
+}
+
+fn parse_contract_fallback_tools(contract: Option<&ToolContractV2Descriptor>) -> Vec<String> {
+    contract
+        .map(|c| {
+            c.fallback_candidates
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn merge_fallback_candidates(
+    primary_tool: &str,
+    profile_fallbacks: &[String],
+    contract_fallbacks: &[String],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    seen.insert(primary_tool.to_string());
+    for candidate in profile_fallbacks.iter().chain(contract_fallbacks.iter()) {
+        if seen.insert(candidate.clone()) {
+            out.push(candidate.clone());
+        }
+    }
+    out
+}
+
+fn contract_routing_bonus(contract: Option<&ToolContractV2Descriptor>) -> f32 {
+    let Some(contract) = contract else {
+        return 0.0;
+    };
+    let side_effect_bias = match contract.side_effect_level {
+        ToolSideEffectLevel::ReadOnly => 0.04,
+        ToolSideEffectLevel::WorkspaceWrite => 0.0,
+        ToolSideEffectLevel::SystemMutation | ToolSideEffectLevel::ExternalMutation => -0.04,
+        ToolSideEffectLevel::Financial | ToolSideEffectLevel::Credential => -0.1,
+    };
+    let idempotency_bias = match contract.idempotency {
+        ToolIdempotency::SafeRetry => 0.03,
+        ToolIdempotency::Unknown => 0.0,
+        ToolIdempotency::UnsafeRetry => -0.03,
+    };
+    side_effect_bias + idempotency_bias
 }
 
 fn profile_breaker_is_open(profile: &ToolReliabilityProfile, now: DateTime<Utc>) -> bool {
@@ -489,6 +537,7 @@ impl Agent {
     pub(super) async fn resolve_chat_tool_routing(
         &self,
         requested_tool: &str,
+        user_id: Option<&str>,
     ) -> ChatToolRoutingDecision {
         if !self.config.autonomy_tool_routing_v2 {
             return ChatToolRoutingDecision::Use {
@@ -523,6 +572,10 @@ impl Agent {
                 reason_codes: Vec::new(),
             };
         };
+        let primary_contract = self
+            .tools()
+            .resolve_tool_contract_v2(requested_tool, Some(store.as_ref()), user_id)
+            .await;
 
         let now = Utc::now();
         if !profile_breaker_is_open(&primary_profile, now) {
@@ -533,11 +586,13 @@ impl Agent {
             };
         }
 
+        let profile_fallbacks =
+            parse_profile_fallback_tools(&primary_profile.safe_fallback_options);
+        let contract_fallbacks = parse_contract_fallback_tools(primary_contract.as_ref());
+        let fallback_candidates =
+            merge_fallback_candidates(requested_tool, &profile_fallbacks, &contract_fallbacks);
         let mut fallback_scored = Vec::<(String, f32)>::new();
-        for fallback in parse_profile_fallback_tools(&primary_profile.safe_fallback_options) {
-            if fallback == requested_tool {
-                continue;
-            }
+        for fallback in fallback_candidates {
             if !self.tools().has(&fallback).await {
                 continue;
             }
@@ -560,10 +615,15 @@ impl Agent {
             if is_open {
                 continue;
             }
+            let fallback_contract = self
+                .tools()
+                .resolve_tool_contract_v2(&fallback, Some(store.as_ref()), user_id)
+                .await;
             let score = fallback_profile
                 .as_ref()
                 .map(|p| p.reliability_score)
-                .unwrap_or(0.5);
+                .unwrap_or(0.5)
+                + contract_routing_bonus(fallback_contract.as_ref());
             fallback_scored.push((fallback, score));
         }
 
@@ -1211,7 +1271,10 @@ impl Agent {
                     // Execute each tool (with approval checking and hook interception)
                     for mut tc in tool_calls {
                         let requested_tool_name = tc.name.clone();
-                        match self.resolve_chat_tool_routing(&requested_tool_name).await {
+                        match self
+                            .resolve_chat_tool_routing(&requested_tool_name, Some(&message.user_id))
+                            .await
+                        {
                             ChatToolRoutingDecision::Use {
                                 tool_name,
                                 routed_from,
@@ -1842,12 +1905,16 @@ pub(super) fn detect_auth_awaiting(
 #[cfg(test)]
 mod tests {
     use crate::error::Error;
-    use crate::tools::{CircuitBreakerState, ToolReliabilityProfile};
+    use crate::tools::{
+        CircuitBreakerState, ToolContractSource, ToolContractV2Descriptor, ToolDryRunSupport,
+        ToolIdempotency, ToolReliabilityProfile, ToolSideEffectLevel,
+    };
     use chrono::Utc;
 
     use super::{
         TOOL_RESULT_CHUNK_CHARS, TOOL_STREAM_EVENT_PREFIX, ToolStreamEvent,
-        chunk_tool_result_preview, detect_auth_awaiting, parse_profile_fallback_tools,
+        chunk_tool_result_preview, contract_routing_bonus, detect_auth_awaiting,
+        merge_fallback_candidates, parse_contract_fallback_tools, parse_profile_fallback_tools,
         parse_tool_stream_event, profile_breaker_is_open, shell_preview_from_args,
     };
 
@@ -1914,6 +1981,97 @@ mod tests {
             from_object,
             vec!["http".to_string(), "memory_search".to_string()]
         );
+    }
+
+    #[test]
+    fn test_parse_contract_fallback_tools_and_merge_candidates() {
+        let contract = ToolContractV2Descriptor {
+            tool_name: "shell".to_string(),
+            version: 2,
+            domain: "orchestrator".to_string(),
+            side_effect_level: ToolSideEffectLevel::ReadOnly,
+            idempotency: ToolIdempotency::SafeRetry,
+            dry_run_support: ToolDryRunSupport::Simulated,
+            requires_approval_default: false,
+            preconditions: serde_json::json!({}),
+            postconditions: serde_json::json!({}),
+            timeout_ms_hint: Some(10_000),
+            retry_guidance: serde_json::json!({}),
+            compensation_hint: None,
+            fallback_candidates: vec![
+                "read_file".to_string(),
+                "memory_search".to_string(),
+                "read_file".to_string(),
+            ],
+            risk_tags: vec!["read_only".to_string()],
+            source: ToolContractSource::Inferred,
+            updated_at: Utc::now(),
+        };
+        let contract_fallbacks = parse_contract_fallback_tools(Some(&contract));
+        assert_eq!(
+            contract_fallbacks,
+            vec![
+                "read_file".to_string(),
+                "memory_search".to_string(),
+                "read_file".to_string()
+            ]
+        );
+        let merged = merge_fallback_candidates(
+            "shell",
+            &vec!["http".to_string(), "read_file".to_string()],
+            &contract_fallbacks,
+        );
+        assert_eq!(
+            merged,
+            vec![
+                "http".to_string(),
+                "read_file".to_string(),
+                "memory_search".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_contract_routing_bonus_prefers_safer_contracts() {
+        let now = Utc::now();
+        let safe_contract = ToolContractV2Descriptor {
+            tool_name: "read_file".to_string(),
+            version: 2,
+            domain: "orchestrator".to_string(),
+            side_effect_level: ToolSideEffectLevel::ReadOnly,
+            idempotency: ToolIdempotency::SafeRetry,
+            dry_run_support: ToolDryRunSupport::None,
+            requires_approval_default: false,
+            preconditions: serde_json::json!({}),
+            postconditions: serde_json::json!({}),
+            timeout_ms_hint: Some(5_000),
+            retry_guidance: serde_json::json!({}),
+            compensation_hint: None,
+            fallback_candidates: Vec::new(),
+            risk_tags: vec!["read_only".to_string()],
+            source: ToolContractSource::Inferred,
+            updated_at: now,
+        };
+        let risky_contract = ToolContractV2Descriptor {
+            tool_name: "payment".to_string(),
+            version: 2,
+            domain: "orchestrator".to_string(),
+            side_effect_level: ToolSideEffectLevel::Financial,
+            idempotency: ToolIdempotency::UnsafeRetry,
+            dry_run_support: ToolDryRunSupport::None,
+            requires_approval_default: true,
+            preconditions: serde_json::json!({}),
+            postconditions: serde_json::json!({}),
+            timeout_ms_hint: Some(5_000),
+            retry_guidance: serde_json::json!({}),
+            compensation_hint: None,
+            fallback_candidates: Vec::new(),
+            risk_tags: vec!["financial".to_string()],
+            source: ToolContractSource::ManualOverride,
+            updated_at: now,
+        };
+        assert!(contract_routing_bonus(Some(&safe_contract)) > 0.0);
+        assert!(contract_routing_bonus(Some(&risky_contract)) < 0.0);
     }
 
     #[test]
