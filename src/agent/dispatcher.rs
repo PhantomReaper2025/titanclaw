@@ -171,6 +171,10 @@ fn parse_profile_fallback_tools(raw: &serde_json::Value) -> Vec<String> {
     Vec::new()
 }
 
+const PROACTIVE_ROUTE_MIN_SAMPLES: i64 = 5;
+const PROACTIVE_ROUTE_PRIMARY_MAX_SCORE: f32 = 0.35;
+const PROACTIVE_ROUTE_SCORE_MARGIN: f32 = 0.15;
+
 fn parse_contract_fallback_tools(contract: Option<&ToolContractV2Descriptor>) -> Vec<String> {
     contract
         .map(|c| {
@@ -216,6 +220,21 @@ fn contract_routing_bonus(contract: Option<&ToolContractV2Descriptor>) -> f32 {
         ToolIdempotency::UnsafeRetry => -0.03,
     };
     side_effect_bias + idempotency_bias
+}
+
+fn should_proactively_reroute(
+    primary_profile: &ToolReliabilityProfile,
+    primary_score: f32,
+    best_fallback_score: f32,
+) -> bool {
+    let half_open = matches!(primary_profile.breaker_state, CircuitBreakerState::HalfOpen);
+    if half_open && best_fallback_score > primary_score {
+        return true;
+    }
+
+    primary_profile.sample_count >= PROACTIVE_ROUTE_MIN_SAMPLES
+        && primary_score <= PROACTIVE_ROUTE_PRIMARY_MAX_SCORE
+        && best_fallback_score >= (primary_score + PROACTIVE_ROUTE_SCORE_MARGIN)
 }
 
 fn profile_breaker_is_open(profile: &ToolReliabilityProfile, now: DateTime<Utc>) -> bool {
@@ -578,13 +597,9 @@ impl Agent {
             .await;
 
         let now = Utc::now();
-        if !profile_breaker_is_open(&primary_profile, now) {
-            return ChatToolRoutingDecision::Use {
-                tool_name: requested_tool.to_string(),
-                routed_from: None,
-                reason_codes: Vec::new(),
-            };
-        }
+        let primary_open = profile_breaker_is_open(&primary_profile, now);
+        let primary_score =
+            primary_profile.reliability_score + contract_routing_bonus(primary_contract.as_ref());
 
         let profile_fallbacks =
             parse_profile_fallback_tools(&primary_profile.safe_fallback_options);
@@ -633,23 +648,44 @@ impl Agent {
                 .then_with(|| a.0.cmp(&b.0))
         });
 
-        if let Some((fallback_tool, _)) = fallback_scored.into_iter().next() {
-            return ChatToolRoutingDecision::Use {
-                tool_name: fallback_tool,
-                routed_from: Some(requested_tool.to_string()),
-                reason_codes: vec![
-                    "circuit_breaker_open".to_string(),
-                    "tool_routing_v2_fallback".to_string(),
-                ],
+        if let Some((fallback_tool, best_fallback_score)) = fallback_scored.first() {
+            if primary_open {
+                return ChatToolRoutingDecision::Use {
+                    tool_name: fallback_tool.clone(),
+                    routed_from: Some(requested_tool.to_string()),
+                    reason_codes: vec![
+                        "circuit_breaker_open".to_string(),
+                        "tool_routing_v2_fallback".to_string(),
+                    ],
+                };
+            }
+            if should_proactively_reroute(&primary_profile, primary_score, *best_fallback_score) {
+                let mut reason_codes = vec!["tool_routing_v2_prefer_reliable_fallback".to_string()];
+                if matches!(primary_profile.breaker_state, CircuitBreakerState::HalfOpen) {
+                    reason_codes.push("circuit_breaker_half_open".to_string());
+                }
+                return ChatToolRoutingDecision::Use {
+                    tool_name: fallback_tool.clone(),
+                    routed_from: Some(requested_tool.to_string()),
+                    reason_codes,
+                };
+            }
+        }
+
+        if primary_open {
+            return ChatToolRoutingDecision::Deny {
+                reason_codes: vec!["circuit_breaker_open".to_string()],
+                detail: format!(
+                    "tool '{}' is temporarily blocked by reliability circuit breaker",
+                    requested_tool
+                ),
             };
         }
 
-        ChatToolRoutingDecision::Deny {
-            reason_codes: vec!["circuit_breaker_open".to_string()],
-            detail: format!(
-                "tool '{}' is temporarily blocked by reliability circuit breaker",
-                requested_tool
-            ),
+        ChatToolRoutingDecision::Use {
+            tool_name: requested_tool.to_string(),
+            routed_from: None,
+            reason_codes: Vec::new(),
         }
     }
 
@@ -1916,6 +1952,7 @@ mod tests {
         chunk_tool_result_preview, contract_routing_bonus, detect_auth_awaiting,
         merge_fallback_candidates, parse_contract_fallback_tools, parse_profile_fallback_tools,
         parse_tool_stream_event, profile_breaker_is_open, shell_preview_from_args,
+        should_proactively_reroute,
     };
 
     #[test]
@@ -2072,6 +2109,34 @@ mod tests {
         };
         assert!(contract_routing_bonus(Some(&safe_contract)) > 0.0);
         assert!(contract_routing_bonus(Some(&risky_contract)) < 0.0);
+    }
+
+    #[test]
+    fn test_should_proactively_reroute_when_primary_degraded() {
+        let now = Utc::now();
+        let profile = ToolReliabilityProfile {
+            tool_name: "shell".to_string(),
+            window_start: now - chrono::Duration::minutes(10),
+            window_end: now,
+            sample_count: 10,
+            success_count: 2,
+            failure_count: 8,
+            timeout_count: 0,
+            blocked_count: 0,
+            success_rate: 0.2,
+            p50_latency_ms: None,
+            p95_latency_ms: None,
+            common_failure_modes: serde_json::json!([]),
+            recent_incident_count: 1,
+            reliability_score: 0.2,
+            safe_fallback_options: serde_json::json!([]),
+            breaker_state: CircuitBreakerState::Closed,
+            cooldown_until: None,
+            last_failure_at: Some(now),
+            last_success_at: None,
+            updated_at: now,
+        };
+        assert!(should_proactively_reroute(&profile, 0.2, 0.5));
     }
 
     #[test]

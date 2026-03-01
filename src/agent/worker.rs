@@ -147,6 +147,10 @@ fn parse_profile_fallback_tools(raw: &serde_json::Value) -> Vec<String> {
     Vec::new()
 }
 
+const PROACTIVE_ROUTE_MIN_SAMPLES: i64 = 5;
+const PROACTIVE_ROUTE_PRIMARY_MAX_SCORE: f32 = 0.35;
+const PROACTIVE_ROUTE_SCORE_MARGIN: f32 = 0.15;
+
 fn parse_contract_fallback_tools(contract: Option<&ToolContractV2Descriptor>) -> Vec<String> {
     contract
         .map(|c| {
@@ -192,6 +196,21 @@ fn contract_routing_bonus(contract: Option<&ToolContractV2Descriptor>) -> f32 {
         ToolIdempotency::UnsafeRetry => -0.03,
     };
     side_effect_bias + idempotency_bias
+}
+
+fn should_proactively_reroute(
+    primary_profile: &ToolReliabilityProfile,
+    primary_score: f32,
+    best_fallback_score: f32,
+) -> bool {
+    let half_open = matches!(primary_profile.breaker_state, CircuitBreakerState::HalfOpen);
+    if half_open && best_fallback_score > primary_score {
+        return true;
+    }
+
+    primary_profile.sample_count >= PROACTIVE_ROUTE_MIN_SAMPLES
+        && primary_score <= PROACTIVE_ROUTE_PRIMARY_MAX_SCORE
+        && best_fallback_score >= (primary_score + PROACTIVE_ROUTE_SCORE_MARGIN)
 }
 
 fn profile_breaker_is_open(profile: &ToolReliabilityProfile, now: chrono::DateTime<Utc>) -> bool {
@@ -598,6 +617,11 @@ impl Worker {
             .as_ref()
             .map(|p| profile_breaker_is_open(p, now))
             .unwrap_or(false);
+        let primary_score = primary_profile
+            .as_ref()
+            .map(|p| p.reliability_score)
+            .unwrap_or(0.5)
+            + contract_routing_bonus(primary_contract.as_ref());
 
         let mut fallback_scored: Vec<(String, f32)> = Vec::new();
         for fallback in candidates.iter().skip(1) {
@@ -640,6 +664,16 @@ impl Worker {
                 return Vec::new();
             }
             return fallback_scored.into_iter().map(|(name, _)| name).collect();
+        }
+
+        if let (Some(primary_profile), Some((_, best_fallback_score))) =
+            (primary_profile.as_ref(), fallback_scored.first())
+            && should_proactively_reroute(primary_profile, primary_score, *best_fallback_score)
+        {
+            let mut ordered = Vec::with_capacity(1 + fallback_scored.len());
+            ordered.extend(fallback_scored.iter().map(|(name, _)| name.clone()));
+            ordered.push(primary_tool.to_string());
+            return ordered;
         }
 
         let mut ordered = Vec::with_capacity(1 + fallback_scored.len());
@@ -2754,6 +2788,7 @@ mod tests {
         PersistedPlanRun, PlanExecutionOutcome, ReplanReason, Worker, WorkerDeps,
         classify_replan_reason_for_step_error, classify_step_evidence, contract_routing_bonus,
         merge_fallback_candidates, parse_contract_fallback_tools, parse_profile_fallback_tools,
+        should_proactively_reroute,
     };
 
     #[test]
@@ -2982,6 +3017,34 @@ mod tests {
         };
         assert!(contract_routing_bonus(Some(&safe_contract)) > 0.0);
         assert!(contract_routing_bonus(Some(&risky_contract)) < 0.0);
+    }
+
+    #[test]
+    fn test_should_proactively_reroute_when_primary_degraded() {
+        let now = Utc::now();
+        let profile = crate::tools::ToolReliabilityProfile {
+            tool_name: "primary".to_string(),
+            window_start: now - chrono::Duration::minutes(30),
+            window_end: now,
+            sample_count: 10,
+            success_count: 2,
+            failure_count: 8,
+            timeout_count: 1,
+            blocked_count: 0,
+            success_rate: 0.2,
+            p50_latency_ms: Some(1000),
+            p95_latency_ms: Some(4000),
+            common_failure_modes: serde_json::json!([]),
+            recent_incident_count: 1,
+            reliability_score: 0.2,
+            safe_fallback_options: serde_json::json!([]),
+            breaker_state: CircuitBreakerState::Closed,
+            cooldown_until: None,
+            last_failure_at: Some(now),
+            last_success_at: None,
+            updated_at: now,
+        };
+        assert!(should_proactively_reroute(&profile, 0.2, 0.5));
     }
 
     struct NoopTool;
@@ -3754,6 +3817,125 @@ mod tests {
         assert!(
             !attempts.iter().any(|a| a.tool_name == "missing_tool"),
             "primary open-breaker tool should not be attempted when fallback is available"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_worker_routing_proactively_prefers_reliable_fallback_for_degraded_primary() {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(NoopTool)).await;
+
+        let scripted_llm = Arc::new(SequenceLlm::new(vec![
+            ScriptedLlmResponse::Complete(
+                serde_json::json!({
+                    "goal": "Prefer reliable fallback",
+                    "actions": [{
+                        "tool_name": "missing_tool",
+                        "parameters": {},
+                        "reasoning": "Primary is degraded; prefer safer fallback",
+                        "expected_outcome": "Fallback should execute before primary"
+                    }],
+                    "estimated_cost": null,
+                    "estimated_time_secs": 5,
+                    "confidence": 0.8
+                })
+                .to_string(),
+            ),
+            ScriptedLlmResponse::CompleteWithTools("The job is complete.".to_string()),
+        ]));
+        let llm: Arc<dyn LlmProvider> = scripted_llm.clone();
+
+        let harness = TestHarnessBuilder::new()
+            .with_tools(Arc::clone(&tools))
+            .with_llm(Arc::clone(&llm))
+            .build()
+            .await;
+
+        let now = Utc::now();
+        harness
+            .db
+            .upsert_tool_reliability_profile(&crate::tools::ToolReliabilityProfile {
+                tool_name: "missing_tool".to_string(),
+                window_start: now - chrono::Duration::minutes(30),
+                window_end: now,
+                sample_count: 10,
+                success_count: 1,
+                failure_count: 9,
+                timeout_count: 2,
+                blocked_count: 0,
+                success_rate: 0.1,
+                p50_latency_ms: Some(3000),
+                p95_latency_ms: Some(8000),
+                common_failure_modes: serde_json::json!([]),
+                recent_incident_count: 2,
+                reliability_score: 0.2,
+                safe_fallback_options: serde_json::json!(["noop_tool"]),
+                breaker_state: CircuitBreakerState::Closed,
+                cooldown_until: None,
+                last_failure_at: Some(now - chrono::Duration::minutes(1)),
+                last_success_at: None,
+                updated_at: now,
+            })
+            .await
+            .expect("seed missing_tool degraded profile");
+
+        let context_manager = Arc::new(ContextManager::new(4));
+        let job_id = context_manager
+            .create_job_for_user(
+                "user-1",
+                "Proactive fallback test",
+                "Prefer reliable fallback for degraded primary",
+            )
+            .await
+            .expect("create job");
+        context_manager
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(JobState::InProgress, Some("test setup".to_string()))
+            })
+            .await
+            .expect("update context")
+            .expect("transition to in_progress");
+
+        let worker = Worker::new(
+            job_id,
+            WorkerDeps {
+                context_manager: Arc::clone(&context_manager),
+                llm: Arc::clone(&llm),
+                safety: harness.deps.safety.clone(),
+                tools: Arc::clone(&tools),
+                store: Some(harness.db.clone()),
+                hooks: Arc::new(HookRegistry::new()),
+                timeout: Duration::from_secs(10),
+                use_planning: true,
+                autonomy_policy_engine_v1: true,
+                autonomy_verifier_v1: true,
+                autonomy_replanner_v1: true,
+                autonomy_tool_routing_v2: true,
+                autonomy_memory_plane_v2: false,
+                autonomy_memory_retrieval_v2: false,
+            },
+        );
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(crate::agent::scheduler::WorkerMessage::Start)
+            .await
+            .expect("send start");
+        worker.run(rx).await.expect("worker run");
+
+        let attempts = harness
+            .db
+            .list_execution_attempts_for_user("user-1")
+            .await
+            .expect("list execution attempts");
+        assert!(
+            attempts.iter().any(|a| a.tool_name == "noop_tool"
+                && matches!(a.status, crate::agent::ExecutionAttemptStatus::Succeeded)),
+            "expected successful noop_tool fallback attempt"
+        );
+        assert!(
+            !attempts.iter().any(|a| a.tool_name == "missing_tool"),
+            "degraded primary should not be attempted when proactive fallback routing is active"
         );
     }
 
