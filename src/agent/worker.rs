@@ -1,5 +1,6 @@
 //! Per-job worker execution.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,7 +45,7 @@ use crate::llm::{
     ActionPlan, ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult, ToolSelection,
 };
 use crate::safety::SafetyLayer;
-use crate::tools::ToolRegistry;
+use crate::tools::{CircuitBreakerState, ToolRegistry, ToolReliabilityProfile};
 
 /// Shared dependencies for worker execution.
 ///
@@ -63,6 +64,7 @@ pub struct WorkerDeps {
     pub autonomy_policy_engine_v1: bool,
     pub autonomy_verifier_v1: bool,
     pub autonomy_replanner_v1: bool,
+    pub autonomy_tool_routing_v2: bool,
     pub autonomy_memory_plane_v2: bool,
     pub autonomy_memory_retrieval_v2: bool,
 }
@@ -75,6 +77,14 @@ pub struct Worker {
 
 /// Result of a tool execution with metadata for context building.
 struct ToolExecResult {
+    result: Result<String, Error>,
+}
+
+struct StepExecutionOutcome {
+    selected_tool_name: String,
+    selected_attempt_index: usize,
+    selected_started_at: chrono::DateTime<Utc>,
+    selected_elapsed_ms: i64,
     result: Result<String, Error>,
 }
 
@@ -104,6 +114,42 @@ fn classify_replan_reason_for_step_error(err: &Error) -> Option<ReplanReason> {
         Error::Tool(ToolError::Timeout { .. }) => Some(ReplanReason::StepFailure),
         Error::Tool(ToolError::ExecutionFailed { .. }) => Some(ReplanReason::StepFailure),
         _ => None,
+    }
+}
+
+fn parse_profile_fallback_tools(raw: &serde_json::Value) -> Vec<String> {
+    if let Some(list) = raw.as_array() {
+        return list
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .collect();
+    }
+    if let Some(obj) = raw.as_object() {
+        for key in ["tools", "fallback_tools", "safe_tools"] {
+            if let Some(list) = obj.get(key).and_then(|v| v.as_array()) {
+                return list
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn profile_breaker_is_open(profile: &ToolReliabilityProfile, now: chrono::DateTime<Utc>) -> bool {
+    if !matches!(profile.breaker_state, CircuitBreakerState::Open) {
+        return false;
+    }
+    match profile.cooldown_until {
+        Some(ts) => ts > now,
+        None => true,
     }
 }
 
@@ -370,6 +416,10 @@ impl Worker {
         self.deps.autonomy_replanner_v1
     }
 
+    fn autonomy_tool_routing_v2(&self) -> bool {
+        self.deps.autonomy_tool_routing_v2
+    }
+
     async fn build_planner_memory_retrieval_context(
         &self,
         reason_ctx: &ReasoningContext,
@@ -442,6 +492,167 @@ impl Worker {
                 );
                 None
             }
+        }
+    }
+
+    async fn rank_plan_step_tool_candidates(&self, primary_tool: &str) -> Vec<String> {
+        let mut candidates = vec![primary_tool.to_string()];
+        if !self.autonomy_tool_routing_v2() {
+            return candidates;
+        }
+        let Some(store) = self.store() else {
+            return candidates;
+        };
+
+        let primary_profile = match store.get_tool_reliability_profile(primary_tool).await {
+            Ok(profile) => profile,
+            Err(e) => {
+                tracing::warn!(
+                    job = %self.job_id,
+                    tool = %primary_tool,
+                    "Failed to load primary tool reliability profile: {}",
+                    e
+                );
+                None
+            }
+        };
+
+        if let Some(profile) = primary_profile.as_ref() {
+            let mut seen: HashSet<String> = HashSet::new();
+            seen.insert(primary_tool.to_string());
+            for fallback in parse_profile_fallback_tools(&profile.safe_fallback_options) {
+                if seen.insert(fallback.clone()) {
+                    candidates.push(fallback);
+                }
+            }
+        }
+
+        if candidates.len() <= 1 {
+            return candidates;
+        }
+
+        let now = Utc::now();
+        let primary_open = primary_profile
+            .as_ref()
+            .map(|p| profile_breaker_is_open(p, now))
+            .unwrap_or(false);
+
+        let mut fallback_scored: Vec<(String, bool, f32)> = Vec::new();
+        for fallback in candidates.iter().skip(1) {
+            let profile = match store.get_tool_reliability_profile(fallback).await {
+                Ok(profile) => profile,
+                Err(e) => {
+                    tracing::warn!(
+                        job = %self.job_id,
+                        tool = %fallback,
+                        "Failed to load fallback tool reliability profile: {}",
+                        e
+                    );
+                    None
+                }
+            };
+            let is_open = profile
+                .as_ref()
+                .map(|p| profile_breaker_is_open(p, now))
+                .unwrap_or(false);
+            let score = profile.as_ref().map(|p| p.reliability_score).unwrap_or(0.5);
+            fallback_scored.push((fallback.clone(), is_open, score));
+        }
+
+        fallback_scored.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        let has_non_open_fallback = fallback_scored.iter().any(|(_, is_open, _)| !*is_open);
+        let mut ordered = Vec::with_capacity(1 + fallback_scored.len());
+        if primary_open && has_non_open_fallback {
+            ordered.extend(fallback_scored.iter().map(|(name, _, _)| name.clone()));
+            ordered.push(primary_tool.to_string());
+        } else {
+            ordered.push(primary_tool.to_string());
+            ordered.extend(fallback_scored.into_iter().map(|(name, _, _)| name));
+        }
+
+        ordered
+    }
+
+    async fn execute_plan_step_with_routing(
+        &self,
+        step_index: usize,
+        requested_tool_name: &str,
+        parameters: &serde_json::Value,
+        persisted_plan: Option<&PersistedPlanRun>,
+    ) -> StepExecutionOutcome {
+        let candidates = self
+            .rank_plan_step_tool_candidates(requested_tool_name)
+            .await;
+        let step_call_prefix = format!("plan_{}_{}", self.job_id, step_index);
+
+        for (attempt_idx, candidate_tool) in candidates.iter().enumerate() {
+            let started_at = Utc::now();
+            let started = std::time::Instant::now();
+            let result = self.execute_tool(candidate_tool, parameters).await;
+            let elapsed_ms = started.elapsed().as_millis() as i64;
+
+            let call_id = format!("{}_{}", step_call_prefix, attempt_idx);
+            if let Some(p) = persisted_plan {
+                self.record_worker_execution_attempt_best_effort(
+                    p,
+                    step_index,
+                    candidate_tool,
+                    parameters,
+                    &call_id,
+                    started_at,
+                    &result,
+                    elapsed_ms,
+                    attempt_idx as i32,
+                )
+                .await;
+            }
+
+            let should_try_fallback = self.autonomy_tool_routing_v2()
+                && result.is_err()
+                && attempt_idx + 1 < candidates.len()
+                && result
+                    .as_ref()
+                    .err()
+                    .and_then(classify_replan_reason_for_step_error)
+                    .is_some();
+
+            if should_try_fallback {
+                tracing::info!(
+                    job = %self.job_id,
+                    step = step_index + 1,
+                    requested_tool = %requested_tool_name,
+                    attempted_tool = %candidate_tool,
+                    next_tool = %candidates[attempt_idx + 1],
+                    "Plan step attempt failed; trying reliability fallback candidate"
+                );
+                continue;
+            }
+
+            return StepExecutionOutcome {
+                selected_tool_name: candidate_tool.clone(),
+                selected_attempt_index: attempt_idx,
+                selected_started_at: started_at,
+                selected_elapsed_ms: elapsed_ms,
+                result,
+            };
+        }
+
+        let fallback_err: Error = ToolError::ExecutionFailed {
+            name: requested_tool_name.to_string(),
+            reason: "No tool candidate could be selected for execution".to_string(),
+        }
+        .into();
+        StepExecutionOutcome {
+            selected_tool_name: requested_tool_name.to_string(),
+            selected_attempt_index: 0,
+            selected_started_at: Utc::now(),
+            selected_elapsed_ms: 0,
+            result: Err(fallback_err),
         }
     }
 
@@ -1831,13 +2042,20 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     .await;
             }
 
-            // Execute the planned tool
-            let started_at = Utc::now();
-            let started = std::time::Instant::now();
-            let result = self
-                .execute_tool(&action.tool_name, &action.parameters)
+            // Execute the planned tool (with optional reliability-aware fallback routing).
+            let step_exec = self
+                .execute_plan_step_with_routing(
+                    i,
+                    &action.tool_name,
+                    &action.parameters,
+                    persisted_plan,
+                )
                 .await;
-            let elapsed_ms = started.elapsed().as_millis() as i64;
+            let started_at = step_exec.selected_started_at;
+            let elapsed_ms = step_exec.selected_elapsed_ms;
+            let result = step_exec.result;
+            let selected_tool_name = step_exec.selected_tool_name;
+            let selected_attempt_index = step_exec.selected_attempt_index;
             let step_succeeded = result.is_ok();
             executed_steps += 1;
             if step_succeeded {
@@ -1864,10 +2082,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 }
             };
             let evidence_class =
-                classify_step_evidence(&action.tool_name, &action.parameters, &action.reasoning);
+                classify_step_evidence(&selected_tool_name, &action.parameters, &action.reasoning);
             let step_payload = serde_json::json!({
                 "sequence_index": i,
-                "tool_name": action.tool_name,
+                "tool_name": selected_tool_name.clone(),
+                "requested_tool_name": action.tool_name,
+                "attempt_index": selected_attempt_index,
                 "reasoning": action.reasoning,
                 "elapsed_ms": elapsed_ms,
                 "status": if step_succeeded { "succeeded" } else { "failed" },
@@ -1900,10 +2120,10 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                         } else {
                             "failed"
                         },
-                        action.tool_name
+                        selected_tool_name.clone()
                     ),
                     summary: format!(
-                        "Step {}/{} {} in {}ms: {}",
+                        "Step {}/{} {} via {} in {}ms: {}",
                         i + 1,
                         plan.actions.len(),
                         if step_succeeded {
@@ -1911,6 +2131,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                         } else {
                             "failed"
                         },
+                        selected_tool_name.clone(),
                         elapsed_ms,
                         action.reasoning.chars().take(160).collect::<String>()
                     ),
@@ -1940,7 +2161,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     } else {
                         "Failed"
                     },
-                    action.tool_name,
+                    selected_tool_name,
                     action.reasoning
                 )
                 .chars()
@@ -1966,27 +2187,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             // Plan actions don't originate from an LLM tool_call response so
             // there is no real tool_call_id; generate a unique one.
             let selection = ToolSelection {
-                tool_name: action.tool_name.clone(),
+                tool_name: selected_tool_name.clone(),
                 parameters: action.parameters.clone(),
                 reasoning: action.reasoning.clone(),
                 alternatives: vec![],
-                tool_call_id: format!("plan_{}_{}", self.job_id, i),
+                tool_call_id: format!("plan_{}_{}_{}", self.job_id, i, selected_attempt_index),
             };
-
-            if let Some(p) = persisted_plan {
-                self.record_worker_execution_attempt_best_effort(
-                    p,
-                    i,
-                    &action.tool_name,
-                    &action.parameters,
-                    &selection.tool_call_id,
-                    started_at,
-                    &result,
-                    elapsed_ms,
-                    0,
-                )
-                .await;
-            }
 
             if let Some(p) = persisted_plan
                 && let Some(step_id) = p.step_ids.get(i)
@@ -2390,12 +2596,13 @@ mod tests {
     };
     use crate::safety::SafetyLayer;
     use crate::testing::{StubLlm, TestHarnessBuilder};
-    use crate::tools::{Tool, ToolOutput, ToolRegistry};
+    use crate::tools::{CircuitBreakerState, Tool, ToolOutput, ToolRegistry};
     use crate::util::llm_signals_completion;
 
     use super::{
         PersistedPlanRun, PlanExecutionOutcome, ReplanReason, Worker, WorkerDeps,
         classify_replan_reason_for_step_error, classify_step_evidence,
+        parse_profile_fallback_tools,
     };
 
     #[test]
@@ -2514,6 +2721,24 @@ mod tests {
             "Run tests",
         );
         assert_eq!(test.kind, crate::agent::EvidenceKind::TestRun);
+    }
+
+    #[test]
+    fn test_parse_profile_fallback_tools_supports_array_and_object() {
+        let from_array =
+            parse_profile_fallback_tools(&serde_json::json!(["shell", " read_file ", 2, null]));
+        assert_eq!(
+            from_array,
+            vec!["shell".to_string(), "read_file".to_string()]
+        );
+
+        let from_object = parse_profile_fallback_tools(&serde_json::json!({
+            "tools": ["http", "memory_search"]
+        }));
+        assert_eq!(
+            from_object,
+            vec!["http".to_string(), "memory_search".to_string()]
+        );
     }
 
     struct NoopTool;
@@ -2765,6 +2990,7 @@ mod tests {
                 autonomy_policy_engine_v1: true,
                 autonomy_verifier_v1: true,
                 autonomy_replanner_v1: true,
+                autonomy_tool_routing_v2: false,
                 autonomy_memory_plane_v2: true,
                 autonomy_memory_retrieval_v2: false,
             },
@@ -2999,6 +3225,7 @@ mod tests {
                 autonomy_policy_engine_v1: true,
                 autonomy_verifier_v1: true,
                 autonomy_replanner_v1: true,
+                autonomy_tool_routing_v2: false,
                 autonomy_memory_plane_v2: false,
                 autonomy_memory_retrieval_v2: false,
             },
@@ -3123,6 +3350,140 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
+    async fn test_worker_routing_uses_fallback_when_primary_breaker_open() {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(NoopTool)).await;
+
+        let scripted_llm = Arc::new(SequenceLlm::new(vec![
+            ScriptedLlmResponse::Complete(
+                serde_json::json!({
+                    "goal": "Use fallback tool",
+                    "actions": [{
+                        "tool_name": "missing_tool",
+                        "parameters": {},
+                        "reasoning": "Primary tool is currently degraded",
+                        "expected_outcome": "Fallback should execute"
+                    }],
+                    "estimated_cost": null,
+                    "estimated_time_secs": 5,
+                    "confidence": 0.8
+                })
+                .to_string(),
+            ),
+            ScriptedLlmResponse::CompleteWithTools("The job is complete.".to_string()),
+        ]));
+        let llm: Arc<dyn LlmProvider> = scripted_llm.clone();
+
+        let harness = TestHarnessBuilder::new()
+            .with_tools(Arc::clone(&tools))
+            .with_llm(Arc::clone(&llm))
+            .build()
+            .await;
+
+        let now = Utc::now();
+        harness
+            .db
+            .upsert_tool_reliability_profile(&crate::tools::ToolReliabilityProfile {
+                tool_name: "missing_tool".to_string(),
+                window_start: now - chrono::Duration::minutes(30),
+                window_end: now,
+                sample_count: 10,
+                success_count: 1,
+                failure_count: 9,
+                timeout_count: 4,
+                blocked_count: 0,
+                success_rate: 0.1,
+                p50_latency_ms: Some(3000),
+                p95_latency_ms: Some(8000),
+                common_failure_modes: serde_json::json!([]),
+                recent_incident_count: 3,
+                reliability_score: 0.1,
+                safe_fallback_options: serde_json::json!(["noop_tool"]),
+                breaker_state: CircuitBreakerState::Open,
+                cooldown_until: Some(now + chrono::Duration::minutes(30)),
+                last_failure_at: Some(now - chrono::Duration::minutes(1)),
+                last_success_at: None,
+                updated_at: now,
+            })
+            .await
+            .expect("seed missing_tool profile");
+
+        let context_manager = Arc::new(ContextManager::new(4));
+        let job_id = context_manager
+            .create_job_for_user(
+                "user-1",
+                "Routing fallback test",
+                "Use reliability fallback",
+            )
+            .await
+            .expect("create job");
+        context_manager
+            .update_context(job_id, |ctx| {
+                ctx.transition_to(JobState::InProgress, Some("test setup".to_string()))
+            })
+            .await
+            .expect("update context")
+            .expect("transition to in_progress");
+
+        let worker = Worker::new(
+            job_id,
+            WorkerDeps {
+                context_manager: Arc::clone(&context_manager),
+                llm: Arc::clone(&llm),
+                safety: harness.deps.safety.clone(),
+                tools: Arc::clone(&tools),
+                store: Some(harness.db.clone()),
+                hooks: Arc::new(HookRegistry::new()),
+                timeout: Duration::from_secs(10),
+                use_planning: true,
+                autonomy_policy_engine_v1: true,
+                autonomy_verifier_v1: true,
+                autonomy_replanner_v1: true,
+                autonomy_tool_routing_v2: true,
+                autonomy_memory_plane_v2: false,
+                autonomy_memory_retrieval_v2: false,
+            },
+        );
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(crate::agent::scheduler::WorkerMessage::Start)
+            .await
+            .expect("send start");
+        worker.run(rx).await.expect("worker run");
+
+        let ctx = context_manager
+            .get_context(job_id)
+            .await
+            .expect("job context");
+        assert_eq!(ctx.state, JobState::Completed);
+        let goal_id = ctx.autonomy_goal_id.expect("goal link persisted");
+
+        let plans = harness
+            .db
+            .list_plans_for_goal(goal_id)
+            .await
+            .expect("list plans");
+        assert_eq!(plans.len(), 1, "fallback should avoid replanning");
+        assert_eq!(plans[0].status, PlanStatus::Completed);
+
+        let attempts = harness
+            .db
+            .list_execution_attempts_for_user("user-1")
+            .await
+            .expect("list execution attempts");
+        assert!(
+            attempts.iter().any(|a| a.tool_name == "noop_tool"
+                && matches!(a.status, crate::agent::ExecutionAttemptStatus::Succeeded)),
+            "expected successful noop_tool fallback attempt"
+        );
+        assert!(
+            !attempts.iter().any(|a| a.tool_name == "missing_tool"),
+            "primary open-breaker tool should not be attempted when fallback is available"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
     async fn test_execute_tool_inner_policy_denial_persists_autonomy_policy_record() {
         let tools = Arc::new(ToolRegistry::new());
         tools.register(Arc::new(ApprovalTool)).await;
@@ -3185,6 +3546,7 @@ mod tests {
             autonomy_policy_engine_v1: true,
             autonomy_verifier_v1: true,
             autonomy_replanner_v1: true,
+            autonomy_tool_routing_v2: false,
             autonomy_memory_plane_v2: false,
             autonomy_memory_retrieval_v2: false,
         };

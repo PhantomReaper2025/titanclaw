@@ -411,7 +411,9 @@ pub(crate) fn compute_tool_reliability_profile(
         (CircuitBreakerState::Closed, None)
     };
 
-    let safe_fallback_options = serde_json::json!([]);
+    let safe_fallback_options = previous_profile
+        .map(|p| p.safe_fallback_options.clone())
+        .unwrap_or_else(|| serde_json::json!([]));
 
     Ok(Some(ToolReliabilityProfile {
         tool_name: tool_name.to_string(),

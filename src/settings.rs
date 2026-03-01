@@ -315,6 +315,10 @@ pub struct AgentSettings {
     #[serde(default = "default_true")]
     pub autonomy_replanner_v1: bool,
 
+    /// Enable reliability-aware worker tool routing/fallback behavior.
+    #[serde(default)]
+    pub autonomy_tool_routing_v2: bool,
+
     /// Enable Memory Plane v2 runtime writes/services.
     #[serde(default)]
     pub autonomy_memory_plane_v2: bool,
@@ -532,6 +536,7 @@ impl Default for AgentSettings {
             autonomy_policy_engine_v1: true,
             autonomy_verifier_v1: true,
             autonomy_replanner_v1: true,
+            autonomy_tool_routing_v2: false,
             autonomy_memory_plane_v2: false,
             autonomy_memory_retrieval_v2: false,
             autonomy_memory_consolidation_v2: false,

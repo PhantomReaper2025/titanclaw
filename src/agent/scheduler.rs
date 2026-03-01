@@ -172,6 +172,7 @@ impl Scheduler {
                 autonomy_policy_engine_v1: self.config.autonomy_policy_engine_v1,
                 autonomy_verifier_v1: self.config.autonomy_verifier_v1,
                 autonomy_replanner_v1: self.config.autonomy_replanner_v1,
+                autonomy_tool_routing_v2: self.config.autonomy_tool_routing_v2,
                 autonomy_memory_plane_v2: self.config.autonomy_memory_plane_v2,
                 autonomy_memory_retrieval_v2: self.config.autonomy_memory_retrieval_v2,
             };

@@ -21,6 +21,8 @@ pub struct AgentConfig {
     pub autonomy_verifier_v1: bool,
     /// Enable bounded automatic replanning in worker planned execution.
     pub autonomy_replanner_v1: bool,
+    /// Enable reliability-aware worker tool routing/fallback behavior.
+    pub autonomy_tool_routing_v2: bool,
     /// Enable Memory Plane v2 runtime writes/services.
     pub autonomy_memory_plane_v2: bool,
     /// Enable Memory Plane v2 retrieval composer integration.
@@ -163,6 +165,14 @@ impl AgentConfig {
                     message: format!("must be 'true' or 'false': {e}"),
                 })?
                 .unwrap_or(settings.agent.autonomy_replanner_v1),
+            autonomy_tool_routing_v2: optional_env("AUTONOMY_TOOL_ROUTING_V2")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "AUTONOMY_TOOL_ROUTING_V2".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(settings.agent.autonomy_tool_routing_v2),
             autonomy_memory_plane_v2: optional_env("AUTONOMY_MEMORY_PLANE_V2")?
                 .map(|s| s.parse())
                 .transpose()
@@ -430,6 +440,7 @@ mod tests {
             std::env::remove_var("AUTONOMY_POLICY_ENGINE_V1");
             std::env::remove_var("AUTONOMY_VERIFIER_V1");
             std::env::remove_var("AUTONOMY_REPLANNER_V1");
+            std::env::remove_var("AUTONOMY_TOOL_ROUTING_V2");
             std::env::remove_var("AUTONOMY_MEMORY_PLANE_V2");
             std::env::remove_var("AUTONOMY_MEMORY_RETRIEVAL_V2");
             std::env::remove_var("AUTONOMY_MEMORY_CONSOLIDATION_V2");
@@ -449,6 +460,7 @@ mod tests {
         assert!(cfg.autonomy_policy_engine_v1);
         assert!(cfg.autonomy_verifier_v1);
         assert!(cfg.autonomy_replanner_v1);
+        assert!(!cfg.autonomy_tool_routing_v2);
     }
 
     #[test]
@@ -460,11 +472,13 @@ mod tests {
             std::env::set_var("AUTONOMY_POLICY_ENGINE_V1", "false");
             std::env::set_var("AUTONOMY_VERIFIER_V1", "false");
             std::env::set_var("AUTONOMY_REPLANNER_V1", "false");
+            std::env::set_var("AUTONOMY_TOOL_ROUTING_V2", "true");
         }
         let cfg = AgentConfig::resolve(&Settings::default()).expect("resolve");
         assert!(!cfg.autonomy_policy_engine_v1);
         assert!(!cfg.autonomy_verifier_v1);
         assert!(!cfg.autonomy_replanner_v1);
+        assert!(cfg.autonomy_tool_routing_v2);
         clear_autonomy_flag_env();
     }
 
