@@ -697,8 +697,11 @@ impl Scheduler {
             .into());
         }
 
+        let contract_v2 = tools
+            .resolve_tool_contract_v2(tool_name, None, Some(&job_ctx.user_id))
+            .await;
         if let ApprovalPolicyOutcome::RequireApproval { .. } =
-            evaluate_worker_tool_approval(tool.as_ref())
+            evaluate_worker_tool_approval(tool.as_ref(), contract_v2.as_ref())
         {
             return Err(crate::error::ToolError::AuthRequired {
                 name: tool_name.to_string(),
@@ -893,8 +896,9 @@ async fn decide_offload(
         return OffloadDecision::LocalOnly;
     };
 
+    let contract_v2 = tools.resolve_tool_contract_v2(tool_name, None, None).await;
     if let ApprovalPolicyOutcome::RequireApproval { .. } =
-        evaluate_dispatcher_tool_approval(tool.as_ref(), params, false)
+        evaluate_dispatcher_tool_approval(tool.as_ref(), params, false, contract_v2.as_ref())
     {
         return OffloadDecision::LocalOnly;
     }

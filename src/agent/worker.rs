@@ -1734,8 +1734,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         }
 
         // Policy engine v1: autonomous jobs cannot execute approval-required tools.
+        let contract_v2 = deps
+            .tools
+            .resolve_tool_contract_v2(tool_name, deps.store.as_deref(), Some(&job_ctx.user_id))
+            .await;
         if let ApprovalPolicyOutcome::RequireApproval { reason_codes } =
-            evaluate_worker_tool_approval(tool.as_ref())
+            evaluate_worker_tool_approval(tool.as_ref(), contract_v2.as_ref())
         {
             if deps.autonomy_policy_engine_v1 {
                 persist_worker_policy_decision_best_effort(
@@ -2636,7 +2640,11 @@ mod tests {
     };
     use crate::safety::SafetyLayer;
     use crate::testing::{StubLlm, TestHarnessBuilder};
-    use crate::tools::{CircuitBreakerState, Tool, ToolOutput, ToolRegistry};
+    use crate::tools::{
+        CircuitBreakerState, Tool, ToolContractOverrideSource, ToolContractSource,
+        ToolContractV2Descriptor, ToolContractV2Override, ToolDryRunSupport, ToolIdempotency,
+        ToolOutput, ToolRegistry, ToolSideEffectLevel,
+    };
     use crate::util::llm_signals_completion;
 
     use super::{
@@ -3786,6 +3794,153 @@ mod tests {
                 .reason_codes
                 .iter()
                 .any(|c| c == "circuit_breaker_open")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_execute_tool_inner_applies_contract_v2_override_policy() {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(NoopTool)).await;
+        let llm: Arc<dyn LlmProvider> = Arc::new(StubLlm::new("unused"));
+        let harness = TestHarnessBuilder::new()
+            .with_tools(Arc::clone(&tools))
+            .with_llm(Arc::clone(&llm))
+            .build()
+            .await;
+
+        let context_manager = Arc::new(ContextManager::new(4));
+        let job_id = context_manager
+            .create_job_for_user("user-1", "Contract policy test", "Apply contract override")
+            .await
+            .expect("create job");
+
+        let goal_id = Uuid::new_v4();
+        let now = Utc::now();
+        harness
+            .db
+            .create_goal(&Goal {
+                id: goal_id,
+                owner_user_id: "user-1".to_string(),
+                channel: Some("worker".to_string()),
+                thread_id: None,
+                title: "Contract policy test".to_string(),
+                intent: "Assert contract v2 override policy enforcement".to_string(),
+                priority: 0,
+                status: GoalStatus::Active,
+                risk_class: GoalRiskClass::High,
+                acceptance_criteria: serde_json::json!({}),
+                constraints: serde_json::json!({}),
+                source: GoalSource::UserRequest,
+                created_at: now,
+                updated_at: now,
+                completed_at: None,
+            })
+            .await
+            .expect("create goal");
+
+        harness
+            .db
+            .upsert_tool_contract_override(&ToolContractV2Override {
+                id: Uuid::new_v4(),
+                tool_name: "noop_tool".to_string(),
+                owner_user_id: Some("user-1".to_string()),
+                enabled: true,
+                descriptor: ToolContractV2Descriptor {
+                    tool_name: "noop_tool".to_string(),
+                    version: 2,
+                    domain: "orchestrator".to_string(),
+                    side_effect_level: ToolSideEffectLevel::ExternalMutation,
+                    idempotency: ToolIdempotency::UnsafeRetry,
+                    dry_run_support: ToolDryRunSupport::None,
+                    requires_approval_default: true,
+                    preconditions: serde_json::json!({}),
+                    postconditions: serde_json::json!({}),
+                    timeout_ms_hint: Some(5_000),
+                    retry_guidance: serde_json::json!({}),
+                    compensation_hint: None,
+                    fallback_candidates: Vec::new(),
+                    risk_tags: vec!["external_mutation".to_string()],
+                    source: ToolContractSource::ManualOverride,
+                    updated_at: now,
+                },
+                source: ToolContractOverrideSource::Manual,
+                notes: Some("Require explicit approval for noop_tool".to_string()),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("upsert contract override");
+
+        context_manager
+            .update_context(job_id, |ctx| -> Result<(), String> {
+                ctx.transition_to(JobState::InProgress, Some("test setup".to_string()))?;
+                ctx.set_autonomy_links(Some(goal_id), None);
+                Ok(())
+            })
+            .await
+            .expect("update context")
+            .expect("context setup");
+
+        let deps = WorkerDeps {
+            context_manager: Arc::clone(&context_manager),
+            llm: Arc::clone(&llm),
+            safety: harness.deps.safety.clone(),
+            tools: Arc::clone(&tools),
+            store: Some(harness.db.clone()),
+            hooks: Arc::new(HookRegistry::new()),
+            timeout: Duration::from_secs(10),
+            use_planning: true,
+            autonomy_policy_engine_v1: true,
+            autonomy_verifier_v1: true,
+            autonomy_replanner_v1: true,
+            autonomy_tool_routing_v2: false,
+            autonomy_memory_plane_v2: false,
+            autonomy_memory_retrieval_v2: false,
+        };
+
+        let err = Worker::execute_tool_inner(&deps, job_id, "noop_tool", &serde_json::json!({}))
+            .await
+            .expect_err("contract override should require approval and block worker execution");
+        match err {
+            Error::Tool(ToolError::AuthRequired { name }) => {
+                assert_eq!(name, "noop_tool");
+            }
+            other => panic!("expected AuthRequired, got {other}"),
+        }
+
+        let record = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = harness
+                    .db
+                    .list_policy_decisions_for_goal(goal_id)
+                    .await
+                    .expect("list policy decisions");
+                if let Some(row) = rows
+                    .iter()
+                    .find(|r| {
+                        r.tool_name.as_deref() == Some("noop_tool")
+                            && r.action_kind == "tool_call_preflight"
+                    })
+                    .cloned()
+                {
+                    break row;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("policy decision persistence timeout");
+
+        assert_eq!(
+            record.decision,
+            crate::agent::PolicyDecisionKind::RequireApproval
+        );
+        assert!(
+            record
+                .reason_codes
+                .iter()
+                .any(|c| c == "contract_v2_requires_approval_default")
         );
     }
 }

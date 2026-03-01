@@ -36,7 +36,9 @@ use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
 use crate::llm::{ChatMessage, Reasoning, ReasoningContext, RespondResult};
-use crate::tools::{CircuitBreakerState, ToolReliabilityProfile, ToolStreamCallback};
+use crate::tools::{
+    CircuitBreakerState, ToolContractV2Descriptor, ToolReliabilityProfile, ToolStreamCallback,
+};
 
 const TOOL_RESULT_CHUNK_CHARS: usize = 700;
 const TOOL_RESULT_MAX_CHUNKS: usize = 12;
@@ -471,6 +473,19 @@ pub(super) enum AgenticLoopResult {
 }
 
 impl Agent {
+    pub(super) async fn resolve_tool_contract_v2_for_user(
+        &self,
+        tool_name: &str,
+        user_id: &str,
+    ) -> Option<ToolContractV2Descriptor> {
+        if !self.config.autonomy_policy_engine_v1 {
+            return None;
+        }
+        self.tools()
+            .resolve_tool_contract_v2(tool_name, self.store().map(|s| s.as_ref()), Some(user_id))
+            .await
+    }
+
     pub(super) async fn resolve_chat_tool_routing(
         &self,
         requested_tool: &str,
@@ -740,6 +755,8 @@ impl Agent {
             let safety_layer = self.safety().clone();
             let session_for_pipe = session.clone();
             let job_ctx_for_pipe = job_ctx.clone();
+            let store_for_pipe = self.store().cloned();
+            let user_id_for_pipe = message.user_id.clone();
             let streamed_tool_calls: Arc<Mutex<HashMap<String, StreamedToolCallState>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let streamed_tool_calls_for_cb = Arc::clone(&streamed_tool_calls);
@@ -758,6 +775,8 @@ impl Agent {
                 let safety_layer = safety_layer.clone();
                 let session_for_pipe = session_for_pipe.clone();
                 let job_ctx_for_pipe = job_ctx_for_pipe.clone();
+                let store_for_pipe = store_for_pipe.clone();
+                let user_id_for_pipe = user_id_for_pipe.clone();
                 let early_shell_results = Arc::clone(&early_shell_results_for_cb);
                 Box::pin(async move {
                     if let Some(event) = parse_tool_stream_event(&chunk) {
@@ -821,11 +840,20 @@ impl Agent {
                                     let safety_layer = safety_layer.clone();
                                     let session_for_pipe = session_for_pipe.clone();
                                     let job_ctx_for_pipe = job_ctx_for_pipe.clone();
+                                    let store_for_pipe = store_for_pipe.clone();
+                                    let user_id_for_pipe = user_id_for_pipe.clone();
                                     let early_shell_results = Arc::clone(&early_shell_results);
                                     tokio::spawn(async move {
                                         let Some(tool) = tools_registry.get("shell").await else {
                                             return;
                                         };
+                                        let contract_v2 = tools_registry
+                                            .resolve_tool_contract_v2(
+                                                "shell",
+                                                store_for_pipe.as_deref(),
+                                                Some(&user_id_for_pipe),
+                                            )
+                                            .await;
 
                                         let is_auto_approved = {
                                             let sess = session_for_pipe.lock().await;
@@ -835,6 +863,7 @@ impl Agent {
                                             tool.as_ref(),
                                             &args,
                                             is_auto_approved,
+                                            contract_v2.as_ref(),
                                         ) {
                                             ApprovalPolicyOutcome::RequireApproval { .. } => {
                                                 let _ = channels
@@ -993,11 +1022,20 @@ impl Agent {
                                     let safety_layer = safety_layer.clone();
                                     let session_for_pipe = session_for_pipe.clone();
                                     let job_ctx_for_pipe = job_ctx_for_pipe.clone();
+                                    let store_for_pipe = store_for_pipe.clone();
+                                    let user_id_for_pipe = user_id_for_pipe.clone();
                                     let early_shell_results = Arc::clone(&early_shell_results);
                                     tokio::spawn(async move {
                                         let Some(tool) = tools_registry.get("shell").await else {
                                             return;
                                         };
+                                        let contract_v2 = tools_registry
+                                            .resolve_tool_contract_v2(
+                                                "shell",
+                                                store_for_pipe.as_deref(),
+                                                Some(&user_id_for_pipe),
+                                            )
+                                            .await;
 
                                         let is_auto_approved = {
                                             let sess = session_for_pipe.lock().await;
@@ -1007,6 +1045,7 @@ impl Agent {
                                             tool.as_ref(),
                                             &args,
                                             is_auto_approved,
+                                            contract_v2.as_ref(),
                                         ) {
                                             ApprovalPolicyOutcome::RequireApproval { .. } => {
                                                 let _ = channels
@@ -1253,6 +1292,9 @@ impl Agent {
 
                         // Check if tool requires approval
                         if let Some(tool) = self.tools().get(&tc.name).await {
+                            let contract_v2 = self
+                                .resolve_tool_contract_v2_for_user(&tc.name, &message.user_id)
+                                .await;
                             let session_auto_approved = {
                                 let sess = session.lock().await;
                                 sess.is_tool_auto_approved(&tc.name)
@@ -1261,6 +1303,7 @@ impl Agent {
                                 tool.as_ref(),
                                 &tc.arguments,
                                 session_auto_approved,
+                                contract_v2.as_ref(),
                             ) {
                                 ApprovalPolicyOutcome::NoApprovalRequired => {}
                                 ApprovalPolicyOutcome::RequireApproval { reason_codes } => {

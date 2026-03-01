@@ -462,6 +462,9 @@ impl Agent {
                         let mut reflex_allowed = true;
                         let mut execution_tool_name = tool_name.clone();
                         if let Some(tool) = self.tools().get(&tool_name).await {
+                            let contract_v2 = self
+                                .resolve_tool_contract_v2_for_user(&tool_name, &message.user_id)
+                                .await;
                             let is_auto_approved = {
                                 let sess = session.lock().await;
                                 sess.is_tool_auto_approved(&tool_name)
@@ -471,6 +474,7 @@ impl Agent {
                                     tool.as_ref(),
                                     &params,
                                     is_auto_approved,
+                                    contract_v2.as_ref(),
                                 )
                             {
                                 tracing::info!(

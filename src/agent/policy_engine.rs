@@ -6,7 +6,7 @@
 use crate::agent::PolicyDecisionKind as AutonomyPolicyDecisionKind;
 use crate::agent::autonomy_telemetry::PolicyDecisionKind as TelemetryPolicyDecisionKind;
 use crate::hooks::{HookError, HookEvent, HookOutcome, HookRegistry};
-use crate::tools::Tool;
+use crate::tools::{Tool, ToolContractV2Descriptor, ToolSideEffectLevel};
 
 #[derive(Debug, Clone)]
 pub(super) enum ApprovalPolicyOutcome {
@@ -48,31 +48,81 @@ pub(super) fn evaluate_dispatcher_tool_approval(
     tool: &dyn Tool,
     params: &serde_json::Value,
     session_auto_approved: bool,
+    contract_v2: Option<&ToolContractV2Descriptor>,
 ) -> ApprovalPolicyOutcome {
-    if !tool.requires_approval() {
+    let contract_reason_codes = contract_requires_approval_reason_codes(contract_v2);
+    let contract_requires_approval = !contract_reason_codes.is_empty();
+    if !tool.requires_approval() && !contract_requires_approval {
         return ApprovalPolicyOutcome::NoApprovalRequired;
     }
-    if session_auto_approved && !tool.requires_approval_for(params) {
+    if session_auto_approved && !tool.requires_approval_for(params) && !contract_requires_approval {
         return ApprovalPolicyOutcome::AllowAutoApproved {
             reason_codes: vec!["session_auto_approval".to_string()],
         };
     }
 
-    let mut reason_codes = vec!["tool_requires_approval".to_string()];
+    let mut reason_codes = Vec::new();
+    if tool.requires_approval() {
+        reason_codes.push("tool_requires_approval".to_string());
+    }
+    reason_codes.extend(contract_reason_codes);
     if session_auto_approved && tool.requires_approval_for(params) {
         reason_codes.push("destructive_params_override_auto_approval".to_string());
     }
+    if session_auto_approved && contract_requires_approval {
+        reason_codes.push("contract_v2_override_auto_approval".to_string());
+    }
+    reason_codes.sort();
+    reason_codes.dedup();
     ApprovalPolicyOutcome::RequireApproval { reason_codes }
 }
 
-pub(super) fn evaluate_worker_tool_approval(tool: &dyn Tool) -> ApprovalPolicyOutcome {
+pub(super) fn evaluate_worker_tool_approval(
+    tool: &dyn Tool,
+    contract_v2: Option<&ToolContractV2Descriptor>,
+) -> ApprovalPolicyOutcome {
+    let mut reason_codes = Vec::new();
     if tool.requires_approval() {
-        ApprovalPolicyOutcome::RequireApproval {
-            reason_codes: vec!["tool_requires_approval".to_string()],
-        }
-    } else {
-        ApprovalPolicyOutcome::NoApprovalRequired
+        reason_codes.push("tool_requires_approval".to_string());
     }
+    reason_codes.extend(contract_requires_approval_reason_codes(contract_v2));
+    reason_codes.sort();
+    reason_codes.dedup();
+
+    if reason_codes.is_empty() {
+        ApprovalPolicyOutcome::NoApprovalRequired
+    } else {
+        ApprovalPolicyOutcome::RequireApproval { reason_codes }
+    }
+}
+
+fn contract_requires_approval_reason_codes(
+    contract_v2: Option<&ToolContractV2Descriptor>,
+) -> Vec<String> {
+    let Some(contract) = contract_v2 else {
+        return Vec::new();
+    };
+
+    let mut reason_codes = Vec::new();
+    if contract.requires_approval_default {
+        reason_codes.push("contract_v2_requires_approval_default".to_string());
+    }
+    match contract.side_effect_level {
+        ToolSideEffectLevel::ReadOnly | ToolSideEffectLevel::WorkspaceWrite => {}
+        ToolSideEffectLevel::SystemMutation => {
+            reason_codes.push("contract_v2_system_mutation".to_string());
+        }
+        ToolSideEffectLevel::ExternalMutation => {
+            reason_codes.push("contract_v2_external_mutation".to_string());
+        }
+        ToolSideEffectLevel::Financial => {
+            reason_codes.push("contract_v2_financial".to_string());
+        }
+        ToolSideEffectLevel::Credential => {
+            reason_codes.push("contract_v2_credential".to_string());
+        }
+    }
+    reason_codes
 }
 
 pub(super) async fn evaluate_tool_call_hook(
@@ -125,6 +175,8 @@ pub(super) async fn evaluate_tool_call_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::{ToolContractSource, ToolDryRunSupport, ToolIdempotency};
+    use chrono::Utc;
     use std::time::Duration;
 
     struct TestTool {
@@ -167,7 +219,7 @@ mod tests {
             needs_approval: true,
             force_explicit_for_params: false,
         };
-        let out = evaluate_dispatcher_tool_approval(&tool, &serde_json::json!({}), true);
+        let out = evaluate_dispatcher_tool_approval(&tool, &serde_json::json!({}), true, None);
         match out {
             ApprovalPolicyOutcome::AllowAutoApproved { reason_codes } => {
                 assert_eq!(reason_codes, vec!["session_auto_approval"]);
@@ -182,7 +234,7 @@ mod tests {
             needs_approval: true,
             force_explicit_for_params: true,
         };
-        let out = evaluate_dispatcher_tool_approval(&tool, &serde_json::json!({}), true);
+        let out = evaluate_dispatcher_tool_approval(&tool, &serde_json::json!({}), true, None);
         match out {
             ApprovalPolicyOutcome::RequireApproval { reason_codes } => {
                 assert!(
@@ -199,7 +251,7 @@ mod tests {
             needs_approval: true,
             force_explicit_for_params: false,
         };
-        match evaluate_worker_tool_approval(&tool) {
+        match evaluate_worker_tool_approval(&tool, None) {
             ApprovalPolicyOutcome::RequireApproval { reason_codes } => {
                 assert_eq!(reason_codes, vec!["tool_requires_approval"]);
             }
@@ -211,5 +263,80 @@ mod tests {
     fn test_map_policy_decision_kind_supports_require_more_evidence() {
         let mapped = map_policy_decision_kind(TelemetryPolicyDecisionKind::RequireMoreEvidence);
         assert_eq!(mapped, AutonomyPolicyDecisionKind::RequireMoreEvidence);
+    }
+
+    #[test]
+    fn test_dispatcher_contract_v2_requires_explicit_approval_and_blocks_auto_approval() {
+        let tool = TestTool {
+            needs_approval: false,
+            force_explicit_for_params: false,
+        };
+        let contract = ToolContractV2Descriptor {
+            tool_name: "http".to_string(),
+            version: 2,
+            domain: "orchestrator".to_string(),
+            side_effect_level: ToolSideEffectLevel::ExternalMutation,
+            idempotency: ToolIdempotency::Unknown,
+            dry_run_support: ToolDryRunSupport::Simulated,
+            requires_approval_default: false,
+            preconditions: serde_json::json!({}),
+            postconditions: serde_json::json!({}),
+            timeout_ms_hint: Some(30_000),
+            retry_guidance: serde_json::json!({}),
+            compensation_hint: None,
+            fallback_candidates: Vec::new(),
+            risk_tags: vec!["external_mutation".to_string()],
+            source: ToolContractSource::Inferred,
+            updated_at: Utc::now(),
+        };
+
+        match evaluate_dispatcher_tool_approval(
+            &tool,
+            &serde_json::json!({}),
+            true,
+            Some(&contract),
+        ) {
+            ApprovalPolicyOutcome::RequireApproval { reason_codes } => {
+                assert!(reason_codes.contains(&"contract_v2_external_mutation".to_string()));
+                assert!(reason_codes.contains(&"contract_v2_override_auto_approval".to_string()));
+            }
+            _ => panic!("unexpected outcome"),
+        }
+    }
+
+    #[test]
+    fn test_worker_contract_v2_requires_approval() {
+        let tool = TestTool {
+            needs_approval: false,
+            force_explicit_for_params: false,
+        };
+        let contract = ToolContractV2Descriptor {
+            tool_name: "bank_transfer".to_string(),
+            version: 2,
+            domain: "orchestrator".to_string(),
+            side_effect_level: ToolSideEffectLevel::Financial,
+            idempotency: ToolIdempotency::UnsafeRetry,
+            dry_run_support: ToolDryRunSupport::None,
+            requires_approval_default: true,
+            preconditions: serde_json::json!({}),
+            postconditions: serde_json::json!({}),
+            timeout_ms_hint: Some(10_000),
+            retry_guidance: serde_json::json!({}),
+            compensation_hint: None,
+            fallback_candidates: Vec::new(),
+            risk_tags: vec!["financial".to_string()],
+            source: ToolContractSource::ManualOverride,
+            updated_at: Utc::now(),
+        };
+
+        match evaluate_worker_tool_approval(&tool, Some(&contract)) {
+            ApprovalPolicyOutcome::RequireApproval { reason_codes } => {
+                assert!(reason_codes.contains(&"contract_v2_financial".to_string()));
+                assert!(
+                    reason_codes.contains(&"contract_v2_requires_approval_default".to_string())
+                );
+            }
+            _ => panic!("unexpected outcome"),
+        }
     }
 }
