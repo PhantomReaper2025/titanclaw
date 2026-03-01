@@ -537,7 +537,7 @@ impl Worker {
             .map(|p| profile_breaker_is_open(p, now))
             .unwrap_or(false);
 
-        let mut fallback_scored: Vec<(String, bool, f32)> = Vec::new();
+        let mut fallback_scored: Vec<(String, f32)> = Vec::new();
         for fallback in candidates.iter().skip(1) {
             let profile = match store.get_tool_reliability_profile(fallback).await {
                 Ok(profile) => profile,
@@ -555,26 +555,29 @@ impl Worker {
                 .as_ref()
                 .map(|p| profile_breaker_is_open(p, now))
                 .unwrap_or(false);
+            if is_open {
+                continue;
+            }
             let score = profile.as_ref().map(|p| p.reliability_score).unwrap_or(0.5);
-            fallback_scored.push((fallback.clone(), is_open, score));
+            fallback_scored.push((fallback.clone(), score));
         }
 
         fallback_scored.sort_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(&b.0))
         });
 
-        let has_non_open_fallback = fallback_scored.iter().any(|(_, is_open, _)| !*is_open);
-        let mut ordered = Vec::with_capacity(1 + fallback_scored.len());
-        if primary_open && has_non_open_fallback {
-            ordered.extend(fallback_scored.iter().map(|(name, _, _)| name.clone()));
-            ordered.push(primary_tool.to_string());
-        } else {
-            ordered.push(primary_tool.to_string());
-            ordered.extend(fallback_scored.into_iter().map(|(name, _, _)| name));
+        if primary_open {
+            if fallback_scored.is_empty() {
+                return Vec::new();
+            }
+            return fallback_scored.into_iter().map(|(name, _)| name).collect();
         }
 
+        let mut ordered = Vec::with_capacity(1 + fallback_scored.len());
+        ordered.push(primary_tool.to_string());
+        ordered.extend(fallback_scored.into_iter().map(|(name, _)| name));
         ordered
     }
 
@@ -1692,6 +1695,43 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
         // Fetch job context early so we have the real user_id for policy + hooks
         let job_ctx = deps.context_manager.get_context(job_id).await?;
+
+        if deps.autonomy_tool_routing_v2
+            && let Some(store) = deps.store.as_ref()
+        {
+            match store.get_tool_reliability_profile(tool_name).await {
+                Ok(Some(profile)) if profile_breaker_is_open(&profile, Utc::now()) => {
+                    if deps.autonomy_policy_engine_v1 {
+                        persist_worker_policy_decision_best_effort(
+                            deps,
+                            &job_ctx,
+                            tool_name,
+                            None,
+                            AutonomyPolicyDecisionKind::Deny,
+                            vec!["circuit_breaker_open".to_string()],
+                            false,
+                            None,
+                            "tool_call_circuit_breaker",
+                            serde_json::json!({}),
+                        );
+                    }
+                    return Err(crate::error::ToolError::ExecutionFailed {
+                        name: tool_name.to_string(),
+                        reason: "Blocked by reliability circuit breaker".to_string(),
+                    }
+                    .into());
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        job = %job_id,
+                        tool = %tool_name,
+                        "Failed to load reliability profile for circuit-breaker check: {}",
+                        e
+                    );
+                }
+            }
+        }
 
         // Policy engine v1: autonomous jobs cannot execute approval-required tools.
         if let ApprovalPolicyOutcome::RequireApproval { reason_codes } =
@@ -3607,6 +3647,145 @@ mod tests {
         assert!(
             memory_rows.is_empty(),
             "memory-plane writes should remain disabled when AUTONOMY_MEMORY_PLANE_V2 is false"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_execute_tool_inner_blocks_on_open_breaker_when_routing_enabled() {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(NoopTool)).await;
+        let llm: Arc<dyn LlmProvider> = Arc::new(StubLlm::new("unused"));
+        let harness = TestHarnessBuilder::new()
+            .with_tools(Arc::clone(&tools))
+            .with_llm(Arc::clone(&llm))
+            .build()
+            .await;
+
+        let context_manager = Arc::new(ContextManager::new(4));
+        let job_id = context_manager
+            .create_job_for_user("user-1", "Breaker test", "Should block open breaker tool")
+            .await
+            .expect("create job");
+
+        let goal_id = Uuid::new_v4();
+        let now = Utc::now();
+        harness
+            .db
+            .create_goal(&Goal {
+                id: goal_id,
+                owner_user_id: "user-1".to_string(),
+                channel: Some("worker".to_string()),
+                thread_id: None,
+                title: "Breaker test".to_string(),
+                intent: "Assert open breaker enforcement".to_string(),
+                priority: 0,
+                status: GoalStatus::Active,
+                risk_class: GoalRiskClass::Medium,
+                acceptance_criteria: serde_json::json!({}),
+                constraints: serde_json::json!({}),
+                source: GoalSource::UserRequest,
+                created_at: now,
+                updated_at: now,
+                completed_at: None,
+            })
+            .await
+            .expect("create goal");
+
+        harness
+            .db
+            .upsert_tool_reliability_profile(&crate::tools::ToolReliabilityProfile {
+                tool_name: "noop_tool".to_string(),
+                window_start: now - chrono::Duration::minutes(30),
+                window_end: now,
+                sample_count: 10,
+                success_count: 2,
+                failure_count: 8,
+                timeout_count: 3,
+                blocked_count: 0,
+                success_rate: 0.2,
+                p50_latency_ms: Some(1200),
+                p95_latency_ms: Some(4500),
+                common_failure_modes: serde_json::json!([]),
+                recent_incident_count: 4,
+                reliability_score: 0.2,
+                safe_fallback_options: serde_json::json!([]),
+                breaker_state: CircuitBreakerState::Open,
+                cooldown_until: Some(now + chrono::Duration::minutes(10)),
+                last_failure_at: Some(now - chrono::Duration::minutes(1)),
+                last_success_at: None,
+                updated_at: now,
+            })
+            .await
+            .expect("seed profile");
+
+        context_manager
+            .update_context(job_id, |ctx| -> Result<(), String> {
+                ctx.transition_to(JobState::InProgress, Some("test setup".to_string()))?;
+                ctx.set_autonomy_links(Some(goal_id), None);
+                Ok(())
+            })
+            .await
+            .expect("update context")
+            .expect("context setup");
+
+        let deps = WorkerDeps {
+            context_manager: Arc::clone(&context_manager),
+            llm: Arc::clone(&llm),
+            safety: harness.deps.safety.clone(),
+            tools: Arc::clone(&tools),
+            store: Some(harness.db.clone()),
+            hooks: Arc::new(HookRegistry::new()),
+            timeout: Duration::from_secs(10),
+            use_planning: true,
+            autonomy_policy_engine_v1: true,
+            autonomy_verifier_v1: true,
+            autonomy_replanner_v1: true,
+            autonomy_tool_routing_v2: true,
+            autonomy_memory_plane_v2: false,
+            autonomy_memory_retrieval_v2: false,
+        };
+
+        let err = Worker::execute_tool_inner(&deps, job_id, "noop_tool", &serde_json::json!({}))
+            .await
+            .expect_err("open breaker should block execution");
+        match err {
+            Error::Tool(ToolError::ExecutionFailed { name, reason }) => {
+                assert_eq!(name, "noop_tool");
+                assert!(reason.contains("circuit breaker"));
+            }
+            other => panic!("expected ExecutionFailed, got {other}"),
+        }
+
+        let record = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = harness
+                    .db
+                    .list_policy_decisions_for_goal(goal_id)
+                    .await
+                    .expect("list policy decisions");
+                if let Some(row) = rows
+                    .iter()
+                    .find(|r| {
+                        r.tool_name.as_deref() == Some("noop_tool")
+                            && r.action_kind == "tool_call_circuit_breaker"
+                    })
+                    .cloned()
+                {
+                    break row;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("policy decision persistence timeout");
+
+        assert_eq!(record.decision, crate::agent::PolicyDecisionKind::Deny);
+        assert!(
+            record
+                .reason_codes
+                .iter()
+                .any(|c| c == "circuit_breaker_open")
         );
     }
 }

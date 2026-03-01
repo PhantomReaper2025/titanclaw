@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -36,12 +36,25 @@ use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
 use crate::llm::{ChatMessage, Reasoning, ReasoningContext, RespondResult};
-use crate::tools::ToolStreamCallback;
+use crate::tools::{CircuitBreakerState, ToolReliabilityProfile, ToolStreamCallback};
 
 const TOOL_RESULT_CHUNK_CHARS: usize = 700;
 const TOOL_RESULT_MAX_CHUNKS: usize = 12;
 const TOOL_STREAM_EVENT_PREFIX: &str = "\u{001e}IRON_TOOL_EVENT:";
 const TOOL_DRAFT_PREVIEW_CHARS: usize = 240;
+
+#[derive(Debug, Clone)]
+pub(super) enum ChatToolRoutingDecision {
+    Use {
+        tool_name: String,
+        routed_from: Option<String>,
+        reason_codes: Vec<String>,
+    },
+    Deny {
+        reason_codes: Vec<String>,
+        detail: String,
+    },
+}
 
 #[derive(Debug, Clone)]
 struct StreamedToolCallState {
@@ -127,6 +140,42 @@ fn failure_class_to_string(
             .ok()
             .and_then(|v| v.as_str().map(ToString::to_string))
     })
+}
+
+fn parse_profile_fallback_tools(raw: &serde_json::Value) -> Vec<String> {
+    if let Some(list) = raw.as_array() {
+        return list
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .collect();
+    }
+    if let Some(obj) = raw.as_object() {
+        for key in ["tools", "fallback_tools", "safe_tools"] {
+            if let Some(list) = obj.get(key).and_then(|v| v.as_array()) {
+                return list
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn profile_breaker_is_open(profile: &ToolReliabilityProfile, now: DateTime<Utc>) -> bool {
+    if !matches!(profile.breaker_state, CircuitBreakerState::Open) {
+        return false;
+    }
+    match profile.cooldown_until {
+        Some(ts) => ts > now,
+        None => true,
+    }
 }
 
 fn persist_policy_decision_best_effort(
@@ -422,6 +471,113 @@ pub(super) enum AgenticLoopResult {
 }
 
 impl Agent {
+    pub(super) async fn resolve_chat_tool_routing(
+        &self,
+        requested_tool: &str,
+    ) -> ChatToolRoutingDecision {
+        if !self.config.autonomy_tool_routing_v2 {
+            return ChatToolRoutingDecision::Use {
+                tool_name: requested_tool.to_string(),
+                routed_from: None,
+                reason_codes: Vec::new(),
+            };
+        }
+        let Some(store) = self.store().cloned() else {
+            return ChatToolRoutingDecision::Use {
+                tool_name: requested_tool.to_string(),
+                routed_from: None,
+                reason_codes: Vec::new(),
+            };
+        };
+
+        let primary_profile = match store.get_tool_reliability_profile(requested_tool).await {
+            Ok(profile) => profile,
+            Err(e) => {
+                tracing::warn!(
+                    tool = %requested_tool,
+                    "Failed to load tool profile for routing; proceeding without override: {}",
+                    e
+                );
+                None
+            }
+        };
+        let Some(primary_profile) = primary_profile else {
+            return ChatToolRoutingDecision::Use {
+                tool_name: requested_tool.to_string(),
+                routed_from: None,
+                reason_codes: Vec::new(),
+            };
+        };
+
+        let now = Utc::now();
+        if !profile_breaker_is_open(&primary_profile, now) {
+            return ChatToolRoutingDecision::Use {
+                tool_name: requested_tool.to_string(),
+                routed_from: None,
+                reason_codes: Vec::new(),
+            };
+        }
+
+        let mut fallback_scored = Vec::<(String, f32)>::new();
+        for fallback in parse_profile_fallback_tools(&primary_profile.safe_fallback_options) {
+            if fallback == requested_tool {
+                continue;
+            }
+            if !self.tools().has(&fallback).await {
+                continue;
+            }
+            let fallback_profile = match store.get_tool_reliability_profile(&fallback).await {
+                Ok(profile) => profile,
+                Err(e) => {
+                    tracing::warn!(
+                        tool = %fallback,
+                        requested_tool = %requested_tool,
+                        "Failed to load fallback tool profile: {}",
+                        e
+                    );
+                    None
+                }
+            };
+            let is_open = fallback_profile
+                .as_ref()
+                .map(|p| profile_breaker_is_open(p, now))
+                .unwrap_or(false);
+            if is_open {
+                continue;
+            }
+            let score = fallback_profile
+                .as_ref()
+                .map(|p| p.reliability_score)
+                .unwrap_or(0.5);
+            fallback_scored.push((fallback, score));
+        }
+
+        fallback_scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        if let Some((fallback_tool, _)) = fallback_scored.into_iter().next() {
+            return ChatToolRoutingDecision::Use {
+                tool_name: fallback_tool,
+                routed_from: Some(requested_tool.to_string()),
+                reason_codes: vec![
+                    "circuit_breaker_open".to_string(),
+                    "tool_routing_v2_fallback".to_string(),
+                ],
+            };
+        }
+
+        ChatToolRoutingDecision::Deny {
+            reason_codes: vec!["circuit_breaker_open".to_string()],
+            detail: format!(
+                "tool '{}' is temporarily blocked by reliability circuit breaker",
+                requested_tool
+            ),
+        }
+    }
+
     /// Run the agentic loop: call LLM, execute tools, repeat until text response.
     ///
     /// Returns `AgenticLoopResult::Response` on completion, or
@@ -578,7 +734,8 @@ impl Agent {
             let channels = self.channels.clone();
             let channel_name = message.channel.clone();
             let metadata = message.metadata.clone();
-            let piped_exec_enabled = self.config.enable_piped_tool_execution;
+            let piped_exec_enabled =
+                self.config.enable_piped_tool_execution && !self.config.autonomy_tool_routing_v2;
             let tools_registry = self.tools().clone();
             let safety_layer = self.safety().clone();
             let session_for_pipe = session.clone();
@@ -1014,6 +1171,86 @@ impl Agent {
 
                     // Execute each tool (with approval checking and hook interception)
                     for mut tc in tool_calls {
+                        let requested_tool_name = tc.name.clone();
+                        match self.resolve_chat_tool_routing(&requested_tool_name).await {
+                            ChatToolRoutingDecision::Use {
+                                tool_name,
+                                routed_from,
+                                reason_codes,
+                            } => {
+                                if routed_from.is_some() {
+                                    let reason_codes_for_db = reason_codes.clone();
+                                    emit_policy_decision(&PolicyDecisionRecord {
+                                        user_id: message.user_id.clone(),
+                                        channel: message.channel.clone(),
+                                        thread_id,
+                                        tool_name: requested_tool_name.clone(),
+                                        tool_call_id: tc.id.clone(),
+                                        decision: TelemetryPolicyDecisionKind::Modify,
+                                        reason_codes,
+                                        auto_approved: None,
+                                    });
+                                    persist_policy_decision_best_effort(
+                                        self,
+                                        message,
+                                        &job_ctx,
+                                        &requested_tool_name,
+                                        &tc.id,
+                                        TelemetryPolicyDecisionKind::Modify,
+                                        reason_codes_for_db,
+                                        None,
+                                    );
+                                    let _ = self
+                                        .channels
+                                        .send_status(
+                                            &message.channel,
+                                            StatusUpdate::ToolResult {
+                                                name: requested_tool_name.clone(),
+                                                preview: format!(
+                                                    "[routing] switched to fallback tool '{}'",
+                                                    tool_name
+                                                ),
+                                            },
+                                            &message.metadata,
+                                        )
+                                        .await;
+                                }
+                                tc.name = tool_name;
+                            }
+                            ChatToolRoutingDecision::Deny {
+                                reason_codes,
+                                detail,
+                            } => {
+                                let reason_codes_for_db = reason_codes.clone();
+                                emit_policy_decision(&PolicyDecisionRecord {
+                                    user_id: message.user_id.clone(),
+                                    channel: message.channel.clone(),
+                                    thread_id,
+                                    tool_name: requested_tool_name.clone(),
+                                    tool_call_id: tc.id.clone(),
+                                    decision: TelemetryPolicyDecisionKind::Deny,
+                                    reason_codes,
+                                    auto_approved: None,
+                                });
+                                persist_policy_decision_best_effort(
+                                    self,
+                                    message,
+                                    &job_ctx,
+                                    &requested_tool_name,
+                                    &tc.id,
+                                    TelemetryPolicyDecisionKind::Deny,
+                                    reason_codes_for_db,
+                                    None,
+                                );
+                                context_messages.push(ChatMessage::tool_result(
+                                    &tc.id,
+                                    &requested_tool_name,
+                                    format!("Tool call blocked by reliability policy: {}", detail),
+                                ));
+                                continue;
+                            }
+                        }
+
                         // Check if tool requires approval
                         if let Some(tool) = self.tools().get(&tc.name).await {
                             let session_auto_approved = {
@@ -1368,6 +1605,28 @@ impl Agent {
                     name: tool_name.to_string(),
                 })?;
 
+        if self.config.autonomy_tool_routing_v2
+            && let Some(store) = self.store()
+        {
+            match store.get_tool_reliability_profile(tool_name).await {
+                Ok(Some(profile)) if profile_breaker_is_open(&profile, Utc::now()) => {
+                    return Err(crate::error::ToolError::ExecutionFailed {
+                        name: tool_name.to_string(),
+                        reason: "Blocked by reliability circuit breaker".to_string(),
+                    }
+                    .into());
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        tool = %tool_name,
+                        "Failed to load reliability profile for chat tool execution: {}",
+                        e
+                    );
+                }
+            }
+        }
+
         // Validate tool parameters
         let validation = self.safety().validator().validate_tool_params(params);
         if !validation.is_valid {
@@ -1540,11 +1799,13 @@ pub(super) fn detect_auth_awaiting(
 #[cfg(test)]
 mod tests {
     use crate::error::Error;
+    use crate::tools::{CircuitBreakerState, ToolReliabilityProfile};
+    use chrono::Utc;
 
     use super::{
         TOOL_RESULT_CHUNK_CHARS, TOOL_STREAM_EVENT_PREFIX, ToolStreamEvent,
-        chunk_tool_result_preview, detect_auth_awaiting, parse_tool_stream_event,
-        shell_preview_from_args,
+        chunk_tool_result_preview, detect_auth_awaiting, parse_profile_fallback_tools,
+        parse_tool_stream_event, profile_breaker_is_open, shell_preview_from_args,
     };
 
     #[test]
@@ -1592,6 +1853,52 @@ mod tests {
         let args = serde_json::json!({"command":"echo hello world"});
         let preview = shell_preview_from_args(&args).expect("preview");
         assert!(preview.contains("echo hello world"));
+    }
+
+    #[test]
+    fn test_parse_profile_fallback_tools() {
+        let from_array =
+            parse_profile_fallback_tools(&serde_json::json!(["shell", " read_file ", null]));
+        assert_eq!(
+            from_array,
+            vec!["shell".to_string(), "read_file".to_string()]
+        );
+
+        let from_object = parse_profile_fallback_tools(&serde_json::json!({
+            "fallback_tools": ["http", "memory_search"]
+        }));
+        assert_eq!(
+            from_object,
+            vec!["http".to_string(), "memory_search".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_profile_breaker_is_open() {
+        let now = Utc::now();
+        let profile = ToolReliabilityProfile {
+            tool_name: "shell".to_string(),
+            window_start: now - chrono::Duration::minutes(10),
+            window_end: now,
+            sample_count: 1,
+            success_count: 0,
+            failure_count: 1,
+            timeout_count: 0,
+            blocked_count: 0,
+            success_rate: 0.0,
+            p50_latency_ms: None,
+            p95_latency_ms: None,
+            common_failure_modes: serde_json::json!([]),
+            recent_incident_count: 1,
+            reliability_score: 0.1,
+            safe_fallback_options: serde_json::json!([]),
+            breaker_state: CircuitBreakerState::Open,
+            cooldown_until: Some(now + chrono::Duration::minutes(5)),
+            last_failure_at: Some(now),
+            last_success_at: None,
+            updated_at: now,
+        };
+        assert!(profile_breaker_is_open(&profile, now));
     }
 
     #[test]

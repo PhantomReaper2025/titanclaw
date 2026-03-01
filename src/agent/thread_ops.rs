@@ -17,7 +17,9 @@ use crate::agent::autonomy_telemetry::{
 };
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context_monitor::CompactionStrategy;
-use crate::agent::dispatcher::{AgenticLoopResult, detect_auth_awaiting, parse_auth_result};
+use crate::agent::dispatcher::{
+    AgenticLoopResult, ChatToolRoutingDecision, detect_auth_awaiting, parse_auth_result,
+};
 use crate::agent::incident_detector::{
     PolicyDeniedIncidentRequest, record_policy_denied_incident_best_effort,
 };
@@ -458,6 +460,7 @@ impl Agent {
                         );
                         let params = serde_json::json!({ "input": content });
                         let mut reflex_allowed = true;
+                        let mut execution_tool_name = tool_name.clone();
                         if let Some(tool) = self.tools().get(&tool_name).await {
                             let is_auto_approved = {
                                 let sess = session.lock().await;
@@ -479,22 +482,49 @@ impl Agent {
                         }
 
                         if reflex_allowed {
+                            match self.resolve_chat_tool_routing(&tool_name).await {
+                                ChatToolRoutingDecision::Use {
+                                    tool_name: routed_tool_name,
+                                    routed_from,
+                                    ..
+                                } => {
+                                    if routed_from.is_some() {
+                                        tracing::info!(
+                                            requested_tool = %tool_name,
+                                            routed_tool = %routed_tool_name,
+                                            "Reflex fast-path rerouted via reliability profile"
+                                        );
+                                    }
+                                    execution_tool_name = routed_tool_name;
+                                }
+                                ChatToolRoutingDecision::Deny { detail, .. } => {
+                                    tracing::info!(
+                                        tool = %tool_name,
+                                        "Reflex fast-path blocked by reliability policy: {}",
+                                        detail
+                                    );
+                                    reflex_allowed = false;
+                                }
+                            }
+                        }
+
+                        if reflex_allowed {
                             let _ = self
                                 .channels
                                 .send_status(
                                     &message.channel,
                                     StatusUpdate::Thinking(format!(
                                         "Reflex fast-path: executing {}",
-                                        tool_name
+                                        execution_tool_name
                                     )),
                                     &message.metadata,
                                 )
                                 .await;
 
-                            let live_stream = tool_name == "shell";
+                            let live_stream = execution_tool_name == "shell";
                             match self
                                 .execute_chat_tool(
-                                    &tool_name,
+                                    &execution_tool_name,
                                     &params,
                                     &job_ctx,
                                     &message.channel,
@@ -1159,13 +1189,111 @@ impl Agent {
             let job_ctx =
                 JobContext::with_user(&message.user_id, "chat", "Interactive chat session");
             let mut approved_params = pending.parameters.clone();
+            let execution_tool_name = match self.resolve_chat_tool_routing(&pending.tool_name).await
+            {
+                ChatToolRoutingDecision::Use {
+                    tool_name,
+                    routed_from,
+                    reason_codes,
+                } => {
+                    if routed_from.is_some() {
+                        if self.config.autonomy_policy_engine_v1 {
+                            persist_chat_policy_decision_best_effort(
+                                self,
+                                message,
+                                thread_id,
+                                &job_ctx,
+                                &pending.tool_name,
+                                &pending.tool_call_id,
+                                TelemetryPolicyDecisionKind::Modify,
+                                reason_codes,
+                                None,
+                                "approval_resume_routing",
+                            );
+                        }
+                        let _ = self
+                            .channels
+                            .send_status(
+                                &message.channel,
+                                StatusUpdate::ToolResult {
+                                    name: pending.tool_name.clone(),
+                                    preview: format!(
+                                        "[routing] switched to fallback tool '{}'",
+                                        tool_name
+                                    ),
+                                },
+                                &message.metadata,
+                            )
+                            .await;
+                    }
+                    tool_name
+                }
+                ChatToolRoutingDecision::Deny {
+                    reason_codes,
+                    detail,
+                } => {
+                    if self.config.autonomy_policy_engine_v1 {
+                        persist_chat_policy_decision_best_effort(
+                            self,
+                            message,
+                            thread_id,
+                            &job_ctx,
+                            &pending.tool_name,
+                            &pending.tool_call_id,
+                            TelemetryPolicyDecisionKind::Deny,
+                            reason_codes,
+                            Some(false),
+                            "approval_resume_routing",
+                        );
+                    }
+                    let blocked_msg = format!(
+                        "Tool '{}' was approved, but reliability policy blocked execution: {}",
+                        pending.tool_name, detail
+                    );
+                    let persist_user_input = {
+                        let mut sess = session.lock().await;
+                        if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                            if let Some(turn) = thread.last_turn_mut() {
+                                turn.record_tool_error(format!(
+                                    "blocked by circuit breaker after approval: {}",
+                                    detail
+                                ));
+                            }
+                            let user_input = thread.last_turn().map(|t| t.user_input.clone());
+                            thread.complete_turn(&blocked_msg);
+                            user_input
+                        } else {
+                            None
+                        }
+                    };
+                    let _ = self
+                        .channels
+                        .send_status(
+                            &message.channel,
+                            StatusUpdate::Status("Blocked by reliability policy".into()),
+                            &message.metadata,
+                        )
+                        .await;
+                    if let Some(user_input) = persist_user_input {
+                        self.persist_turn(
+                            thread_id,
+                            &message.user_id,
+                            &user_input,
+                            Some(&blocked_msg),
+                            &message.channel,
+                            &message.metadata,
+                        );
+                    }
+                    return Ok(SubmissionResult::response(blocked_msg));
+                }
+            };
             if self.config.autonomy_policy_engine_v1 {
                 persist_chat_policy_decision_best_effort(
                     self,
                     message,
                     thread_id,
                     &job_ctx,
-                    &pending.tool_name,
+                    &execution_tool_name,
                     &pending.tool_call_id,
                     TelemetryPolicyDecisionKind::Allow,
                     vec![if always {
@@ -1179,7 +1307,7 @@ impl Agent {
 
                 match evaluate_tool_call_hook(
                     self.hooks().as_ref(),
-                    &pending.tool_name,
+                    &execution_tool_name,
                     &approved_params,
                     &message.user_id,
                     "chat_approval_resume",
@@ -1198,7 +1326,7 @@ impl Agent {
                             message,
                             thread_id,
                             &job_ctx,
-                            &pending.tool_name,
+                            &execution_tool_name,
                             &pending.tool_call_id,
                             TelemetryPolicyDecisionKind::Modify,
                             reason_codes,
@@ -1216,7 +1344,7 @@ impl Agent {
                             message,
                             thread_id,
                             &job_ctx,
-                            &pending.tool_name,
+                            &execution_tool_name,
                             &pending.tool_call_id,
                             TelemetryPolicyDecisionKind::Deny,
                             reason_codes,
@@ -1225,7 +1353,7 @@ impl Agent {
                         );
                         let blocked_msg = format!(
                             "Tool '{}' was approved, but a policy hook blocked execution: {}",
-                            pending.tool_name, reason
+                            execution_tool_name, reason
                         );
                         let persist_user_input = {
                             let mut sess = session.lock().await;
@@ -1271,7 +1399,7 @@ impl Agent {
                 .send_status(
                     &message.channel,
                     StatusUpdate::ToolStarted {
-                        name: pending.tool_name.clone(),
+                        name: execution_tool_name.clone(),
                     },
                     &message.metadata,
                 )
@@ -1279,12 +1407,12 @@ impl Agent {
 
             let tool_result = self
                 .execute_chat_tool(
-                    &pending.tool_name,
+                    &execution_tool_name,
                     &approved_params,
                     &job_ctx,
                     &message.channel,
                     &message.metadata,
-                    pending.tool_name == "shell",
+                    execution_tool_name == "shell",
                 )
                 .await;
 
@@ -1293,14 +1421,14 @@ impl Agent {
                 .send_status(
                     &message.channel,
                     StatusUpdate::ToolCompleted {
-                        name: pending.tool_name.clone(),
+                        name: execution_tool_name.clone(),
                         success: tool_result.is_ok(),
                     },
                     &message.metadata,
                 )
                 .await;
 
-            if pending.tool_name != "shell"
+            if execution_tool_name != "shell"
                 && let Ok(ref output) = tool_result
                 && !output.is_empty()
             {
@@ -1309,7 +1437,7 @@ impl Agent {
                     .send_status(
                         &message.channel,
                         StatusUpdate::ToolResult {
-                            name: pending.tool_name.clone(),
+                            name: execution_tool_name.clone(),
                             preview: output.clone(),
                         },
                         &message.metadata,
@@ -1357,7 +1485,7 @@ impl Agent {
             // If tool_auth returned awaiting_token, enter auth mode and
             // return instructions directly (skip agentic loop continuation).
             if let Some((ext_name, instructions)) =
-                detect_auth_awaiting(&pending.tool_name, &tool_result)
+                detect_auth_awaiting(&execution_tool_name, &tool_result)
             {
                 let auth_data = parse_auth_result(&tool_result);
                 {
@@ -1735,6 +1863,7 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use chrono::Utc;
     use serde_json::json;
     use uuid::Uuid;
 
@@ -1745,6 +1874,7 @@ mod tests {
     use crate::llm::ChatMessage;
     use crate::settings::Settings;
     use crate::testing::TestHarnessBuilder;
+    use crate::tools::CircuitBreakerState;
 
     struct RejectToolCallHook;
 
@@ -2084,6 +2214,107 @@ mod tests {
                     && r.summary.contains("approval_resume_decision")
             }),
             "expected approval rejection memory-plane policy record"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_process_approval_blocks_on_open_breaker() {
+        let harness = TestHarnessBuilder::new().build().await;
+
+        let now = Utc::now();
+        harness
+            .db
+            .upsert_tool_reliability_profile(&crate::tools::ToolReliabilityProfile {
+                tool_name: "shell".to_string(),
+                window_start: now - chrono::Duration::minutes(30),
+                window_end: now,
+                sample_count: 10,
+                success_count: 1,
+                failure_count: 9,
+                timeout_count: 3,
+                blocked_count: 0,
+                success_rate: 0.1,
+                p50_latency_ms: Some(900),
+                p95_latency_ms: Some(4000),
+                common_failure_modes: serde_json::json!([]),
+                recent_incident_count: 3,
+                reliability_score: 0.1,
+                safe_fallback_options: serde_json::json!([]),
+                breaker_state: CircuitBreakerState::Open,
+                cooldown_until: Some(now + chrono::Duration::minutes(10)),
+                last_failure_at: Some(now - chrono::Duration::minutes(1)),
+                last_success_at: None,
+                updated_at: now,
+            })
+            .await
+            .expect("seed shell profile");
+
+        let mut config = AgentConfig::resolve(&Settings::default()).expect("config");
+        config.autonomy_policy_engine_v1 = true;
+        config.autonomy_tool_routing_v2 = true;
+
+        let agent = Agent::new(
+            config,
+            harness.deps,
+            ChannelManager::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let message = IncomingMessage::new("test", "user-3", "approve")
+            .with_metadata(json!({"source":"test"}));
+        let session = agent.session_manager.get_or_create_session("user-3").await;
+
+        let (thread_id, request_id) = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("Please run shell");
+            thread.record_tool_call("call-breaker", "shell", json!({"command":"echo hi"}));
+            let request_id = Uuid::new_v4();
+            thread.await_approval(crate::agent::PendingApproval {
+                request_id,
+                tool_name: "shell".to_string(),
+                parameters: json!({"command":"echo hi"}),
+                description: "Run shell".to_string(),
+                tool_call_id: "call-breaker".to_string(),
+                context_messages: vec![ChatMessage::user("Please run shell")],
+            });
+            (thread.id, request_id)
+        };
+
+        let out = agent
+            .process_approval(
+                &message,
+                session.clone(),
+                thread_id,
+                Some(request_id),
+                true,
+                false,
+            )
+            .await
+            .expect("process approval");
+
+        match out {
+            crate::agent::submission::SubmissionResult::Response { content } => {
+                assert!(content.contains("reliability policy blocked execution"));
+            }
+            other => panic!("unexpected submission result: {:?}", other),
+        }
+
+        let policy_rows =
+            wait_for_policy_decisions_for_user(harness.db.as_ref(), "user-3", 1).await;
+        assert!(
+            policy_rows.iter().any(|d| {
+                d.tool_name.as_deref() == Some("shell")
+                    && d.tool_call_id.as_deref() == Some("call-breaker")
+                    && d.action_kind == "approval_resume_routing"
+                    && d.decision == crate::agent::PolicyDecisionKind::Deny
+                    && d.reason_codes.iter().any(|r| r == "circuit_breaker_open")
+            }),
+            "expected approval routing deny for open breaker"
         );
     }
 }
