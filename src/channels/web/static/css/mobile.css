@@ -1,34 +1,192 @@
-@media (max-width: 768px) {
+/* TitanClaw Mobile & Responsive Styles */
 
-  /* Tab bar: horizontal scroll */
+/* ========================================
+   TABLET BREAKPOINT (768px - 1024px)
+   ======================================== */
+@media (min-width: 769px) and (max-width: 1024px) {
+  /* Tab bar adjustments */
+  .tab-bar {
+    padding: 0 12px;
+  }
+
+  .tab-bar button {
+    padding: 12px 14px;
+    font-size: 12px;
+  }
+
+  /* Chat container - reduce padding */
+  .chat-messages {
+    padding: 24px calc(50% - 320px) 14px;
+  }
+
+  .chat-input {
+    padding: 16px calc(50% - 320px) 20px;
+  }
+
+  /* Memory sidebar - slightly narrower */
+  .memory-sidebar {
+    width: 220px;
+  }
+
+  /* Jobs/Routines tables - allow horizontal scroll */
+  .jobs-table,
+  .routines-table,
+  .tools-table {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* Extensions grid - 2 columns */
+  .extensions-list {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  /* Jobs summary cards - 2 columns */
+  .jobs-summary {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  /* Routines summary - 2 columns */
+  .routines-summary {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  /* Logs toolbar - wrap if needed */
+  .logs-toolbar {
+    flex-wrap: wrap;
+  }
+
+  .logs-toolbar input {
+    max-width: 180px;
+  }
+}
+
+/* ========================================
+   MOBILE BREAKPOINT (< 768px)
+   ======================================== */
+@media (max-width: 768px) {
+  /* --- Root variable overrides --- */
+  :root {
+    --radius: 8px;
+    --radius-sm: 6px;
+    --radius-lg: 12px;
+  }
+
+  /* --- Tab bar: horizontal scroll --- */
   .tab-bar {
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     padding: 0 8px;
+    gap: 0;
   }
 
   .tab-bar button {
-    padding: 8px 12px;
-    font-size: 13px;
+    padding: 12px 14px;
+    font-size: 12px;
     white-space: nowrap;
+    min-height: 44px; /* Touch-friendly */
+    min-width: 44px;
   }
 
-  /* Chat messages: wider */
+  .tab-bar .tab-brand {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .tab-brand-copy {
+    display: none; /* Hide brand text on mobile */
+  }
+
+  .tab-bar .status {
+    padding: 8px 10px;
+    margin: 6px 0 6px 8px;
+  }
+
+  .tab-bar .status span {
+    display: none; /* Hide "Connected" text */
+  }
+
+  /* --- Chat messages: wider --- */
+  .chat-messages {
+    padding: 16px 12px 14px;
+  }
+
   .message {
     max-width: 95%;
+    padding: 14px 16px;
+    font-size: 14px;
   }
 
-  /* Thread sidebar: hidden behind toggle */
+  .message.user {
+    max-width: 90%;
+  }
+
+  /* Chat header */
+  .chat-header {
+    padding: 12px 16px;
+  }
+
+  .chat-header h2 {
+    font-size: 16px;
+  }
+
+  .chat-header p {
+    font-size: 12px;
+  }
+
+  /* Chat input */
+  .chat-input {
+    padding: 12px 16px 16px;
+    gap: 8px;
+  }
+
+  .chat-input textarea {
+    padding: 12px 16px;
+    font-size: 14px;
+    min-height: 44px; /* Touch-friendly */
+  }
+
+  .chat-input button {
+    width: 44px;
+    height: 44px;
+    flex-shrink: 0;
+  }
+
+  /* --- Thread sidebar: collapsible on mobile --- */
   .thread-sidebar {
-    width: 36px;
+    width: 44px;
+    transition: width 0.2s ease;
   }
 
+  /* Hide most content in collapsed sidebar */
   .thread-sidebar .thread-sidebar-header span,
   .thread-sidebar .thread-new-btn,
   .thread-sidebar .thread-list,
   .thread-sidebar .assistant-item,
-  .thread-sidebar .threads-section-header {
+  .thread-sidebar .threads-section-header,
+  .thread-sidebar .thread-clear-btn {
     display: none;
+  }
+
+  /* Show toggle button even when collapsed on mobile */
+  .thread-sidebar .thread-toggle-btn {
+    display: flex !important;
+    width: 36px;
+    height: 36px;
+    min-width: 36px;
+    min-height: 36px;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    margin: 4px auto;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 14px;
   }
 
   .thread-sidebar.expanded-mobile {
@@ -36,65 +194,394 @@
     left: 0;
     top: 0;
     bottom: 0;
-    width: 200px;
-    z-index: 50;
+    width: 240px;
+    z-index: 100;
+    background: var(--bg-secondary);
+    border-right: 1px solid var(--border);
   }
 
   .thread-sidebar.expanded-mobile .thread-sidebar-header span,
   .thread-sidebar.expanded-mobile .thread-new-btn,
   .thread-sidebar.expanded-mobile .thread-list,
   .thread-sidebar.expanded-mobile .assistant-item,
-  .thread-sidebar.expanded-mobile .threads-section-header {
+  .thread-sidebar.expanded-mobile .threads-section-header,
+  .thread-sidebar.expanded-mobile .thread-clear-btn,
+  .thread-sidebar.expanded-mobile .thread-toggle-btn {
     display: flex;
   }
 
-  /* Memory: vertical stack */
+
+  /* --- Auth screen: full width --- */
+  .auth-card-login {
+    margin: 16px;
+    padding: 24px 20px;
+    max-width: none;
+  }
+
+  .auth-brand h1 {
+    font-size: 24px;
+  }
+
+  /* --- Memory: vertical stack --- */
   .memory-container {
     flex-direction: column;
   }
 
   .memory-sidebar {
     width: 100%;
-    max-height: 200px;
+    max-height: 180px;
     border-right: none;
     border-bottom: 1px solid var(--border);
   }
 
-  /* Job detail sub-tabs: wrap */
-  .job-detail-tabs {
-    flex-wrap: wrap;
+  .memory-content {
+    min-height: 0;
   }
 
+  /* Tree rows - touch-friendly */
+  .tree-row {
+    min-height: 44px;
+    padding: 8px 12px;
+  }
+
+  /* --- Jobs: responsive table --- */
+  .jobs-container {
+    padding: 12px;
+  }
+
+  .jobs-summary {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+  }
+
+  .summary-card {
+    padding: 12px;
+  }
+
+  .summary-card .count {
+    font-size: 22px;
+  }
+
+  .jobs-create {
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .jobs-create input,
+  .jobs-create select {
+    width: 100%;
+  }
+
+  /* Table scroll wrapper for mobile */
+  .jobs-table {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    font-size: 12px;
+  }
+
+  .jobs-table th,
+  .jobs-table td {
+    padding: 8px 10px;
+    white-space: nowrap;
+  }
+
+  /* Job detail - stack vertically */
   .job-detail-header {
     flex-wrap: wrap;
+    gap: 8px;
   }
 
   .job-detail-header h2 {
     min-width: 100%;
     order: -1;
+    font-size: 16px;
+  }
+
+  .job-detail-tabs {
+    flex-wrap: wrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .job-detail-tabs button {
+    padding: 10px 14px;
+    min-height: 44px; /* Touch-friendly */
   }
 
   /* Job files: vertical */
   .job-files {
     flex-direction: column;
     height: auto;
+    min-height: 300px;
   }
 
   .job-files-sidebar {
     width: 100%;
-    max-height: 180px;
+    max-height: 160px;
     border-right: none;
     border-bottom: 1px solid var(--border);
   }
 
-  /* Extension install form */
+  /* Job meta grid */
+  .job-meta-grid {
+    grid-template-columns: 1fr;
+  }
+
+  /* --- Logs: full width --- */
+  .logs-container {
+    flex-direction: column;
+  }
+
+  .logs-toolbar {
+    flex-wrap: wrap;
+    padding: 10px 12px;
+    gap: 6px;
+  }
+
+  .logs-toolbar select,
+  .logs-toolbar input {
+    flex: 1;
+    min-width: 100px;
+    max-width: none;
+  }
+
+  .logs-toolbar label,
+  .logs-toolbar .logs-checkbox {
+    order: 10;
+    width: 100%;
+    margin-top: 4px;
+  }
+
+  .logs-output {
+    font-size: 11px;
+    padding: 4px 8px;
+  }
+
+  .log-entry {
+    flex-wrap: wrap;
+    padding: 4px 8px;
+  }
+
+  .log-ts {
+    width: 60px;
+    font-size: 10px;
+  }
+
+  .log-level {
+    width: 36px;
+    font-size: 10px;
+  }
+
+  .log-target {
+    display: none; /* Hide on very small screens */
+  }
+
+  .log-msg {
+    width: 100%;
+  }
+
+  /* --- Routines: responsive --- */
+  .routines-container {
+    padding: 12px;
+  }
+
+  .routines-summary {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+  }
+
+  .routines-table {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    font-size: 12px;
+  }
+
+  .routines-table th,
+  .routines-table td {
+    padding: 8px 10px;
+    white-space: nowrap;
+  }
+
+  /* --- Extensions: single column --- */
+  .extensions-container {
+    padding: 12px;
+  }
+
+  .extensions-list {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
   .ext-install-form {
     flex-direction: column;
     align-items: stretch;
+    gap: 10px;
   }
 
   .ext-install-form input,
   .ext-install-form select {
     width: 100%;
+    min-height: 44px; /* Touch-friendly */
+  }
+
+  .ext-install-form button {
+    width: 100%;
+    min-height: 44px; /* Touch-friendly */
+  }
+
+  .tools-table {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    font-size: 12px;
+  }
+
+  .tools-table th,
+  .tools-table td {
+    padding: 8px 10px;
+    white-space: nowrap;
+  }
+
+  /* --- Buttons: touch-friendly --- */
+  button,
+  .tab-bar button,
+  .btn-back,
+  .btn-cancel,
+  .btn-restart,
+  .btn-browse,
+  .btn-trigger,
+  .btn-toggle,
+  .btn-ext,
+  .logs-toolbar button {
+    min-height: 44px;
+    min-width: 44px;
+    padding: 10px 14px;
+  }
+
+  /* Approval card actions */
+  .approval-card .approval-actions button {
+    min-height: 36px;
+    padding: 8px 12px;
+    flex: 1;
+  }
+
+  /* Auth card actions */
+  .auth-card .auth-actions button {
+    min-height: 36px;
+    padding: 8px 12px;
+  }
+
+  /* --- Scrollbar styling for touch --- */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--text-muted);
+  }
+}
+
+/* ========================================
+   EXTRA SMALL SCREENS (< 480px)
+   ======================================== */
+@media (max-width: 480px) {
+  /* Even more compact layouts */
+  .tab-bar button {
+    padding: 12px 10px;
+    font-size: 11px;
+  }
+
+  .tab-bar .tab-brand-mark {
+    width: 24px;
+    height: 24px;
+  }
+
+  .message {
+    padding: 12px 14px;
+    font-size: 13px;
+  }
+
+  .jobs-summary,
+  .routines-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .summary-card .count {
+    font-size: 24px;
+  }
+
+  /* Hide less important columns on tables */
+  .jobs-table th:nth-child(3),
+  .jobs-table td:nth-child(3),
+  .jobs-table th:nth-child(5),
+  .jobs-table td:nth-child(5),
+  .routines-table th:nth-child(2),
+  .routines-table td:nth-child(2),
+  .routines-table th:nth-child(4),
+  .routines-table td:nth-child(4),
+  .routines-table th:nth-child(5),
+  .routines-table td:nth-child(5) {
+    display: none;
+  }
+}
+
+/* ========================================
+   LANDSCAPE ORIENTATION HELPERS
+   ======================================== */
+@media (max-height: 500px) and (orientation: landscape) {
+  /* Adjust chat messages for short landscape screens */
+  .chat-messages {
+    padding: 12px 16px 8px;
+  }
+
+  .chat-input {
+    padding: 8px 16px 12px;
+  }
+
+  /* Auth screen compact */
+  .auth-card-login {
+    padding: 16px;
+    gap: 16px;
+  }
+}
+
+/* ========================================
+   DARK MODE SUPPORT (system preference)
+   ======================================== */
+@media (prefers-color-scheme: dark) {
+  /* Already optimized for dark mode, but ensure consistency */
+  :root {
+    color-scheme: dark;
+  }
+}
+
+/* ========================================
+   REDUCED MOTION SUPPORT
+   ======================================== */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }
