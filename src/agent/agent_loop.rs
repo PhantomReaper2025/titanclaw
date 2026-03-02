@@ -206,13 +206,12 @@ impl Agent {
     ) -> Self {
         let kernel_orchestrator = deps.kernel_orchestrator.clone();
         let shadow_engine = deps.shadow_engine.clone();
-        let profile_onboarding = match (deps.store.as_ref(), deps.workspace.as_ref()) {
-            (Some(store), Some(ws)) => Some(Arc::new(ProfileOnboardingManager::new(
+        let profile_onboarding = deps.store.as_ref().map(|store| {
+            Arc::new(ProfileOnboardingManager::new(
                 Arc::clone(store),
-                Arc::clone(ws),
-            ))),
-            _ => None,
-        };
+                deps.workspace.clone(),
+            ))
+        });
         let profile_synthesizer = deps.workspace.as_ref().map(|ws| {
             ProfileSynthesizer::new(
                 ProfileSynthesisConfig {

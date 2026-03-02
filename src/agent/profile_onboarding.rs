@@ -24,7 +24,7 @@ const MANAGED_END_MARKER: &str = "<!-- titanclaw:managed-end profile-onboarding:
 #[derive(Clone)]
 pub struct ProfileOnboardingManager {
     store: Arc<dyn Database>,
-    workspace: Arc<Workspace>,
+    workspace: Option<Arc<Workspace>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,29 +53,29 @@ pub enum OnboardingIntercept {
 }
 
 impl ProfileOnboardingManager {
-    pub fn new(store: Arc<dyn Database>, workspace: Arc<Workspace>) -> Self {
+    pub fn new(store: Arc<dyn Database>, workspace: Option<Arc<Workspace>>) -> Self {
         Self { store, workspace }
     }
 
     pub async fn is_completed(&self, user_id: &str) -> bool {
-        self.store
-            .get_setting(user_id, KEY_COMPLETED)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+        match self.store.get_setting(user_id, KEY_COMPLETED).await {
+            Ok(Some(value)) => value.as_bool().unwrap_or(false),
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(user_id, error = %e, "Failed to check profile onboarding completion status");
+                false
+            }
+        }
     }
 
     pub async fn is_deferred(&self, user_id: &str) -> bool {
-        let Some(value) = self
-            .store
-            .get_setting(user_id, KEY_DEFERRED_UNTIL)
-            .await
-            .ok()
-            .flatten()
-        else {
-            return false;
+        let value = match self.store.get_setting(user_id, KEY_DEFERRED_UNTIL).await {
+            Ok(Some(v)) => v,
+            Ok(None) => return false,
+            Err(e) => {
+                tracing::warn!(user_id, error = %e, "Failed to check profile onboarding defer status");
+                return false;
+            }
         };
         let Some(raw) = value.as_str() else {
             return false;
@@ -376,16 +376,18 @@ impl ProfileOnboardingManager {
         user_id: &str,
         state: &ProfileOnboardingState,
     ) -> Result<(), String> {
+        let Some(workspace) = &self.workspace else {
+            return Err("Workspace not available for writing profile data. Onboarding can check completion status but cannot write results.".to_string());
+        };
         let docs = build_doc_sections(user_id, state);
         for (path, body) in docs {
-            let existing = self
-                .workspace
+            let existing = workspace
                 .read(path)
                 .await
                 .map(|d| d.content)
                 .unwrap_or_default();
             let updated = render_with_managed_section(&existing, path, &body)?;
-            self.workspace
+            workspace
                 .write(path, &updated)
                 .await
                 .map_err(|e| e.to_string())?;
