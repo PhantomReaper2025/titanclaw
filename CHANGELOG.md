@@ -5,7 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] - 2026-03-02
+
+### Highlights
+
+- All 138 Execution TODO items completed
+- Memory Plane v2 fully implemented (all phases: V19-V23 + libSQL mirror, write policy, consolidation, retrieval)
+- Phase 3 Tooling System v2 / Reliability foundations completed (all 12 slices: incidents, contract v2 overrides, reliability profiles, tool reliability service, incident detector, auto-refresh, routing flags, fallback routing, contract-aware checks, dry-run semantics, execution critic, proactive degraded-tool rerouting)
+- Gateway/CLI parity for autonomy operations
+- Web auth/render hardening (SSE token, WebSocket origin, DOM-based sanitization)
 
 ### Added
 
