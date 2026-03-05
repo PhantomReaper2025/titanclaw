@@ -11,7 +11,7 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 > [!CAUTION]
 > This represents a paradigm shift from a linear conversational agent to a distributed orchestration mesh. Please confirm if this extreme scale of ambition aligns with your vision. 
 
-## Implementation Status (2026-02-25)
+## Implementation Status (2026-03-05)
 
 | Track | Status | Notes |
 |---|---|---|
@@ -58,6 +58,7 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 | Tooling System v2 / Reliability foundations (Phase 3 slice 10: execution critic loop + replan hooks) | 🚧 | Added an explicit `ExecutionCritic` module (`src/agent/execution_critic.rs`) and wired it into planned worker step execution so post-step deterministic checks can trigger/upgrade replan requests for policy blocks, transient failures, tool unavailability, and latency budget drift; critic reason codes now flow into replan-event memory payloads. |
 | Tooling System v2 / Reliability foundations (Phase 3 slice 11: contract-aware fallback ranking) | 🚧 | Extended worker/chat routing fallback candidate selection to merge reliability profile `safe_fallback_options` with Tool Contract V2 `fallback_candidates`, dedupe deterministically, and rank alternatives using reliability plus contract side-effect/idempotency safety bias before selecting fallbacks; includes integration coverage for contract-driven fallback routing when profile fallbacks are absent. |
 | Tooling System v2 / Reliability foundations (Phase 3 slice 12: proactive degraded-primary rerouting) | 🚧 | Added conservative proactive rerouting logic so worker/chat routing may choose fallback tools before primary execution when primary reliability is sufficiently degraded (or breaker is half-open) and fallback score is materially stronger, while preserving existing open-breaker deny/fallback semantics and deterministic ordering. |
+| Smart Rules v1 (conversation-first recovery + adaptive routing knobs) | ✅ | Added default-on runtime smart rules with env/config knobs (`AUTONOMY_SMART_RULES_*`): planner empty-action outputs now produce clarification guidance, worker no-action model replies can stop with actionable clarification instructions instead of silent loops, chat non-actionable “no task” replies are rewritten into concrete follow-up prompts, proactive fallback thresholds are tunable, and fallback attempts are budgeted before replanning. |
 
 ## Execution TODO (Live)
 
@@ -102,6 +103,7 @@ Transform IronClaw from a single-node, synchronous AI assistant into the **IronC
 - [x] Phase 3 slice 10: Execution critic loop + replan hooks (`ExecutionCritic` deterministic post-step evaluator + worker replan reason hook integration + critic unit tests + worker replan regression pass)
 - [x] Phase 3 slice 11: Contract-aware fallback ranking (worker/chat fallback candidate merge from reliability + contract metadata + deterministic safety-weighted ranking + contract-fallback integration test)
 - [x] Phase 3 slice 12: Proactive degraded-primary rerouting (conservative thresholded reroute to stronger fallback before primary attempt in worker/chat routing + targeted helper/worker integration tests)
+- [x] Smart Rules v1: conversation-first recovery + adaptive routing knobs (planner/worker/chat no-action clarification recovery, tunable `AUTONOMY_SMART_RULES_*` thresholds, fallback attempt budget, targeted unit coverage)
 - [x] Persist job-level autonomy linkage IDs in `agent_jobs` across Postgres/libSQL (`V17` + libSQL schema compatibility path)
 - [x] Read-only gateway inspection endpoints for autonomy goals/plans (user-scoped)
 - [x] Gateway create endpoints for autonomy goals/plans (`POST /api/goals`, `POST /api/plans`, user-scoped)

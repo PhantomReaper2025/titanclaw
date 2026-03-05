@@ -48,7 +48,7 @@ pub async fn run_reflex_compiler_loop(
                     // but if we had metadata we'd skip. We'll proceed with compiling for now
                     // if we want a fresh Reflex.
                     // We will skip if the pattern is already a known tool name.
-                    if all_tools.iter().any(|t| *t == description) {
+                    if all_tools.contains(&description) {
                         continue;
                     }
 

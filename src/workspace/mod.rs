@@ -788,13 +788,12 @@ impl Workspace {
         }
 
         // Index AST graph (if indexer is available and file is a .rs file)
-        if let Some(ref indexer) = self.ast_indexer {
-            if let Err(e) = indexer
+        if let Some(ref indexer) = self.ast_indexer
+            && let Err(e) = indexer
                 .index_document(document_id, &doc.content, &doc.path)
                 .await
-            {
-                tracing::warn!("AST graph indexing failed for {}: {}", doc.path, e);
-            }
+        {
+            tracing::warn!("AST graph indexing failed for {}: {}", doc.path, e);
         }
 
         Ok(())

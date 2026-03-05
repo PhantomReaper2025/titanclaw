@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Smart Rules v1 runtime knobs (default-on) via `AUTONOMY_SMART_RULES_*`: enable switch, proactive fallback thresholds, fallback-attempt budget, and empty-plan recovery toggle.
+- Planner clarification outcome path: empty/low-action plans now produce explicit clarification guidance with suggested next steps instead of opaque hard-stop errors.
+
+### Changed
+
+- Worker runtime now treats non-actionable model replies (for example “no task” / “nothing to do”) as clarification-needed guidance and exits with actionable instructions instead of looping silently.
+- Chat runtime can rewrite non-actionable model text into concrete follow-up prompts so TitanClaw remains conversational and task-oriented.
+- Reliability fallback execution is now bounded by a smart-rule attempt budget; exhaustion emits explicit failure context that the execution critic maps into deterministic replanning.
+- Proactive fallback-first routing thresholds are now configurable instead of hardcoded.
+
 ## [1.1.2] - 2026-03-02
 
 ### Fixed

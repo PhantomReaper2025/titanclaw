@@ -54,10 +54,10 @@ impl ShadowEngine {
         }
         let key = normalize(input);
         let mut cache = self.cache.write().await;
-        if let Some(entry) = cache.get(&key) {
-            if entry.created_at.elapsed() <= self.ttl {
-                return Some(entry.response.clone());
-            }
+        if let Some(entry) = cache.get(&key)
+            && entry.created_at.elapsed() <= self.ttl
+        {
+            return Some(entry.response.clone());
         }
         cache.remove(&key);
         None

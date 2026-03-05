@@ -68,24 +68,24 @@ pub fn parse_rust_ast(content: &str) -> Result<Vec<AstNode>, String> {
             }
         }
 
-        if let Some(node) = main_node {
-            if !name.is_empty() {
-                // Extract brief preview (first line)
-                let full_text = node.utf8_text(text_bytes).unwrap_or("");
-                let preview = full_text.lines().next().unwrap_or("").trim().to_string();
+        if let Some(node) = main_node
+            && !name.is_empty()
+        {
+            // Extract brief preview (first line)
+            let full_text = node.utf8_text(text_bytes).unwrap_or("");
+            let preview = full_text.lines().next().unwrap_or("").trim().to_string();
 
-                // Find incoming/outgoing call queries within this block
-                let outgoing = find_outgoing_calls(node, text_bytes, &language);
+            // Find incoming/outgoing call queries within this block
+            let outgoing = find_outgoing_calls(node, text_bytes, &language);
 
-                results.push(AstNode {
-                    node_type: node_type.to_string(),
-                    name: name.to_string(),
-                    content_preview: preview,
-                    start_byte: node.start_byte(),
-                    end_byte: node.end_byte(),
-                    outgoing_calls: outgoing,
-                });
-            }
+            results.push(AstNode {
+                node_type: node_type.to_string(),
+                name: name.to_string(),
+                content_preview: preview,
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+                outgoing_calls: outgoing,
+            });
         }
     }
 

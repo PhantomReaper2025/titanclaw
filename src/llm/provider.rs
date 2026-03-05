@@ -314,10 +314,10 @@ pub trait LlmProvider: Send + Sync {
          ),
     ) -> Result<ToolCompletionResponse, LlmError> {
         let response = self.complete_with_tools(request).await?;
-        if let Some(ref content) = response.content {
-            if !content.is_empty() {
-                on_chunk(content.clone()).await;
-            }
+        if let Some(ref content) = response.content
+            && !content.is_empty()
+        {
+            on_chunk(content.clone()).await;
         }
         Ok(response)
     }

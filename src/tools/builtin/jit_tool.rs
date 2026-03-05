@@ -168,7 +168,7 @@ impl Tool for JitWasmTool {
 
         // Compile to WASM using cargo
         let build_output = Command::new("cargo")
-            .current_dir(&dir_path)
+            .current_dir(dir_path)
             .arg("build")
             .arg("--target")
             .arg("wasm32-wasip2")

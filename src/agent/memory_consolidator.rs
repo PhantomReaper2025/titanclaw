@@ -241,7 +241,7 @@ impl MemoryConsolidator {
         let routine_name = payload
             .get("routine_name")
             .and_then(|v| v.as_str())
-            .unwrap_or_else(|| record.title.as_str())
+            .unwrap_or(record.title.as_str())
             .to_string();
         let playbook_name = format!("Routine: {}", routine_name);
 

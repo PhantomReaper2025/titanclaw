@@ -148,13 +148,12 @@ async fn process_batch(
     apply_observations_to_state(&mut state, &observations);
 
     let mut sections = build_deterministic_sections(&state);
-    if config.llm_enabled {
-        if let Ok(llm_sections) = llm_merge_sections(workspace, llm, &observations, &sections).await
-        {
-            for (file, content) in llm_sections {
-                if !content.trim().is_empty() {
-                    sections.insert(file, content);
-                }
+    if config.llm_enabled
+        && let Ok(llm_sections) = llm_merge_sections(workspace, llm, &observations, &sections).await
+    {
+        for (file, content) in llm_sections {
+            if !content.trim().is_empty() {
+                sections.insert(file, content);
             }
         }
     }

@@ -72,6 +72,23 @@ impl ExecutionCritic {
                     )),
                 },
                 Error::Tool(ToolError::ExecutionFailed { reason, .. })
+                    if is_fallback_budget_exhausted_reason(reason) =>
+                {
+                    CriticDecision {
+                        action: CriticAction::Replan {
+                            reason: ReplanReason::StepFailure,
+                        },
+                        reason_codes: vec!["critic_fallback_budget_exhausted".to_string()],
+                        detail: Some(format!(
+                            "Execution critic requested replan after step {}/{} ({}): {}",
+                            input.step_index + 1,
+                            input.total_steps,
+                            input.tool_name,
+                            reason
+                        )),
+                    }
+                }
+                Error::Tool(ToolError::ExecutionFailed { reason, .. })
                     if is_policy_block_reason(reason) =>
                 {
                     CriticDecision {
@@ -155,6 +172,11 @@ fn is_transient_failure_reason(reason: &str) -> bool {
         || normalized.contains("rate limit")
 }
 
+fn is_fallback_budget_exhausted_reason(reason: &str) -> bool {
+    let normalized = reason.to_ascii_lowercase();
+    normalized.contains("fallback budget exhausted")
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -209,6 +231,29 @@ mod tests {
             }
         );
         assert!(out.reason_codes.iter().any(|c| c == "critic_step_timeout"));
+    }
+
+    #[test]
+    fn critic_maps_fallback_budget_exhaustion_to_step_failure_replan() {
+        let err: Result<String, Error> = Err(ToolError::ExecutionFailed {
+            name: "shell".to_string(),
+            reason: "Smart-rule fallback budget exhausted after 3 attempt(s); replanning required"
+                .to_string(),
+        }
+        .into());
+
+        let out = ExecutionCritic::evaluate_step(base_input(&err));
+        assert_eq!(
+            out.action,
+            CriticAction::Replan {
+                reason: ReplanReason::StepFailure
+            }
+        );
+        assert!(
+            out.reason_codes
+                .iter()
+                .any(|c| c == "critic_fallback_budget_exhausted")
+        );
     }
 
     #[test]

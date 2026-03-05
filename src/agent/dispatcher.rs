@@ -226,15 +226,45 @@ fn should_proactively_reroute(
     primary_profile: &ToolReliabilityProfile,
     primary_score: f32,
     best_fallback_score: f32,
+    min_samples: i64,
+    primary_max_score: f32,
+    score_margin: f32,
 ) -> bool {
     let half_open = matches!(primary_profile.breaker_state, CircuitBreakerState::HalfOpen);
     if half_open && best_fallback_score > primary_score {
         return true;
     }
 
-    primary_profile.sample_count >= PROACTIVE_ROUTE_MIN_SAMPLES
-        && primary_score <= PROACTIVE_ROUTE_PRIMARY_MAX_SCORE
-        && best_fallback_score >= (primary_score + PROACTIVE_ROUTE_SCORE_MARGIN)
+    primary_profile.sample_count >= min_samples
+        && primary_score <= primary_max_score
+        && best_fallback_score >= (primary_score + score_margin)
+}
+
+fn looks_like_non_actionable_response(response: &str) -> bool {
+    let normalized = response.to_ascii_lowercase();
+    let hints = [
+        "no task",
+        "no tasks",
+        "nothing to do",
+        "no actionable",
+        "no action needed",
+        "cannot proceed without",
+        "need a specific task",
+        "need more details",
+    ];
+    hints.iter().any(|hint| normalized.contains(hint))
+}
+
+fn render_non_actionable_recovery_response(raw_model_text: &str) -> String {
+    format!(
+        "I need a clearer objective before I run tools.\n\
+Reason from model: {}\n\
+You can reply with one of these:\n\
+1. Exact outcome you want.\n\
+2. Files/tools I should use.\n\
+3. Whether to execute immediately or ask before risky actions.",
+        raw_model_text.trim()
+    )
 }
 
 fn profile_breaker_is_open(profile: &ToolReliabilityProfile, now: DateTime<Utc>) -> bool {
@@ -659,7 +689,33 @@ impl Agent {
                     ],
                 };
             }
-            if should_proactively_reroute(&primary_profile, primary_score, *best_fallback_score) {
+            let min_samples = if self.config.autonomy_smart_rules_enabled {
+                self.config
+                    .autonomy_smart_rules_proactive_min_samples
+                    .max(1)
+            } else {
+                PROACTIVE_ROUTE_MIN_SAMPLES
+            };
+            let primary_max_score = if self.config.autonomy_smart_rules_enabled {
+                self.config
+                    .autonomy_smart_rules_primary_max_score
+                    .clamp(0.0, 1.0)
+            } else {
+                PROACTIVE_ROUTE_PRIMARY_MAX_SCORE
+            };
+            let score_margin = if self.config.autonomy_smart_rules_enabled {
+                self.config.autonomy_smart_rules_proactive_margin.max(0.0)
+            } else {
+                PROACTIVE_ROUTE_SCORE_MARGIN
+            };
+            if should_proactively_reroute(
+                &primary_profile,
+                primary_score,
+                *best_fallback_score,
+                min_samples,
+                primary_max_score,
+                score_margin,
+            ) {
                 let mut reason_codes = vec!["tool_routing_v2_prefer_reliable_fallback".to_string()];
                 if matches!(primary_profile.breaker_state, CircuitBreakerState::HalfOpen) {
                     reason_codes.push("circuit_breaker_half_open".to_string());
@@ -1248,6 +1304,15 @@ impl Agent {
 
             match output.result {
                 RespondResult::Text(text) => {
+                    if self.config.autonomy_smart_rules_enabled
+                        && self.config.autonomy_smart_rules_empty_plan_recovery
+                        && looks_like_non_actionable_response(&text)
+                    {
+                        return Ok(AgenticLoopResult::Response(
+                            render_non_actionable_recovery_response(&text),
+                        ));
+                    }
+
                     // If no tools have been executed yet, prompt the LLM to use tools
                     // This handles the case where the model explains what it will do
                     // instead of actually calling tools
@@ -1659,7 +1724,7 @@ impl Agent {
                             Ok(output) => {
                                 // Sanitize output before showing to LLM
                                 let sanitized =
-                                    self.safety().sanitize_tool_output(&tc.name, &output);
+                                    self.safety().sanitize_tool_output(&tc.name, output);
                                 self.safety().wrap_for_llm(
                                     &tc.name,
                                     &sanitized.content,
@@ -1950,8 +2015,9 @@ mod tests {
     use super::{
         TOOL_RESULT_CHUNK_CHARS, TOOL_STREAM_EVENT_PREFIX, ToolStreamEvent,
         chunk_tool_result_preview, contract_routing_bonus, detect_auth_awaiting,
-        merge_fallback_candidates, parse_contract_fallback_tools, parse_profile_fallback_tools,
-        parse_tool_stream_event, profile_breaker_is_open, shell_preview_from_args,
+        looks_like_non_actionable_response, merge_fallback_candidates,
+        parse_contract_fallback_tools, parse_profile_fallback_tools, parse_tool_stream_event,
+        profile_breaker_is_open, render_non_actionable_recovery_response, shell_preview_from_args,
         should_proactively_reroute,
     };
 
@@ -2055,7 +2121,7 @@ mod tests {
         );
         let merged = merge_fallback_candidates(
             "shell",
-            &vec!["http".to_string(), "read_file".to_string()],
+            &["http".to_string(), "read_file".to_string()],
             &contract_fallbacks,
         );
         assert_eq!(
@@ -2136,7 +2202,26 @@ mod tests {
             last_success_at: None,
             updated_at: now,
         };
-        assert!(should_proactively_reroute(&profile, 0.2, 0.5));
+        assert!(should_proactively_reroute(
+            &profile, 0.2, 0.5, 5, 0.35, 0.15
+        ));
+    }
+
+    #[test]
+    fn test_non_actionable_response_detection_and_recovery_message() {
+        assert!(looks_like_non_actionable_response(
+            "There is no task to run right now."
+        ));
+        assert!(looks_like_non_actionable_response(
+            "I cannot proceed without more details."
+        ));
+        assert!(!looks_like_non_actionable_response(
+            "I can run tests and summarize the output."
+        ));
+
+        let recovery = render_non_actionable_recovery_response("No actionable task provided.");
+        assert!(recovery.contains("clearer objective"));
+        assert!(recovery.contains("Exact outcome"));
     }
 
     #[test]

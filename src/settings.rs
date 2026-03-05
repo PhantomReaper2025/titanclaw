@@ -319,6 +319,30 @@ pub struct AgentSettings {
     #[serde(default)]
     pub autonomy_tool_routing_v2: bool,
 
+    /// Enable Smart Rules runtime behavior (conversation-first recovery + adaptive routing).
+    #[serde(default = "default_true")]
+    pub autonomy_smart_rules_enabled: bool,
+
+    /// Minimum sample count before proactive fallback-first routing can trigger.
+    #[serde(default = "default_smart_rules_proactive_min_samples")]
+    pub autonomy_smart_rules_proactive_min_samples: u32,
+
+    /// Maximum primary reliability score that is still considered degraded.
+    #[serde(default = "default_smart_rules_primary_max_score")]
+    pub autonomy_smart_rules_primary_max_score: f32,
+
+    /// Minimum score margin required to prefer fallback before primary.
+    #[serde(default = "default_smart_rules_proactive_margin")]
+    pub autonomy_smart_rules_proactive_margin: f32,
+
+    /// Maximum fallback attempts per step before forcing replan.
+    #[serde(default = "default_smart_rules_max_fallback_attempts")]
+    pub autonomy_smart_rules_max_fallback_attempts: u32,
+
+    /// Convert empty/no-action plans into clarification guidance instead of hard failure.
+    #[serde(default = "default_true")]
+    pub autonomy_smart_rules_empty_plan_recovery: bool,
+
     /// Enable Memory Plane v2 runtime writes/services.
     #[serde(default)]
     pub autonomy_memory_plane_v2: bool,
@@ -473,6 +497,22 @@ fn default_memory_playbook_min_repetitions() -> u32 {
     3
 }
 
+fn default_smart_rules_proactive_min_samples() -> u32 {
+    5
+}
+
+fn default_smart_rules_primary_max_score() -> f32 {
+    0.35
+}
+
+fn default_smart_rules_proactive_margin() -> f32 {
+    0.15
+}
+
+fn default_smart_rules_max_fallback_attempts() -> u32 {
+    2
+}
+
 fn default_session_idle_timeout() -> u64 {
     7 * 24 * 3600 // 7 days
 }
@@ -537,6 +577,12 @@ impl Default for AgentSettings {
             autonomy_verifier_v1: true,
             autonomy_replanner_v1: true,
             autonomy_tool_routing_v2: false,
+            autonomy_smart_rules_enabled: true,
+            autonomy_smart_rules_proactive_min_samples: default_smart_rules_proactive_min_samples(),
+            autonomy_smart_rules_primary_max_score: default_smart_rules_primary_max_score(),
+            autonomy_smart_rules_proactive_margin: default_smart_rules_proactive_margin(),
+            autonomy_smart_rules_max_fallback_attempts: default_smart_rules_max_fallback_attempts(),
+            autonomy_smart_rules_empty_plan_recovery: true,
             autonomy_memory_plane_v2: false,
             autonomy_memory_retrieval_v2: false,
             autonomy_memory_consolidation_v2: false,

@@ -19,7 +19,6 @@ use axum::{
     },
     routing::{delete, get, post},
 };
-use bytes::Bytes;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot};
@@ -1836,7 +1835,7 @@ async fn jobs_create_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if mode != crate::orchestrator::job_manager::JobMode::Worker {
-        let _ = store
+        store
             .update_sandbox_job_mode(job_id, mode.as_str())
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2488,7 +2487,7 @@ async fn build_tar_gz_archive_body(
         }
     });
 
-    let stream = ReaderStream::new(stdout).map(|result| result.map(Bytes::from));
+    let stream = ReaderStream::new(stdout).map(|result| result);
     Ok(axum::body::Body::from_stream(stream))
 }
 
@@ -3708,10 +3707,10 @@ async fn goals_list_handler(
         goals.retain(|g| g.status == status);
     }
     apply_goal_list_sort(&mut goals, sort);
-    if let Some(offset) = query.offset {
-        if offset > 0 {
-            goals = goals.into_iter().skip(offset).collect();
-        }
+    if let Some(offset) = query.offset
+        && offset > 0
+    {
+        goals = goals.into_iter().skip(offset).collect();
     }
     if let Some(limit) = query.limit {
         if limit == 0 {
@@ -4003,10 +4002,10 @@ async fn plans_list_handler(
         plans.retain(|p| p.status == status);
     }
     apply_plan_list_sort(&mut plans, sort);
-    if let Some(offset) = query.offset {
-        if offset > 0 {
-            plans = plans.into_iter().skip(offset).collect();
-        }
+    if let Some(offset) = query.offset
+        && offset > 0
+    {
+        plans = plans.into_iter().skip(offset).collect();
     }
     if let Some(limit) = query.limit {
         if limit == 0 {

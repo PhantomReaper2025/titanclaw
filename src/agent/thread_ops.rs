@@ -278,15 +278,15 @@ impl Agent {
         // Insert into session and register with session manager
         {
             let mut sess = session.lock().await;
-            if sess.threads.contains_key(&thread_uuid) {
+            if let std::collections::hash_map::Entry::Vacant(e) = sess.threads.entry(thread_uuid) {
+                e.insert(thread);
+                sess.active_thread = Some(thread_uuid);
+                sess.last_active_at = chrono::Utc::now();
+            } else {
                 tracing::debug!(
                     "Skipped hydration insert for thread {} because it was created concurrently",
                     thread_uuid
                 );
-                sess.active_thread = Some(thread_uuid);
-                sess.last_active_at = chrono::Utc::now();
-            } else {
-                sess.threads.insert(thread_uuid, thread);
                 sess.active_thread = Some(thread_uuid);
                 sess.last_active_at = chrono::Utc::now();
             }
@@ -1461,7 +1461,7 @@ impl Agent {
                 Ok(output) => {
                     let sanitized = self
                         .safety()
-                        .sanitize_tool_output(&pending.tool_name, &output);
+                        .sanitize_tool_output(&pending.tool_name, output);
                     self.safety().wrap_for_llm(
                         &pending.tool_name,
                         &sanitized.content,
@@ -1864,6 +1864,10 @@ impl Agent {
             Ok(SubmissionResult::error("Checkpoint not found."))
         }
     }
+}
+
+fn is_approval_expired(updated_at: chrono::DateTime<chrono::Utc>) -> bool {
+    updated_at < chrono::Utc::now() - chrono::TimeDelta::seconds(APPROVAL_TIMEOUT_SECS)
 }
 
 #[cfg(test)]
@@ -2326,8 +2330,4 @@ mod tests {
             "expected approval routing deny for open breaker"
         );
     }
-}
-
-fn is_approval_expired(updated_at: chrono::DateTime<chrono::Utc>) -> bool {
-    updated_at < chrono::Utc::now() - chrono::TimeDelta::seconds(APPROVAL_TIMEOUT_SECS)
 }

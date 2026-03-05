@@ -237,8 +237,8 @@ If the job is not complete, continue with tools or explain what remains."#,
 
         for iteration in 1..=max_iterations {
             // Report progress
-            if iteration % 5 == 1 {
-                if let Err(e) = self
+            if iteration % 5 == 1
+                && let Err(e) = self
                     .client
                     .report_status(&StatusUpdate {
                         state: "in_progress".to_string(),
@@ -246,13 +246,12 @@ If the job is not complete, continue with tools or explain what remains."#,
                         iteration,
                     })
                     .await
-                {
-                    tracing::debug!(
-                        iteration,
-                        error = %e,
-                        "Failed to report worker progress status"
-                    );
-                }
+            {
+                tracing::debug!(
+                    iteration,
+                    error = %e,
+                    "Failed to report worker progress status"
+                );
             }
 
             // Poll for follow-up prompts from the user

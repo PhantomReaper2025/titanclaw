@@ -12,6 +12,24 @@ pub(super) struct PlannerOutput {
     pub plan_trace_summary: String,
 }
 
+#[derive(Debug, Clone)]
+pub(super) enum PlannerOutcome {
+    Ready(PlannerOutput),
+    NeedsClarification {
+        reason: String,
+        suggested_next_actions: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum PlanValidationResult {
+    Valid,
+    NeedsClarification {
+        reason: String,
+        suggested_next_actions: Vec<String>,
+    },
+}
+
 pub(super) struct PlannerV1;
 
 impl PlannerV1 {
@@ -19,7 +37,7 @@ impl PlannerV1 {
     pub(super) async fn plan_initial(
         reasoning: &Reasoning,
         reason_ctx: &ReasoningContext,
-    ) -> Result<PlannerOutput, Error> {
+    ) -> Result<PlannerOutcome, Error> {
         Self::plan_initial_with_retrieval(reasoning, reason_ctx, None).await
     }
 
@@ -27,7 +45,7 @@ impl PlannerV1 {
         reasoning: &Reasoning,
         reason_ctx: &ReasoningContext,
         retrieval_context_block: Option<&str>,
-    ) -> Result<PlannerOutput, Error> {
+    ) -> Result<PlannerOutcome, Error> {
         let mut planning_ctx = clone_reasoning_context(reason_ctx);
         if let Some(block) = retrieval_context_block
             .map(str::trim)
@@ -40,12 +58,22 @@ impl PlannerV1 {
         }
 
         let action_plan = reasoning.plan(&planning_ctx).await?;
-        validate_action_plan(&action_plan)?;
-        let plan_trace_summary = render_plan_trace_summary(&action_plan);
-        Ok(PlannerOutput {
-            action_plan,
-            plan_trace_summary,
-        })
+        match validate_action_plan(&action_plan)? {
+            PlanValidationResult::Valid => {
+                let plan_trace_summary = render_plan_trace_summary(&action_plan);
+                Ok(PlannerOutcome::Ready(PlannerOutput {
+                    action_plan,
+                    plan_trace_summary,
+                }))
+            }
+            PlanValidationResult::NeedsClarification {
+                reason,
+                suggested_next_actions,
+            } => Ok(PlannerOutcome::NeedsClarification {
+                reason,
+                suggested_next_actions,
+            }),
+        }
     }
 }
 
@@ -59,18 +87,32 @@ fn clone_reasoning_context(reason_ctx: &ReasoningContext) -> ReasoningContext {
     }
 }
 
-fn validate_action_plan(plan: &ActionPlan) -> Result<(), Error> {
+fn default_clarification_actions(goal: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if !goal.trim().is_empty() {
+        out.push(format!("Confirm the main outcome: \"{}\".", goal.trim()));
+    } else {
+        out.push("State the main outcome you want in one sentence.".to_string());
+    }
+    out.push("List 1-3 concrete actions or files/tools TitanClaw should use.".to_string());
+    out.push(
+        "Tell TitanClaw whether to execute immediately or ask before each risky step.".to_string(),
+    );
+    out
+}
+
+fn validate_action_plan(plan: &ActionPlan) -> Result<PlanValidationResult, Error> {
     if plan.goal.trim().is_empty() {
-        return Err(WorkerError::ExecutionFailed {
-            reason: "Planner returned an empty goal".to_string(),
-        }
-        .into());
+        return Ok(PlanValidationResult::NeedsClarification {
+            reason: "Planner could not infer a concrete goal from the request".to_string(),
+            suggested_next_actions: default_clarification_actions(""),
+        });
     }
     if plan.actions.is_empty() {
-        return Err(WorkerError::ExecutionFailed {
-            reason: "Planner returned an empty action list".to_string(),
-        }
-        .into());
+        return Ok(PlanValidationResult::NeedsClarification {
+            reason: "Planner returned no actionable steps for the current request".to_string(),
+            suggested_next_actions: default_clarification_actions(&plan.goal),
+        });
     }
     if !(0.0..=1.0).contains(&plan.confidence) {
         return Err(WorkerError::ExecutionFailed {
@@ -81,7 +123,7 @@ fn validate_action_plan(plan: &ActionPlan) -> Result<(), Error> {
         }
         .into());
     }
-    Ok(())
+    Ok(PlanValidationResult::Valid)
 }
 
 pub(super) fn render_plan_trace_summary(plan: &ActionPlan) -> String {
@@ -126,11 +168,20 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_action_plan_rejects_empty_actions() {
+    fn test_validate_action_plan_returns_clarification_for_empty_actions() {
         let mut plan = sample_plan();
         plan.actions.clear();
-        let err = validate_action_plan(&plan).unwrap_err();
-        assert!(err.to_string().contains("empty action list"));
+        let out = validate_action_plan(&plan).expect("validate");
+        match out {
+            PlanValidationResult::NeedsClarification {
+                reason,
+                suggested_next_actions,
+            } => {
+                assert!(reason.contains("no actionable steps"));
+                assert!(!suggested_next_actions.is_empty());
+            }
+            PlanValidationResult::Valid => panic!("expected clarification"),
+        }
     }
 
     #[test]

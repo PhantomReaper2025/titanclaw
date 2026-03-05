@@ -175,6 +175,22 @@ impl Scheduler {
                 autonomy_tool_routing_v2: self.config.autonomy_tool_routing_v2,
                 autonomy_memory_plane_v2: self.config.autonomy_memory_plane_v2,
                 autonomy_memory_retrieval_v2: self.config.autonomy_memory_retrieval_v2,
+                autonomy_smart_rules_enabled: self.config.autonomy_smart_rules_enabled,
+                autonomy_smart_rules_proactive_min_samples: self
+                    .config
+                    .autonomy_smart_rules_proactive_min_samples,
+                autonomy_smart_rules_primary_max_score: self
+                    .config
+                    .autonomy_smart_rules_primary_max_score,
+                autonomy_smart_rules_proactive_margin: self
+                    .config
+                    .autonomy_smart_rules_proactive_margin,
+                autonomy_smart_rules_max_fallback_attempts: self
+                    .config
+                    .autonomy_smart_rules_max_fallback_attempts,
+                autonomy_smart_rules_empty_plan_recovery: self
+                    .config
+                    .autonomy_smart_rules_empty_plan_recovery,
             };
             let worker = Worker::new(job_id, deps);
 
@@ -482,88 +498,84 @@ impl Scheduler {
                         metrics.local_fallbacks.fetch_add(1, Ordering::Relaxed);
                     }
 
-                    if memory_plane_v2_enabled {
-                        if let Some(store) = store {
-                            let job_ctx = memory_context_manager
-                                .get_context(tool_parent_id)
-                                .await
-                                .ok();
-                            let (owner_user_id, goal_id, plan_id, plan_step_id) = match job_ctx {
-                                Some(ctx) => (
-                                    ctx.user_id,
-                                    ctx.autonomy_goal_id,
-                                    ctx.autonomy_plan_id,
-                                    ctx.autonomy_plan_step_id,
+                    if memory_plane_v2_enabled && let Some(store) = store {
+                        let job_ctx = memory_context_manager
+                            .get_context(tool_parent_id)
+                            .await
+                            .ok();
+                        let (owner_user_id, goal_id, plan_id, plan_step_id) = match job_ctx {
+                            Some(ctx) => (
+                                ctx.user_id,
+                                ctx.autonomy_goal_id,
+                                ctx.autonomy_plan_id,
+                                ctx.autonomy_plan_step_id,
+                            ),
+                            None => ("default".to_string(), None, None, None),
+                        };
+                        let (success, duration_ms, result_preview) = match &result {
+                            Ok(output) => (
+                                true,
+                                Some(output.duration.as_millis() as u64),
+                                serde_json::to_string(&output.result)
+                                    .ok()
+                                    .map(|s| truncate_chars(&s, 400)),
+                            ),
+                            Err(err) => (false, None, Some(truncate_chars(&err.to_string(), 400))),
+                        };
+                        let params_preview = serde_json::to_string(&params_memory)
+                            .ok()
+                            .map(|s| truncate_chars(&s, 400));
+                        let now = chrono::Utc::now();
+                        persist_memory_record_best_effort(
+                            store,
+                            MemoryRecordWriteRequest {
+                                owner_user_id,
+                                goal_id,
+                                plan_id,
+                                plan_step_id,
+                                job_id: Some(tool_parent_id),
+                                thread_id: None,
+                                source_kind: MemorySourceKind::SchedulerSubtask,
+                                category: "scheduler_subtask_outcome".to_string(),
+                                title: format!(
+                                    "Scheduler subtask {} ({})",
+                                    if success { "succeeded" } else { "failed" },
+                                    tool_name_memory
                                 ),
-                                None => ("default".to_string(), None, None, None),
-                            };
-                            let (success, duration_ms, result_preview) = match &result {
-                                Ok(output) => (
-                                    true,
-                                    Some(output.duration.as_millis() as u64),
-                                    serde_json::to_string(&output.result)
-                                        .ok()
-                                        .map(|s| truncate_chars(&s, 400)),
+                                summary: format!(
+                                    "Tool subtask '{}' {}{}",
+                                    tool_name_memory,
+                                    if success { "succeeded" } else { "failed" },
+                                    if used_local_fallback {
+                                        " with local fallback"
+                                    } else if swarm_path_available {
+                                        " via remote path"
+                                    } else {
+                                        ""
+                                    }
                                 ),
-                                Err(err) => {
-                                    (false, None, Some(truncate_chars(&err.to_string(), 400)))
-                                }
-                            };
-                            let params_preview = serde_json::to_string(&params_memory)
-                                .ok()
-                                .map(|s| truncate_chars(&s, 400));
-                            let now = chrono::Utc::now();
-                            persist_memory_record_best_effort(
-                                store,
-                                MemoryRecordWriteRequest {
-                                    owner_user_id,
-                                    goal_id,
-                                    plan_id,
-                                    plan_step_id,
-                                    job_id: Some(tool_parent_id),
-                                    thread_id: None,
-                                    source_kind: MemorySourceKind::SchedulerSubtask,
-                                    category: "scheduler_subtask_outcome".to_string(),
-                                    title: format!(
-                                        "Scheduler subtask {} ({})",
-                                        if success { "succeeded" } else { "failed" },
-                                        tool_name_memory
-                                    ),
-                                    summary: format!(
-                                        "Tool subtask '{}' {}{}",
-                                        tool_name_memory,
-                                        if success { "succeeded" } else { "failed" },
-                                        if used_local_fallback {
-                                            " with local fallback"
-                                        } else if swarm_path_available {
-                                            " via remote path"
-                                        } else {
-                                            ""
-                                        }
-                                    ),
-                                    payload: serde_json::json!({
-                                        "task_id": task_id_for_remote,
-                                        "tool_name": tool_name_memory,
-                                        "used_local_fallback": used_local_fallback,
-                                        "swarm_path_available": swarm_path_available,
-                                        "success": success,
-                                        "duration_ms": duration_ms,
-                                        "params_preview": params_preview,
-                                        "result_preview": result_preview,
-                                    }),
-                                    provenance: serde_json::json!({
-                                        "source": "scheduler.spawn_subtask",
-                                        "timestamp": now,
-                                    }),
-                                    desired_memory_type: None,
-                                    confidence_hint: Some(if success { 0.9 } else { 0.75 }),
-                                    sensitivity_hint: None,
-                                    ttl_secs_hint: Some((episodic_ttl_days as i64) * 24 * 60 * 60),
-                                    high_impact: false,
-                                    intent: MemoryWriteIntent::Generic,
-                                },
-                            );
-                        }
+                                payload: serde_json::json!({
+                                    "task_id": task_id_for_remote,
+                                    "tool_name": tool_name_memory,
+                                    "used_local_fallback": used_local_fallback,
+                                    "swarm_path_available": swarm_path_available,
+                                    "success": success,
+                                    "duration_ms": duration_ms,
+                                    "params_preview": params_preview,
+                                    "result_preview": result_preview,
+                                }),
+                                provenance: serde_json::json!({
+                                    "source": "scheduler.spawn_subtask",
+                                    "timestamp": now,
+                                }),
+                                desired_memory_type: None,
+                                confidence_hint: Some(if success { 0.9 } else { 0.75 }),
+                                sensitivity_hint: None,
+                                ttl_secs_hint: Some((episodic_ttl_days as i64) * 24 * 60 * 60),
+                                high_impact: false,
+                                intent: MemoryWriteIntent::Generic,
+                            },
+                        );
                     }
 
                     // Send result (ignore if receiver dropped)

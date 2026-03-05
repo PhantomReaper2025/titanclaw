@@ -23,6 +23,18 @@ pub struct AgentConfig {
     pub autonomy_replanner_v1: bool,
     /// Enable reliability-aware worker tool routing/fallback behavior.
     pub autonomy_tool_routing_v2: bool,
+    /// Enable Smart Rules runtime behavior (conversation-first recovery + adaptive routing).
+    pub autonomy_smart_rules_enabled: bool,
+    /// Minimum samples before proactive fallback-first routing.
+    pub autonomy_smart_rules_proactive_min_samples: i64,
+    /// Maximum reliability score treated as degraded for proactive reroute.
+    pub autonomy_smart_rules_primary_max_score: f32,
+    /// Required fallback score margin for proactive reroute.
+    pub autonomy_smart_rules_proactive_margin: f32,
+    /// Maximum fallback attempts per step before replanning.
+    pub autonomy_smart_rules_max_fallback_attempts: usize,
+    /// Convert empty/no-action plans into clarification prompts.
+    pub autonomy_smart_rules_empty_plan_recovery: bool,
     /// Enable Memory Plane v2 runtime writes/services.
     pub autonomy_memory_plane_v2: bool,
     /// Enable Memory Plane v2 retrieval composer integration.
@@ -173,6 +185,67 @@ impl AgentConfig {
                     message: format!("must be 'true' or 'false': {e}"),
                 })?
                 .unwrap_or(settings.agent.autonomy_tool_routing_v2),
+            autonomy_smart_rules_enabled: optional_env("AUTONOMY_SMART_RULES_ENABLED")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "AUTONOMY_SMART_RULES_ENABLED".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(settings.agent.autonomy_smart_rules_enabled),
+            autonomy_smart_rules_proactive_min_samples: optional_env(
+                "AUTONOMY_SMART_RULES_PROACTIVE_MIN_SAMPLES",
+            )?
+            .map(|s| s.parse())
+            .transpose()
+            .map_err(|e| ConfigError::InvalidValue {
+                key: "AUTONOMY_SMART_RULES_PROACTIVE_MIN_SAMPLES".to_string(),
+                message: format!("must be a positive integer: {e}"),
+            })?
+            .unwrap_or(settings.agent.autonomy_smart_rules_proactive_min_samples as i64)
+            .max(1),
+            autonomy_smart_rules_primary_max_score: optional_env(
+                "AUTONOMY_SMART_RULES_PRIMARY_MAX_SCORE",
+            )?
+            .map(|s| s.parse())
+            .transpose()
+            .map_err(|e| ConfigError::InvalidValue {
+                key: "AUTONOMY_SMART_RULES_PRIMARY_MAX_SCORE".to_string(),
+                message: format!("must be a number between 0 and 1: {e}"),
+            })?
+            .unwrap_or(settings.agent.autonomy_smart_rules_primary_max_score)
+            .clamp(0.0, 1.0),
+            autonomy_smart_rules_proactive_margin: optional_env(
+                "AUTONOMY_SMART_RULES_PROACTIVE_MARGIN",
+            )?
+            .map(|s| s.parse())
+            .transpose()
+            .map_err(|e| ConfigError::InvalidValue {
+                key: "AUTONOMY_SMART_RULES_PROACTIVE_MARGIN".to_string(),
+                message: format!("must be a non-negative number: {e}"),
+            })?
+            .unwrap_or(settings.agent.autonomy_smart_rules_proactive_margin)
+            .max(0.0),
+            autonomy_smart_rules_max_fallback_attempts: optional_env(
+                "AUTONOMY_SMART_RULES_MAX_FALLBACK_ATTEMPTS",
+            )?
+            .map(|s| s.parse())
+            .transpose()
+            .map_err(|e| ConfigError::InvalidValue {
+                key: "AUTONOMY_SMART_RULES_MAX_FALLBACK_ATTEMPTS".to_string(),
+                message: format!("must be a non-negative integer: {e}"),
+            })?
+            .unwrap_or(settings.agent.autonomy_smart_rules_max_fallback_attempts as usize),
+            autonomy_smart_rules_empty_plan_recovery: optional_env(
+                "AUTONOMY_SMART_RULES_EMPTY_PLAN_RECOVERY",
+            )?
+            .map(|s| s.parse())
+            .transpose()
+            .map_err(|e| ConfigError::InvalidValue {
+                key: "AUTONOMY_SMART_RULES_EMPTY_PLAN_RECOVERY".to_string(),
+                message: format!("must be 'true' or 'false': {e}"),
+            })?
+            .unwrap_or(settings.agent.autonomy_smart_rules_empty_plan_recovery),
             autonomy_memory_plane_v2: optional_env("AUTONOMY_MEMORY_PLANE_V2")?
                 .map(|s| s.parse())
                 .transpose()
@@ -441,6 +514,12 @@ mod tests {
             std::env::remove_var("AUTONOMY_VERIFIER_V1");
             std::env::remove_var("AUTONOMY_REPLANNER_V1");
             std::env::remove_var("AUTONOMY_TOOL_ROUTING_V2");
+            std::env::remove_var("AUTONOMY_SMART_RULES_ENABLED");
+            std::env::remove_var("AUTONOMY_SMART_RULES_PROACTIVE_MIN_SAMPLES");
+            std::env::remove_var("AUTONOMY_SMART_RULES_PRIMARY_MAX_SCORE");
+            std::env::remove_var("AUTONOMY_SMART_RULES_PROACTIVE_MARGIN");
+            std::env::remove_var("AUTONOMY_SMART_RULES_MAX_FALLBACK_ATTEMPTS");
+            std::env::remove_var("AUTONOMY_SMART_RULES_EMPTY_PLAN_RECOVERY");
             std::env::remove_var("AUTONOMY_MEMORY_PLANE_V2");
             std::env::remove_var("AUTONOMY_MEMORY_RETRIEVAL_V2");
             std::env::remove_var("AUTONOMY_MEMORY_CONSOLIDATION_V2");
@@ -461,6 +540,12 @@ mod tests {
         assert!(cfg.autonomy_verifier_v1);
         assert!(cfg.autonomy_replanner_v1);
         assert!(!cfg.autonomy_tool_routing_v2);
+        assert!(cfg.autonomy_smart_rules_enabled);
+        assert_eq!(cfg.autonomy_smart_rules_proactive_min_samples, 5);
+        assert!((cfg.autonomy_smart_rules_primary_max_score - 0.35).abs() < f32::EPSILON);
+        assert!((cfg.autonomy_smart_rules_proactive_margin - 0.15).abs() < f32::EPSILON);
+        assert_eq!(cfg.autonomy_smart_rules_max_fallback_attempts, 2);
+        assert!(cfg.autonomy_smart_rules_empty_plan_recovery);
     }
 
     #[test]
@@ -473,12 +558,24 @@ mod tests {
             std::env::set_var("AUTONOMY_VERIFIER_V1", "false");
             std::env::set_var("AUTONOMY_REPLANNER_V1", "false");
             std::env::set_var("AUTONOMY_TOOL_ROUTING_V2", "true");
+            std::env::set_var("AUTONOMY_SMART_RULES_ENABLED", "true");
+            std::env::set_var("AUTONOMY_SMART_RULES_PROACTIVE_MIN_SAMPLES", "9");
+            std::env::set_var("AUTONOMY_SMART_RULES_PRIMARY_MAX_SCORE", "0.42");
+            std::env::set_var("AUTONOMY_SMART_RULES_PROACTIVE_MARGIN", "0.2");
+            std::env::set_var("AUTONOMY_SMART_RULES_MAX_FALLBACK_ATTEMPTS", "4");
+            std::env::set_var("AUTONOMY_SMART_RULES_EMPTY_PLAN_RECOVERY", "false");
         }
         let cfg = AgentConfig::resolve(&Settings::default()).expect("resolve");
         assert!(!cfg.autonomy_policy_engine_v1);
         assert!(!cfg.autonomy_verifier_v1);
         assert!(!cfg.autonomy_replanner_v1);
         assert!(cfg.autonomy_tool_routing_v2);
+        assert!(cfg.autonomy_smart_rules_enabled);
+        assert_eq!(cfg.autonomy_smart_rules_proactive_min_samples, 9);
+        assert!((cfg.autonomy_smart_rules_primary_max_score - 0.42).abs() < f32::EPSILON);
+        assert!((cfg.autonomy_smart_rules_proactive_margin - 0.2).abs() < f32::EPSILON);
+        assert_eq!(cfg.autonomy_smart_rules_max_fallback_attempts, 4);
+        assert!(!cfg.autonomy_smart_rules_empty_plan_recovery);
         clear_autonomy_flag_env();
     }
 

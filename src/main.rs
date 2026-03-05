@@ -1755,10 +1755,10 @@ async fn main() -> anyhow::Result<()> {
     agent.run().await?;
 
     // Shut down swarm node if enabled.
-    if let Some(handle) = swarm_handle.take() {
-        if let Err(e) = handle.shutdown().await {
-            tracing::warn!("Failed to stop swarm mesh cleanly: {}", e);
-        }
+    if let Some(handle) = swarm_handle.take()
+        && let Err(e) = handle.shutdown().await
+    {
+        tracing::warn!("Failed to stop swarm mesh cleanly: {}", e);
     }
     if let Some(task) = swarm_events_task.take() {
         task.abort();

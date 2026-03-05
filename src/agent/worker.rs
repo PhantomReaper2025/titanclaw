@@ -19,7 +19,7 @@ use crate::agent::memory_retrieval_composer::{
     MemoryRetrievalComposer, MemoryRetrievalRequest, RetrievalTaskClass,
 };
 use crate::agent::memory_write_policy::MemoryWriteIntent;
-use crate::agent::planner_v1::PlannerV1;
+use crate::agent::planner_v1::{PlannerOutcome, PlannerV1};
 use crate::agent::policy_engine::{
     ApprovalPolicyOutcome, HookToolPolicyOutcome, evaluate_tool_call_hook,
     evaluate_worker_tool_approval,
@@ -71,6 +71,12 @@ pub struct WorkerDeps {
     pub autonomy_tool_routing_v2: bool,
     pub autonomy_memory_plane_v2: bool,
     pub autonomy_memory_retrieval_v2: bool,
+    pub autonomy_smart_rules_enabled: bool,
+    pub autonomy_smart_rules_proactive_min_samples: i64,
+    pub autonomy_smart_rules_primary_max_score: f32,
+    pub autonomy_smart_rules_proactive_margin: f32,
+    pub autonomy_smart_rules_max_fallback_attempts: usize,
+    pub autonomy_smart_rules_empty_plan_recovery: bool,
 }
 
 /// Worker that executes a single job.
@@ -150,6 +156,7 @@ fn parse_profile_fallback_tools(raw: &serde_json::Value) -> Vec<String> {
 const PROACTIVE_ROUTE_MIN_SAMPLES: i64 = 5;
 const PROACTIVE_ROUTE_PRIMARY_MAX_SCORE: f32 = 0.35;
 const PROACTIVE_ROUTE_SCORE_MARGIN: f32 = 0.15;
+const SMART_RULES_MAX_FALLBACK_ATTEMPTS: usize = 2;
 
 fn parse_contract_fallback_tools(contract: Option<&ToolContractV2Descriptor>) -> Vec<String> {
     contract
@@ -202,15 +209,47 @@ fn should_proactively_reroute(
     primary_profile: &ToolReliabilityProfile,
     primary_score: f32,
     best_fallback_score: f32,
+    min_samples: i64,
+    primary_max_score: f32,
+    score_margin: f32,
 ) -> bool {
     let half_open = matches!(primary_profile.breaker_state, CircuitBreakerState::HalfOpen);
     if half_open && best_fallback_score > primary_score {
         return true;
     }
 
-    primary_profile.sample_count >= PROACTIVE_ROUTE_MIN_SAMPLES
-        && primary_score <= PROACTIVE_ROUTE_PRIMARY_MAX_SCORE
-        && best_fallback_score >= (primary_score + PROACTIVE_ROUTE_SCORE_MARGIN)
+    primary_profile.sample_count >= min_samples
+        && primary_score <= primary_max_score
+        && best_fallback_score >= (primary_score + score_margin)
+}
+
+fn looks_like_non_actionable_response(response: &str) -> bool {
+    let normalized = response.to_ascii_lowercase();
+    let hints = [
+        "no task",
+        "no tasks",
+        "nothing to do",
+        "no actionable",
+        "no action needed",
+        "cannot proceed without",
+        "need a specific task",
+        "need more details",
+    ];
+    hints.iter().any(|hint| normalized.contains(hint))
+}
+
+fn format_clarification_guidance(reason: &str, suggestions: &[String]) -> String {
+    let mut body = String::from("Planner needs clarification before execution.\n");
+    body.push_str("Reason: ");
+    body.push_str(reason.trim());
+    if !suggestions.is_empty() {
+        body.push_str("\nSuggested next steps:");
+        for step in suggestions {
+            body.push_str("\n- ");
+            body.push_str(step.trim());
+        }
+    }
+    body
 }
 
 fn profile_breaker_is_open(profile: &ToolReliabilityProfile, now: chrono::DateTime<Utc>) -> bool {
@@ -490,6 +529,48 @@ impl Worker {
         self.deps.autonomy_tool_routing_v2
     }
 
+    fn autonomy_smart_rules_enabled(&self) -> bool {
+        self.deps.autonomy_smart_rules_enabled
+    }
+
+    fn autonomy_smart_rules_empty_plan_recovery(&self) -> bool {
+        self.deps.autonomy_smart_rules_empty_plan_recovery
+    }
+
+    fn smart_rules_proactive_min_samples(&self) -> i64 {
+        if self.autonomy_smart_rules_enabled() {
+            self.deps.autonomy_smart_rules_proactive_min_samples.max(1)
+        } else {
+            PROACTIVE_ROUTE_MIN_SAMPLES
+        }
+    }
+
+    fn smart_rules_primary_max_score(&self) -> f32 {
+        if self.autonomy_smart_rules_enabled() {
+            self.deps
+                .autonomy_smart_rules_primary_max_score
+                .clamp(0.0, 1.0)
+        } else {
+            PROACTIVE_ROUTE_PRIMARY_MAX_SCORE
+        }
+    }
+
+    fn smart_rules_proactive_margin(&self) -> f32 {
+        if self.autonomy_smart_rules_enabled() {
+            self.deps.autonomy_smart_rules_proactive_margin.max(0.0)
+        } else {
+            PROACTIVE_ROUTE_SCORE_MARGIN
+        }
+    }
+
+    fn smart_rules_max_fallback_attempts(&self) -> usize {
+        if self.autonomy_smart_rules_enabled() {
+            self.deps.autonomy_smart_rules_max_fallback_attempts
+        } else {
+            SMART_RULES_MAX_FALLBACK_ATTEMPTS
+        }
+    }
+
     async fn build_planner_memory_retrieval_context(
         &self,
         reason_ctx: &ReasoningContext,
@@ -668,7 +749,14 @@ impl Worker {
 
         if let (Some(primary_profile), Some((_, best_fallback_score))) =
             (primary_profile.as_ref(), fallback_scored.first())
-            && should_proactively_reroute(primary_profile, primary_score, *best_fallback_score)
+            && should_proactively_reroute(
+                primary_profile,
+                primary_score,
+                *best_fallback_score,
+                self.smart_rules_proactive_min_samples(),
+                self.smart_rules_primary_max_score(),
+                self.smart_rules_proactive_margin(),
+            )
         {
             let mut ordered = Vec::with_capacity(1 + fallback_scored.len());
             ordered.extend(fallback_scored.iter().map(|(name, _)| name.clone()));
@@ -698,9 +786,14 @@ impl Worker {
         let candidates = self
             .rank_plan_step_tool_candidates(requested_tool_name, routing_user_id.as_deref())
             .await;
+        let max_attempts = if self.autonomy_smart_rules_enabled() {
+            (1usize.saturating_add(self.smart_rules_max_fallback_attempts())).min(candidates.len())
+        } else {
+            candidates.len()
+        };
         let step_call_prefix = format!("plan_{}_{}", self.job_id, step_index);
 
-        for (attempt_idx, candidate_tool) in candidates.iter().enumerate() {
+        for (attempt_idx, candidate_tool) in candidates.iter().take(max_attempts).enumerate() {
             let started_at = Utc::now();
             let started = std::time::Instant::now();
             let result = self.execute_tool(candidate_tool, parameters).await;
@@ -724,7 +817,7 @@ impl Worker {
 
             let should_try_fallback = self.autonomy_tool_routing_v2()
                 && result.is_err()
-                && attempt_idx + 1 < candidates.len()
+                && attempt_idx + 1 < max_attempts
                 && result
                     .as_ref()
                     .err()
@@ -749,6 +842,30 @@ impl Worker {
                 selected_started_at: started_at,
                 selected_elapsed_ms: elapsed_ms,
                 result,
+            };
+        }
+
+        if self.autonomy_smart_rules_enabled()
+            && candidates.len() > max_attempts
+            && max_attempts > 0
+        {
+            let fallback_err: Error = ToolError::ExecutionFailed {
+                name: requested_tool_name.to_string(),
+                reason: format!(
+                    "Smart-rule fallback budget exhausted after {} attempt(s); replanning required",
+                    max_attempts
+                ),
+            }
+            .into();
+            return StepExecutionOutcome {
+                selected_tool_name: candidates
+                    .get(max_attempts - 1)
+                    .cloned()
+                    .unwrap_or_else(|| requested_tool_name.to_string()),
+                selected_attempt_index: max_attempts - 1,
+                selected_started_at: Utc::now(),
+                selected_elapsed_ms: 0,
+                result: Err(fallback_err),
             };
         }
 
@@ -1395,7 +1512,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             )
             .await
             {
-                Ok(planner_out) => {
+                Ok(PlannerOutcome::Ready(planner_out)) => {
                     let crate::agent::planner_v1::PlannerOutput {
                         action_plan: p,
                         plan_trace_summary,
@@ -1437,6 +1554,31 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     }
 
                     Some((p, persisted_plan))
+                }
+                Ok(PlannerOutcome::NeedsClarification {
+                    reason,
+                    suggested_next_actions,
+                }) => {
+                    let guidance = format_clarification_guidance(&reason, &suggested_next_actions);
+                    tracing::warn!(
+                        job = %self.job_id,
+                        reason = %reason,
+                        "Planning requires clarification"
+                    );
+                    reason_ctx
+                        .messages
+                        .push(ChatMessage::assistant(guidance.clone()));
+                    if self.autonomy_smart_rules_enabled()
+                        && self.autonomy_smart_rules_empty_plan_recovery()
+                    {
+                        self.mark_stuck(&guidance).await?;
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        job = %self.job_id,
+                        "Smart-rule clarification recovery disabled; falling back to direct selection"
+                    );
+                    None
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1570,10 +1712,32 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                                 return Ok(());
                             }
                         };
-                        let crate::agent::planner_v1::PlannerOutput {
-                            action_plan: next_plan,
-                            plan_trace_summary,
-                        } = planner_out;
+                        let (next_plan, plan_trace_summary) = match planner_out {
+                            PlannerOutcome::Ready(out) => (out.action_plan, out.plan_trace_summary),
+                            PlannerOutcome::NeedsClarification {
+                                reason,
+                                suggested_next_actions,
+                            } => {
+                                let guidance =
+                                    format_clarification_guidance(&reason, &suggested_next_actions);
+                                self.set_goal_status_best_effort(
+                                    previous_persisted.goal_id,
+                                    GoalStatus::Blocked,
+                                )
+                                .await;
+                                self.set_plan_status_best_effort(
+                                    previous_persisted.plan_id,
+                                    PlanStatus::Failed,
+                                )
+                                .await;
+                                self.mark_stuck(&format!(
+                                    "Automatic replanning needs clarification after {} attempt(s): {}",
+                                    replan_state.replans_attempted, guidance
+                                ))
+                                .await?;
+                                return Ok(());
+                            }
+                        };
 
                         tracing::info!(
                             job = %self.job_id,
@@ -1678,6 +1842,23 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                         // (not tool output) can trigger this.
                         if crate::util::llm_signals_completion(&response) {
                             self.mark_completed().await?;
+                            return Ok(());
+                        }
+
+                        if self.autonomy_smart_rules_enabled()
+                            && self.autonomy_smart_rules_empty_plan_recovery()
+                            && looks_like_non_actionable_response(&response)
+                        {
+                            let clarification = format!(
+                                "Execution paused because the model reported no actionable task.\n\
+Reason: {}\n\
+Suggested next steps:\n\
+- Restate the exact outcome you want for this job.\n\
+- Mention specific files, tools, or constraints.\n\
+- Confirm whether TitanClaw should execute immediately or ask before risky steps.",
+                                response.trim()
+                            );
+                            self.mark_stuck(&clarification).await?;
                             return Ok(());
                         }
 
@@ -2321,13 +2502,13 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 confidence: if step_succeeded { 0.95 } else { 0.8 },
                 payload: {
                     let mut payload = step_payload;
-                    if let Some(command_hint) = evidence_class.command_hint {
-                        if let Some(map) = payload.as_object_mut() {
-                            map.insert(
-                                "verifier_command_hint".to_string(),
-                                serde_json::json!(command_hint),
-                            );
-                        }
+                    if let Some(command_hint) = evidence_class.command_hint
+                        && let Some(map) = payload.as_object_mut()
+                    {
+                        map.insert(
+                            "verifier_command_hint".to_string(),
+                            serde_json::json!(command_hint),
+                        );
                     }
                     payload
                 },
@@ -2787,6 +2968,7 @@ mod tests {
     use super::{
         PersistedPlanRun, PlanExecutionOutcome, ReplanReason, Worker, WorkerDeps,
         classify_replan_reason_for_step_error, classify_step_evidence, contract_routing_bonus,
+        format_clarification_guidance, looks_like_non_actionable_response,
         merge_fallback_candidates, parse_contract_fallback_tools, parse_profile_fallback_tools,
         should_proactively_reroute,
     };
@@ -2963,7 +3145,7 @@ mod tests {
         );
         let merged = merge_fallback_candidates(
             "missing_tool",
-            &vec!["noop_tool".to_string(), "memory_search".to_string()],
+            &["noop_tool".to_string(), "memory_search".to_string()],
             &from_contract,
         );
         assert_eq!(
@@ -3044,7 +3226,32 @@ mod tests {
             last_success_at: None,
             updated_at: now,
         };
-        assert!(should_proactively_reroute(&profile, 0.2, 0.5));
+        assert!(should_proactively_reroute(
+            &profile, 0.2, 0.5, 5, 0.35, 0.15
+        ));
+    }
+
+    #[test]
+    fn test_worker_non_actionable_detection_and_guidance_format() {
+        assert!(looks_like_non_actionable_response(
+            "There is no task to execute yet."
+        ));
+        assert!(looks_like_non_actionable_response(
+            "I need a specific task before running tools."
+        ));
+        assert!(!looks_like_non_actionable_response(
+            "Running build and tests now."
+        ));
+
+        let guidance = format_clarification_guidance(
+            "Planner returned no actionable steps",
+            &[
+                "Restate the desired outcome".to_string(),
+                "Mention target files".to_string(),
+            ],
+        );
+        assert!(guidance.contains("Planner needs clarification"));
+        assert!(guidance.contains("Restate the desired outcome"));
     }
 
     struct NoopTool;
@@ -3331,6 +3538,12 @@ mod tests {
                 autonomy_tool_routing_v2: false,
                 autonomy_memory_plane_v2: true,
                 autonomy_memory_retrieval_v2: false,
+                autonomy_smart_rules_enabled: true,
+                autonomy_smart_rules_proactive_min_samples: 5,
+                autonomy_smart_rules_primary_max_score: 0.35,
+                autonomy_smart_rules_proactive_margin: 0.15,
+                autonomy_smart_rules_max_fallback_attempts: 2,
+                autonomy_smart_rules_empty_plan_recovery: true,
             },
         );
 
@@ -3463,7 +3676,7 @@ mod tests {
             verifications[0].status,
             crate::agent::PlanVerificationStatus::Inconclusive
         );
-        assert_eq!(verifications[0].completion_claimed, true);
+        assert!(verifications[0].completion_claimed);
 
         let memory_rows = wait_for_memory_records_for_user(harness.db.as_ref(), "user-1", 3).await;
         assert!(
@@ -3566,6 +3779,12 @@ mod tests {
                 autonomy_tool_routing_v2: false,
                 autonomy_memory_plane_v2: false,
                 autonomy_memory_retrieval_v2: false,
+                autonomy_smart_rules_enabled: true,
+                autonomy_smart_rules_proactive_min_samples: 5,
+                autonomy_smart_rules_primary_max_score: 0.35,
+                autonomy_smart_rules_proactive_margin: 0.15,
+                autonomy_smart_rules_max_fallback_attempts: 2,
+                autonomy_smart_rules_empty_plan_recovery: true,
             },
         );
 
@@ -3780,6 +3999,12 @@ mod tests {
                 autonomy_tool_routing_v2: true,
                 autonomy_memory_plane_v2: false,
                 autonomy_memory_retrieval_v2: false,
+                autonomy_smart_rules_enabled: true,
+                autonomy_smart_rules_proactive_min_samples: 5,
+                autonomy_smart_rules_primary_max_score: 0.35,
+                autonomy_smart_rules_proactive_margin: 0.15,
+                autonomy_smart_rules_max_fallback_attempts: 2,
+                autonomy_smart_rules_empty_plan_recovery: true,
             },
         );
 
@@ -3914,6 +4139,12 @@ mod tests {
                 autonomy_tool_routing_v2: true,
                 autonomy_memory_plane_v2: false,
                 autonomy_memory_retrieval_v2: false,
+                autonomy_smart_rules_enabled: true,
+                autonomy_smart_rules_proactive_min_samples: 5,
+                autonomy_smart_rules_primary_max_score: 0.35,
+                autonomy_smart_rules_proactive_margin: 0.15,
+                autonomy_smart_rules_max_fallback_attempts: 2,
+                autonomy_smart_rules_empty_plan_recovery: true,
             },
         );
 
@@ -4066,6 +4297,12 @@ mod tests {
                 autonomy_tool_routing_v2: true,
                 autonomy_memory_plane_v2: false,
                 autonomy_memory_retrieval_v2: false,
+                autonomy_smart_rules_enabled: true,
+                autonomy_smart_rules_proactive_min_samples: 5,
+                autonomy_smart_rules_primary_max_score: 0.35,
+                autonomy_smart_rules_proactive_margin: 0.15,
+                autonomy_smart_rules_max_fallback_attempts: 2,
+                autonomy_smart_rules_empty_plan_recovery: true,
             },
         );
 
@@ -4158,6 +4395,12 @@ mod tests {
             autonomy_tool_routing_v2: false,
             autonomy_memory_plane_v2: false,
             autonomy_memory_retrieval_v2: false,
+            autonomy_smart_rules_enabled: true,
+            autonomy_smart_rules_proactive_min_samples: 5,
+            autonomy_smart_rules_primary_max_score: 0.35,
+            autonomy_smart_rules_proactive_margin: 0.15,
+            autonomy_smart_rules_max_fallback_attempts: 2,
+            autonomy_smart_rules_empty_plan_recovery: true,
         };
 
         let err =
@@ -4313,6 +4556,12 @@ mod tests {
             autonomy_tool_routing_v2: true,
             autonomy_memory_plane_v2: false,
             autonomy_memory_retrieval_v2: false,
+            autonomy_smart_rules_enabled: true,
+            autonomy_smart_rules_proactive_min_samples: 5,
+            autonomy_smart_rules_primary_max_score: 0.35,
+            autonomy_smart_rules_proactive_margin: 0.15,
+            autonomy_smart_rules_max_fallback_attempts: 2,
+            autonomy_smart_rules_empty_plan_recovery: true,
         };
 
         let err = Worker::execute_tool_inner(&deps, job_id, "noop_tool", &serde_json::json!({}))
@@ -4458,6 +4707,12 @@ mod tests {
             autonomy_tool_routing_v2: false,
             autonomy_memory_plane_v2: false,
             autonomy_memory_retrieval_v2: false,
+            autonomy_smart_rules_enabled: true,
+            autonomy_smart_rules_proactive_min_samples: 5,
+            autonomy_smart_rules_primary_max_score: 0.35,
+            autonomy_smart_rules_proactive_margin: 0.15,
+            autonomy_smart_rules_max_fallback_attempts: 2,
+            autonomy_smart_rules_empty_plan_recovery: true,
         };
 
         let err = Worker::execute_tool_inner(&deps, job_id, "noop_tool", &serde_json::json!({}))
