@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Smart Rules v1 runtime knobs (default-on) via `AUTONOMY_SMART_RULES_*`: enable switch, proactive fallback thresholds, fallback-attempt budget, and empty-plan recovery toggle.
 - Planner clarification outcome path: empty/low-action plans now produce explicit clarification guidance with suggested next steps instead of opaque hard-stop errors.
+- Gateway readiness endpoint `GET /api/ready` with dependency checks (`message_pipeline`, `database_store`, `session_manager`) and `ready`/`degraded` status.
+- Production deployment templates now include loopback-bound reverse-proxy baseline via `deploy/nginx.titanclaw.conf.example`.
 
 ### Changed
 
@@ -23,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sandbox jobs now register runtime context immediately so `job_status`, `job_events`, and `job_prompt` work in the same session, sandbox DB writes are awaited instead of fire-and-forget, and waited jobs use a short persisted-terminal grace window before failing when structured completion lands slightly after the container stops.
 - Approval prompts now include clearer policy notes for high-impact actions where explicit per-call approval remains required even if session-level “Always approved” was selected.
 - Approval/thread flow is stricter and more consistent: hook-mutated params are re-approved before execution (including approval resume even when autonomy telemetry flags are off), pending approvals now close/persist on timeout or interrupt, expired approval waits are cleared before history controls or malformed approval retries can leave them stuck, gateway/web approvals require request IDs, auth completion/retry events preserve the active thread when clients omit `thread_id`, and approval/job/auth cards are thread-scoped and deduped on replay.
+- Worker autonomous tool execution now re-runs approval preflight after hook parameter mutation (`tool_call_post_hook_preflight`) so hook rewrites cannot bypass high-impact contract approval requirements.
+- `/clear` now clears pending approval state atomically instead of only resetting thread state.
+- Direct shell execution now drains stdout/stderr concurrently during process execution, removing a large-output deadlock class.
+- WebSocket approval submissions now return explicit `Channel not started` / `Channel closed` errors instead of silently dropping failed sends.
+- Auth thread resolution now validates explicit thread UUIDs before apply/clear operations and falls back to active thread on malformed IDs.
+- `jit_wasm_run` now always requires explicit approval and registration is explicit opt-in (`JIT_WASM_ENABLED=true`, requires `ALLOW_LOCAL_TOOLS=true`).
+- Deployment service template now enforces pinned image configuration via `/opt/ironclaw/service.env`, drops host networking in favor of loopback publish, and setup now verifies Cloud SQL proxy SHA256 before install.
 
 ## [1.1.2] - 2026-03-02
 

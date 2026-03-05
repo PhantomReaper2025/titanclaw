@@ -658,6 +658,19 @@ pub struct HealthResponse {
     pub channel: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ReadinessChecks {
+    pub message_pipeline: bool,
+    pub database_store: bool,
+    pub session_manager: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReadinessResponse {
+    pub status: &'static str,
+    pub checks: ReadinessChecks,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

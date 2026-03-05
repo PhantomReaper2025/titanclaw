@@ -245,4 +245,8 @@ impl Tool for JitWasmTool {
     fn requires_sanitization(&self) -> bool {
         true
     }
+
+    fn requires_approval(&self) -> bool {
+        true
+    }
 }

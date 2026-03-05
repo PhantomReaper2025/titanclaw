@@ -186,7 +186,9 @@ pub async fn start_server(
             })?;
 
     // Public routes (no auth)
-    let public = Router::new().route("/api/health", get(health_handler));
+    let public = Router::new()
+        .route("/api/health", get(health_handler))
+        .route("/api/ready", get(readiness_handler));
 
     // Protected routes (require auth)
     let auth_state = AuthState { token: auth_token };
@@ -766,6 +768,21 @@ async fn health_handler() -> Json<HealthResponse> {
     })
 }
 
+async fn readiness_handler(State(state): State<Arc<GatewayState>>) -> Json<ReadinessResponse> {
+    let message_pipeline = state.msg_tx.read().await.as_ref().is_some();
+    let checks = ReadinessChecks {
+        message_pipeline,
+        database_store: state.store.is_some(),
+        session_manager: state.session_manager.is_some(),
+    };
+    let status = if checks.message_pipeline && checks.database_store && checks.session_manager {
+        "ready"
+    } else {
+        "degraded"
+    };
+    Json(ReadinessResponse { status, checks })
+}
+
 // --- Kernel patch management handlers ---
 
 async fn kernel_patches_handler(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
@@ -911,8 +928,14 @@ pub async fn resolve_auth_thread_id(
     state: &GatewayState,
     requested_thread_id: Option<&str>,
 ) -> Option<String> {
-    if let Some(thread_id) = requested_thread_id {
-        return Some(thread_id.to_string());
+    if let Some(raw_thread_id) = requested_thread_id {
+        if let Ok(thread_id) = Uuid::parse_str(raw_thread_id) {
+            return Some(thread_id.to_string());
+        }
+        tracing::warn!(
+            thread_id = %raw_thread_id,
+            "Ignoring invalid auth thread_id; falling back to active thread"
+        );
     }
 
     let sm = state.session_manager.as_ref()?;
@@ -926,9 +949,16 @@ pub async fn clear_auth_mode(state: &GatewayState, requested_thread_id: Option<&
     if let Some(ref sm) = state.session_manager {
         let session = sm.get_or_create_session(&state.user_id).await;
         let mut sess = session.lock().await;
-        let target_thread_id = requested_thread_id
-            .and_then(|raw| Uuid::parse_str(raw).ok())
-            .or(sess.active_thread);
+        let target_thread_id = requested_thread_id.and_then(|raw| match Uuid::parse_str(raw) {
+            Ok(thread_id) => Some(thread_id),
+            Err(_) => {
+                tracing::warn!(
+                    thread_id = %raw,
+                    "Ignoring invalid auth thread_id during clear; falling back to active thread"
+                );
+                None
+            }
+        }).or(sess.active_thread);
         if let Some(thread_id) = target_thread_id
             && let Some(thread) = sess.threads.get_mut(&thread_id)
         {
@@ -4993,6 +5023,27 @@ mod tests {
         let requested_thread_id = Uuid::new_v4();
         let resolved = resolve_auth_thread_id(&state, Some(&requested_thread_id.to_string())).await;
         let expected_thread_id = requested_thread_id.to_string();
+        assert_eq!(resolved.as_deref(), Some(expected_thread_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_auth_thread_id_invalid_request_falls_back_to_active() {
+        let (_dir, store) = make_test_store().await;
+        let session_manager = Arc::new(SessionManager::new());
+        let state =
+            make_test_gateway_state_with_session_manager("alice", store, session_manager.clone());
+
+        let active_thread_id = Uuid::new_v4();
+        let session = session_manager.get_or_create_session("alice").await;
+        {
+            let mut sess = session.lock().await;
+            let thread = Thread::with_id(active_thread_id, sess.id);
+            sess.threads.insert(active_thread_id, thread);
+            sess.active_thread = Some(active_thread_id);
+        }
+
+        let resolved = resolve_auth_thread_id(&state, Some("not-a-uuid")).await;
+        let expected_thread_id = active_thread_id.to_string();
         assert_eq!(resolved.as_deref(), Some(expected_thread_id.as_str()));
     }
 

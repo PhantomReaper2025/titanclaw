@@ -1250,7 +1250,7 @@ impl Agent {
             .get_mut(&thread_id)
             .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
         thread.turns.clear();
-        thread.state = ThreadState::Idle;
+        thread.clear_pending_approval();
 
         // Clear undo history too
         let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
@@ -2317,6 +2317,57 @@ mod tests {
         })
         .await
         .expect("timed out waiting for conversation messages")
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_process_clear_clears_pending_approval_state() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let config = AgentConfig::resolve(&Settings::default()).expect("config");
+        let agent = Agent::new(
+            config,
+            harness.deps,
+            ChannelManager::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let session = agent
+            .session_manager
+            .get_or_create_session("clear-user")
+            .await;
+        let thread_id = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("Please run shell");
+            thread.record_tool_call("call-clear", "shell", json!({"command":"echo hi"}));
+            thread.await_approval(crate::agent::PendingApproval {
+                request_id: Uuid::new_v4(),
+                tool_name: "shell".to_string(),
+                parameters: json!({"command":"echo hi"}),
+                description: "Run shell".to_string(),
+                tool_call_id: "call-clear".to_string(),
+                context_messages: vec![ChatMessage::user("Please run shell")],
+            });
+            thread.id
+        };
+
+        let out = agent
+            .process_clear(session.clone(), thread_id)
+            .await
+            .expect("process clear");
+        assert!(matches!(
+            out,
+            crate::agent::submission::SubmissionResult::Ok { .. }
+        ));
+
+        let sess = session.lock().await;
+        let thread = sess.threads.get(&thread_id).expect("thread");
+        assert_eq!(thread.state, ThreadState::Idle);
+        assert!(thread.pending_approval.is_none());
+        assert!(thread.turns.is_empty());
     }
 
     #[cfg(feature = "libsql")]

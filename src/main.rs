@@ -861,8 +861,23 @@ async fn main() -> anyhow::Result<()> {
             None
         };
 
+    let jit_wasm_enabled = std::env::var("JIT_WASM_ENABLED")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
     if let Some(ref runtime) = wasm_tool_runtime {
-        tools.register_jit_tool(Arc::clone(runtime));
+        if config.agent.allow_local_tools && jit_wasm_enabled {
+            tools.register_jit_tool(Arc::clone(runtime));
+        } else if config.agent.allow_local_tools {
+            tracing::info!("JIT WASM tool disabled (set JIT_WASM_ENABLED=true to enable)");
+        } else if jit_wasm_enabled {
+            tracing::warn!("Ignoring JIT_WASM_ENABLED=true because ALLOW_LOCAL_TOOLS is false");
+        }
     }
 
     // Load WASM tools and MCP servers concurrently.

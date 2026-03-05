@@ -111,6 +111,10 @@ Based on `implementation_plan.md`, this is where the upgrade stands today.
 - Chat `create_job` orchestration is now async-first when `wait` is omitted, emits `job_started` updates with project directory context when available, and uses clearer high-impact approval notes when explicit per-call approval is still required
 - Sandbox job follow-up tools now work immediately after `create_job`: runtime job context is registered up front for `job_status`, `job_events`, and `job_prompt`, sandbox DB status writes are awaited, and waited jobs only succeed when completion is explicitly confirmed or a short persisted-terminal grace window resolves the final state
 - Approval/thread UX is stricter and less cross-thread fragile: hook-mutated params are re-approved before execution even if autonomy telemetry flags are off, pending approvals close and persist on timeout/interrupt, expired approval waits are cleared before history controls or malformed retries can leave them stuck, gateway/web approvals require request IDs, auth completion/retry events fall back to the active thread when needed, and approval/job/auth cards are filtered by thread and deduped on replay
+- Worker runtime now re-checks approval policy after hook parameter mutation (`tool_call_post_hook_preflight`) so hook rewrites cannot bypass high-impact contract gating
+- Direct shell execution now drains stdout/stderr concurrently during process execution to avoid large-output pipe deadlocks
+- Web gateway now exposes `GET /api/ready` with dependency checks (`message_pipeline`, `database_store`, `session_manager`) and `ready`/`degraded` status
+- `jit_wasm_run` now always requires explicit approval and is disabled by default unless `JIT_WASM_ENABLED=true` (and `ALLOW_LOCAL_TOOLS=true`)
 - `agent_jobs` autonomy linkage persistence (`autonomy_goal_id` / `autonomy_plan_id` / `autonomy_plan_step_id`) across Postgres/libSQL for restart-safe record correlation
 - User-scoped web goal/plan APIs for autonomy inspection + creation + status updates/reprioritization (list endpoints support optional `status`, `sort`, `offset`, and `limit` query params, including goal-scoped plan lists; examples: `GET /api/goals?status=active&sort=priority_desc&offset=0&limit=20`, `GET /api/plans?goal_id=...&status=ready&sort=revision_desc&offset=0&limit=10`, `GET /api/goals/{id}/plans?status=ready&sort=revision_desc&offset=0&limit=10`) plus detail/lifecycle endpoints (`GET /api/goals/{id}`, `GET /api/goals/{id}/plans`, `GET /api/plans/{id}`, `POST /api/goals`, `POST /api/plans`, `POST /api/goals/{id}/status`, `POST /api/goals/{id}/priority`, `POST /api/goals/{id}/cancel`, `POST /api/goals/{id}/complete`, `POST /api/goals/{id}/abandon`, `POST /api/plans/{id}/status`, `POST /api/plans/{id}/cancel`, `POST /api/plans/{id}/complete`, `POST /api/plans/{id}/supersede`)
 - User-scoped web plan-step APIs for autonomy execution structure management (`GET/POST /api/plans/{id}/steps`, `POST /api/plans/{id}/steps/replace`, `GET /api/plan-steps/{id}`, `POST /api/plan-steps/{id}/status`)
@@ -212,6 +216,8 @@ Advanced runtime knobs:
 - `AUTONOMY_SMART_RULES_PROACTIVE_MARGIN` (default `0.15`)
 - `AUTONOMY_SMART_RULES_MAX_FALLBACK_ATTEMPTS` (default `2`)
 - `AUTONOMY_SMART_RULES_EMPTY_PLAN_RECOVERY` (`true`/`false`, default `true`)
+- `ALLOW_LOCAL_TOOLS` (`true`/`false`, default `false`)
+- `JIT_WASM_ENABLED` (`true`/`false`, default `false`, requires `ALLOW_LOCAL_TOOLS=true`)
 
 Profile synthesis writes only managed sections (marker-delimited blocks) in the core docs and preserves any manual content you maintain outside those blocks.
 
@@ -249,6 +255,13 @@ Kernel patch management interfaces:
 ```
 
 On startup, TitanClaw now safely refreshes core workspace docs (`AGENTS.md`, `IDENTITY.md`, `SOUL.md`, `USER.md`, `MEMORY.md`, `HEARTBEAT.md`, `README.md`) when they are missing, legacy, or managed-and-outdated.
+
+### Production Deployment Baseline
+
+- Use an immutable image digest in `/opt/ironclaw/service.env` via `TITANCLAW_IMAGE=...@sha256:...` (do not use `:latest`).
+- Keep TitanClaw bound to loopback (`127.0.0.1`) at the Docker publish layer and front it with TLS reverse proxy.
+- Use `deploy/nginx.titanclaw.conf.example` as a starting point for proxying `https://...` to `http://127.0.0.1:3000`.
+- Bootstrap now requires `CLOUD_SQL_PROXY_SHA256` during setup and verifies the Cloud SQL proxy binary before install.
 
 ### Swarm Mesh (Experimental)
 

@@ -24,8 +24,16 @@ systemctl enable docker
 systemctl start docker
 
 echo "==> Installing Cloud SQL Auth Proxy"
+CLOUD_SQL_PROXY_VERSION="${CLOUD_SQL_PROXY_VERSION:-v2.14.3}"
+CLOUD_SQL_PROXY_SHA256="${CLOUD_SQL_PROXY_SHA256:-}"
+if [ -z "$CLOUD_SQL_PROXY_SHA256" ]; then
+  echo "ERROR: CLOUD_SQL_PROXY_SHA256 is required for supply-chain verification."
+  echo "Set it to the published SHA256 for cloud-sql-proxy ${CLOUD_SQL_PROXY_VERSION} and re-run."
+  exit 1
+fi
 curl -fsSL -o /usr/local/bin/cloud-sql-proxy \
-  https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.14.3/cloud-sql-proxy.linux.amd64
+  "https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/${CLOUD_SQL_PROXY_VERSION}/cloud-sql-proxy.linux.amd64"
+echo "${CLOUD_SQL_PROXY_SHA256}  /usr/local/bin/cloud-sql-proxy" | sha256sum -c -
 chmod +x /usr/local/bin/cloud-sql-proxy
 
 echo "==> Installing systemd services"
@@ -46,6 +54,17 @@ echo "==> Creating config directory"
 # before dropping to uid 1000 (ironclaw) inside the container.
 mkdir -p /opt/ironclaw
 chmod 700 /opt/ironclaw
+
+if [ ! -f /opt/ironclaw/service.env ]; then
+  cat >/opt/ironclaw/service.env <<'EOF'
+# Pin to an immutable digest before enabling the service.
+TITANCLAW_IMAGE=us-central1-docker.pkg.dev/ironclaw-prod/ironclaw/agent@sha256:CHANGE_ME
+# Host loopback port for reverse-proxy upstream forwarding.
+TITANCLAW_HOST_PORT=3000
+EOF
+  chmod 600 /opt/ironclaw/service.env
+  echo "Created /opt/ironclaw/service.env (update TITANCLAW_IMAGE digest before start)."
+fi
 
 if [ ! -f /opt/ironclaw/.env ]; then
   echo "WARNING: /opt/ironclaw/.env does not exist."

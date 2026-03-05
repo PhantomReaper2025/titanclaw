@@ -150,7 +150,7 @@ fn infer_side_effect_level(
         }
         "create_job" | "cancel_job" | "tool_install" | "tool_remove" | "tool_activate"
         | "skill_install" | "skill_remove" => ToolSideEffectLevel::SystemMutation,
-        "http" | "tool_auth" => ToolSideEffectLevel::ExternalMutation,
+        "http" | "tool_auth" | "jit_wasm_run" => ToolSideEffectLevel::ExternalMutation,
         "memory_write" => ToolSideEffectLevel::WorkspaceWrite,
         _ if requires_approval => ToolSideEffectLevel::ExternalMutation,
         _ => match domain {

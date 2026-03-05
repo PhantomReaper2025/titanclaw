@@ -61,7 +61,7 @@ function clearApprovalCardError(card) {
   }
 }
 
-function markApprovalCardResolved(card, action) {
+function markApprovalCardSubmitted(card, action) {
   if (!card) return;
   clearApprovalCardError(card);
   setApprovalCardButtonsDisabled(card, true);
@@ -76,10 +76,10 @@ function markApprovalCardResolved(card, action) {
   const label = document.createElement('span');
   label.className = 'approval-resolved';
   const labelText = action === 'approve'
-    ? 'Approved'
+    ? 'Approval sent'
     : action === 'always'
-      ? 'Always approved (when policy allows)'
-      : 'Denied';
+      ? 'Always-approve request sent'
+      : 'Deny request sent';
   label.textContent = labelText;
   actions.appendChild(label);
 }
@@ -97,7 +97,7 @@ function sendApprovalAction(requestId, action) {
     method: 'POST',
     body: { request_id: requestId, action: action, thread_id: approvalThreadId || undefined },
   }).then(() => {
-    markApprovalCardResolved(card, action);
+    markApprovalCardSubmitted(card, action);
   }).catch((err) => {
     setApprovalCardButtonsDisabled(card, false);
     if (card) {

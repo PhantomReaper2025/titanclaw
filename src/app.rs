@@ -683,12 +683,25 @@ impl AppBuilder {
         if self.config.agent.allow_local_tools {
             tools.register_dev_tools();
 
-            if let Some(ref runtime) = wasm_tool_runtime {
+            let jit_wasm_enabled = std::env::var("JIT_WASM_ENABLED")
+                .ok()
+                .map(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false);
+            if let Some(ref runtime) = wasm_tool_runtime
+                && jit_wasm_enabled
+            {
                 tools.register_jit_tool(Arc::clone(runtime));
+            } else {
+                tracing::info!("JIT WASM tool disabled (set JIT_WASM_ENABLED=true to enable)");
             }
 
             tracing::info!(
-                "Local tools enabled (allow_local_tools=true), dev tools and JIT tools registered directly"
+                "Local tools enabled (allow_local_tools=true), dev tools registered directly"
             );
         }
 

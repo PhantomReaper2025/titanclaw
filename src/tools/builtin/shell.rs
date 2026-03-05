@@ -509,25 +509,38 @@ impl ShellTool {
             .spawn()
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to spawn command: {}", e)))?;
 
+        // Drain both pipes concurrently while the process is running. Waiting for
+        // exit before reading can deadlock on large output when pipe buffers fill.
+        let mut stdout_handle = child
+            .stdout
+            .take()
+            .map(|out| tokio::spawn(read_stream_with_limit(out, MAX_OUTPUT_SIZE)));
+        let mut stderr_handle = child
+            .stderr
+            .take()
+            .map(|err| tokio::spawn(read_stream_with_limit(err, MAX_OUTPUT_SIZE)));
+
         // Wait with timeout
         let result = tokio::time::timeout(timeout, async {
             let status = child.wait().await?;
 
-            // Read stdout
-            let mut stdout = String::new();
-            if let Some(mut out) = child.stdout.take() {
-                let mut buf = vec![0u8; MAX_OUTPUT_SIZE];
-                let n = out.read(&mut buf).await.unwrap_or(0);
-                stdout = String::from_utf8_lossy(&buf[..n]).to_string();
-            }
+            let stdout = if let Some(handle) = stdout_handle.take() {
+                let (bytes, truncated) = handle.await.map_err(|e| {
+                    std::io::Error::other(format!("stdout reader join error: {}", e))
+                })??;
+                decode_limited_stream(bytes, truncated)
+            } else {
+                String::new()
+            };
 
-            // Read stderr
-            let mut stderr = String::new();
-            if let Some(mut err) = child.stderr.take() {
-                let mut buf = vec![0u8; MAX_OUTPUT_SIZE];
-                let n = err.read(&mut buf).await.unwrap_or(0);
-                stderr = String::from_utf8_lossy(&buf[..n]).to_string();
-            }
+            let stderr = if let Some(handle) = stderr_handle.take() {
+                let (bytes, truncated) = handle.await.map_err(|e| {
+                    std::io::Error::other(format!("stderr reader join error: {}", e))
+                })??;
+                decode_limited_stream(bytes, truncated)
+            } else {
+                String::new()
+            };
 
             // Combine output
             let output = if stderr.is_empty() {
@@ -551,6 +564,12 @@ impl ShellTool {
             Err(_) => {
                 // Timeout - try to kill the process
                 let _ = child.kill().await;
+                if let Some(handle) = stdout_handle.take() {
+                    handle.abort();
+                }
+                if let Some(handle) = stderr_handle.take() {
+                    handle.abort();
+                }
                 Err(ToolError::Timeout(timeout))
             }
         }
@@ -780,6 +799,40 @@ fn truncate_for_error(s: &str) -> String {
     }
 }
 
+async fn read_stream_with_limit<R>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = vec![0u8; 8192];
+    let mut captured = Vec::with_capacity(limit.min(8192));
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buf).await?;
+        if read == 0 {
+            break;
+        }
+        if captured.len() < limit {
+            let remaining = limit - captured.len();
+            let take = remaining.min(read);
+            captured.extend_from_slice(&buf[..take]);
+            if take < read {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+    }
+    Ok((captured, truncated))
+}
+
+fn decode_limited_stream(bytes: Vec<u8>, truncated: bool) -> String {
+    let mut text = String::from_utf8_lossy(&bytes).to_string();
+    if truncated {
+        text.push_str("\n\n... [stream output truncated] ...");
+    }
+    text
+}
+
 async fn execute_direct_with_streaming(
     cmd: &str,
     workdir: &PathBuf,
@@ -905,6 +958,31 @@ mod tests {
         let output = result.result.get("output").unwrap().as_str().unwrap();
         assert!(output.contains("hello"));
         assert_eq!(result.result.get("exit_code").unwrap().as_i64().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_large_output_command_does_not_deadlock() {
+        let tool = ShellTool::new();
+        let ctx = JobContext::default();
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "command": "yes x | head -c 200000",
+                    "timeout": 5
+                }),
+                &ctx,
+            )
+            .await
+            .expect("large output command should complete without deadlock");
+
+        let output = result
+            .result
+            .get("output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(!output.is_empty());
+        assert_eq!(result.result.get("exit_code").unwrap().as_i64(), Some(0));
     }
 
     #[test]

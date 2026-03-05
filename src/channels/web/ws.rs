@@ -235,7 +235,19 @@ async fn handle_client_message(
             }
             let tx_guard = state.msg_tx.read().await;
             if let Some(ref tx) = *tx_guard {
-                let _ = tx.send(msg).await;
+                if tx.send(msg).await.is_err() {
+                    let _ = direct_tx
+                        .send(WsServerMessage::Error {
+                            message: "Channel closed".to_string(),
+                        })
+                        .await;
+                }
+            } else {
+                let _ = direct_tx
+                    .send(WsServerMessage::Error {
+                        message: "Channel not started".to_string(),
+                    })
+                    .await;
             }
         }
         WsClientMessage::AuthToken {
@@ -473,6 +485,60 @@ mod tests {
         match response {
             WsServerMessage::Error { message } => {
                 assert!(message.contains("Invalid request_id"));
+            }
+            _ => panic!("Expected Error variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_client_approval_no_channel_reports_error() {
+        let state = make_test_state(None).await;
+        let (direct_tx, mut direct_rx) = mpsc::channel(16);
+
+        handle_client_message(
+            WsClientMessage::Approval {
+                request_id: Uuid::new_v4().to_string(),
+                action: "approve".to_string(),
+                thread_id: None,
+            },
+            &state,
+            "user1",
+            &direct_tx,
+        )
+        .await;
+
+        let response = direct_rx.recv().await.unwrap();
+        match response {
+            WsServerMessage::Error { message } => {
+                assert!(message.contains("not started"));
+            }
+            _ => panic!("Expected Error variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_client_approval_closed_channel_reports_error() {
+        let (agent_tx, agent_rx) = mpsc::channel(1);
+        drop(agent_rx);
+        let state = make_test_state(Some(agent_tx)).await;
+        let (direct_tx, mut direct_rx) = mpsc::channel(16);
+
+        handle_client_message(
+            WsClientMessage::Approval {
+                request_id: Uuid::new_v4().to_string(),
+                action: "approve".to_string(),
+                thread_id: None,
+            },
+            &state,
+            "user1",
+            &direct_tx,
+        )
+        .await;
+
+        let response = direct_rx.recv().await.unwrap();
+        match response {
+            WsServerMessage::Error { message } => {
+                assert!(message.contains("Channel closed"));
             }
             _ => panic!("Expected Error variant"),
         }

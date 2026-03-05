@@ -5,13 +5,14 @@ Requires=cloud-sql-proxy.service
 
 [Service]
 Type=simple
-ExecStartPre=/usr/bin/docker pull us-central1-docker.pkg.dev/ironclaw-prod/ironclaw/agent:latest
-ExecStart=/usr/bin/docker run --rm \
+EnvironmentFile=-/opt/ironclaw/service.env
+ExecStartPre=-/usr/bin/docker rm -f ironclaw
+ExecStart=/usr/bin/bash -lc '/usr/bin/docker run --rm \
   --name ironclaw \
   --env-file /opt/ironclaw/.env \
-  --network=host \
-  us-central1-docker.pkg.dev/ironclaw-prod/ironclaw/agent:latest \
-  --no-onboard
+  --publish 127.0.0.1:${TITANCLAW_HOST_PORT:-3000}:3000 \
+  ${TITANCLAW_IMAGE:?set TITANCLAW_IMAGE in /opt/ironclaw/service.env} \
+  --no-onboard'
 ExecStop=/usr/bin/docker stop ironclaw
 Restart=always
 RestartSec=10

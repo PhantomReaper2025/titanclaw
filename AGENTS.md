@@ -77,7 +77,17 @@ When behavior changes, keep these docs aligned in the same branch:
   - `approval_needed`, `job_started`, `auth_required`, and `auth_completed` SSE events now carry thread context for gateway chat filtering
   - gateway/web auth token submission now resolves the active thread when `thread_id` is omitted, so auth completion/retry events still return to the owning thread
   - web auth cards are keyed by extension plus thread, avoiding cross-thread removal when the same extension requests auth in multiple chats
-  - approval cards submit the owning thread ID and only mark themselves resolved after the approval request is accepted
+  - approval cards submit the owning thread ID and are marked as submitted (not terminally resolved) until backend outcome events arrive
+  - web socket approval submissions now emit explicit `Channel not started` / `Channel closed` errors instead of silently dropping failed sends
+- Worker tool-call policy hardening:
+  - worker now re-runs approval preflight after hook-based parameter mutation so rewritten params cannot bypass approval-required policy
+- Shell execution reliability:
+  - direct shell execution now drains stdout/stderr concurrently while the process runs to avoid deadlocks on large output
+- Web gateway readiness contract:
+  - gateway now exposes `GET /api/ready` with dependency checks (`message_pipeline`, `database_store`, `session_manager`) and returns `ready` vs `degraded`
+- JIT tool production safety:
+  - `jit_wasm_run` now always requires explicit approval
+  - JIT tool registration is now explicit opt-in via `JIT_WASM_ENABLED=true` and still requires `ALLOW_LOCAL_TOOLS=true`
 - Autonomy Control Plane v1 groundwork (internal persistence):
   - versioned autonomy domain types and dual-backend (PostgreSQL/libSQL) autonomy tables exist for goals/plans/plan steps/execution attempts/policy decisions/incidents/plan verifications
   - worker planned executions and dispatcher approval/tool-attempt paths now best-effort persist internal autonomy records (tracing emitters and approval UX remain unchanged), including worker post-plan verification outcomes for persisted plans with richer per-step checks/evidence and coverage for early completion-path exits

@@ -2105,6 +2105,32 @@ Suggested next steps:\n\
                 .into());
             }
         };
+
+        // Re-run approval policy after hook mutation so rewritten parameters
+        // cannot bypass worker preflight gates.
+        if let ApprovalPolicyOutcome::RequireApproval { reason_codes } =
+            evaluate_worker_tool_approval(tool.as_ref(), &params, contract_v2.as_ref())
+        {
+            if deps.autonomy_policy_engine_v1 {
+                persist_worker_policy_decision_best_effort(
+                    deps,
+                    &job_ctx,
+                    tool_name,
+                    None,
+                    AutonomyPolicyDecisionKind::RequireApproval,
+                    reason_codes,
+                    true,
+                    Some(false),
+                    "tool_call_post_hook_preflight",
+                    serde_json::json!({}),
+                );
+            }
+            return Err(crate::error::ToolError::AuthRequired {
+                name: tool_name.to_string(),
+            }
+            .into());
+        }
+
         if job_ctx.state == JobState::Cancelled {
             return Err(crate::error::ToolError::ExecutionFailed {
                 name: tool_name.to_string(),
@@ -2951,7 +2977,9 @@ mod tests {
     use crate::config::SafetyConfig;
     use crate::context::{ContextManager, JobState};
     use crate::error::{Error, LlmError, ToolError};
-    use crate::hooks::HookRegistry;
+    use crate::hooks::{
+        Hook, HookContext, HookEvent, HookFailureMode, HookOutcome, HookPoint, HookRegistry,
+    };
     use crate::llm::{
         ActionPlan, CompletionRequest, CompletionResponse, FinishReason, LlmProvider, Reasoning,
         ReasoningContext, ToolCompletionRequest, ToolCompletionResponse, ToolSelection,
@@ -3351,6 +3379,42 @@ mod tests {
                 serde_json::json!({"unexpected": "executed"}),
                 Duration::from_millis(1),
             ))
+        }
+    }
+
+    struct HookMutatesDryRunParams;
+
+    #[async_trait]
+    impl Hook for HookMutatesDryRunParams {
+        fn name(&self) -> &str {
+            "hook_mutates_dry_run_params"
+        }
+
+        fn hook_points(&self) -> &[HookPoint] {
+            static POINTS: [HookPoint; 1] = [HookPoint::BeforeToolCall];
+            &POINTS
+        }
+
+        fn failure_mode(&self) -> HookFailureMode {
+            HookFailureMode::FailClosed
+        }
+
+        fn timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        async fn execute(
+            &self,
+            event: &HookEvent,
+            _ctx: &HookContext,
+        ) -> Result<HookOutcome, crate::hooks::HookError> {
+            match event {
+                HookEvent::ToolCall { .. } => {
+                    // Strip dry-run intent so post-hook policy recheck must gate this call.
+                    Ok(HookOutcome::modify(serde_json::json!({}).to_string()))
+                }
+                _ => Ok(HookOutcome::ok()),
+            }
         }
     }
 
@@ -4757,6 +4821,173 @@ mod tests {
                 .reason_codes
                 .iter()
                 .any(|c| c == "contract_v2_requires_approval_default")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_execute_tool_inner_rechecks_approval_after_hook_param_mutation() {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(NoopTool)).await;
+        let llm: Arc<dyn LlmProvider> = Arc::new(StubLlm::new("unused"));
+        let harness = TestHarnessBuilder::new()
+            .with_tools(Arc::clone(&tools))
+            .with_llm(Arc::clone(&llm))
+            .build()
+            .await;
+
+        let context_manager = Arc::new(ContextManager::new(4));
+        let job_id = context_manager
+            .create_job_for_user(
+                "user-1",
+                "Hook recheck test",
+                "Mutated params must re-require approval",
+            )
+            .await
+            .expect("create job");
+
+        let goal_id = Uuid::new_v4();
+        let now = Utc::now();
+        harness
+            .db
+            .create_goal(&Goal {
+                id: goal_id,
+                owner_user_id: "user-1".to_string(),
+                channel: Some("worker".to_string()),
+                thread_id: None,
+                title: "Hook recheck test".to_string(),
+                intent: "Ensure post-hook approval recheck is enforced".to_string(),
+                priority: 0,
+                status: GoalStatus::Active,
+                risk_class: GoalRiskClass::High,
+                acceptance_criteria: serde_json::json!({}),
+                constraints: serde_json::json!({}),
+                source: GoalSource::UserRequest,
+                created_at: now,
+                updated_at: now,
+                completed_at: None,
+            })
+            .await
+            .expect("create goal");
+
+        harness
+            .db
+            .upsert_tool_contract_override(&ToolContractV2Override {
+                id: Uuid::new_v4(),
+                tool_name: "noop_tool".to_string(),
+                owner_user_id: Some("user-1".to_string()),
+                enabled: true,
+                descriptor: ToolContractV2Descriptor {
+                    tool_name: "noop_tool".to_string(),
+                    version: 2,
+                    domain: "orchestrator".to_string(),
+                    side_effect_level: ToolSideEffectLevel::ExternalMutation,
+                    idempotency: ToolIdempotency::UnsafeRetry,
+                    dry_run_support: ToolDryRunSupport::Simulated,
+                    requires_approval_default: false,
+                    preconditions: serde_json::json!({}),
+                    postconditions: serde_json::json!({}),
+                    timeout_ms_hint: Some(5_000),
+                    retry_guidance: serde_json::json!({}),
+                    compensation_hint: None,
+                    fallback_candidates: Vec::new(),
+                    risk_tags: vec!["external_mutation".to_string()],
+                    source: ToolContractSource::ManualOverride,
+                    updated_at: now,
+                },
+                source: ToolContractOverrideSource::Manual,
+                notes: Some("Require explicit approval when dry_run intent is absent".to_string()),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .expect("upsert contract override");
+
+        context_manager
+            .update_context(job_id, |ctx| -> Result<(), String> {
+                ctx.transition_to(JobState::InProgress, Some("test setup".to_string()))?;
+                ctx.set_autonomy_links(Some(goal_id), None);
+                Ok(())
+            })
+            .await
+            .expect("update context")
+            .expect("context setup");
+
+        let hook_registry = Arc::new(HookRegistry::new());
+        hook_registry
+            .register(Arc::new(HookMutatesDryRunParams))
+            .await;
+
+        let deps = WorkerDeps {
+            context_manager: Arc::clone(&context_manager),
+            llm: Arc::clone(&llm),
+            safety: harness.deps.safety.clone(),
+            tools: Arc::clone(&tools),
+            store: Some(harness.db.clone()),
+            hooks: hook_registry,
+            timeout: Duration::from_secs(10),
+            use_planning: true,
+            autonomy_policy_engine_v1: true,
+            autonomy_verifier_v1: true,
+            autonomy_replanner_v1: true,
+            autonomy_tool_routing_v2: false,
+            autonomy_memory_plane_v2: false,
+            autonomy_memory_retrieval_v2: false,
+            autonomy_smart_rules_enabled: true,
+            autonomy_smart_rules_proactive_min_samples: 5,
+            autonomy_smart_rules_primary_max_score: 0.35,
+            autonomy_smart_rules_proactive_margin: 0.15,
+            autonomy_smart_rules_max_fallback_attempts: 2,
+            autonomy_smart_rules_empty_plan_recovery: true,
+        };
+
+        let err = Worker::execute_tool_inner(
+            &deps,
+            job_id,
+            "noop_tool",
+            &serde_json::json!({"dry_run": true}),
+        )
+        .await
+        .expect_err("hook-mutated params should require approval after post-hook recheck");
+        match err {
+            Error::Tool(ToolError::AuthRequired { name }) => {
+                assert_eq!(name, "noop_tool");
+            }
+            other => panic!("expected AuthRequired, got {other}"),
+        }
+
+        let record = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = harness
+                    .db
+                    .list_policy_decisions_for_goal(goal_id)
+                    .await
+                    .expect("list policy decisions");
+                if let Some(row) = rows
+                    .iter()
+                    .find(|r| {
+                        r.tool_name.as_deref() == Some("noop_tool")
+                            && r.action_kind == "tool_call_post_hook_preflight"
+                    })
+                    .cloned()
+                {
+                    break row;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("policy decision persistence timeout");
+
+        assert_eq!(
+            record.decision,
+            crate::agent::PolicyDecisionKind::RequireApproval
+        );
+        assert!(
+            record
+                .reason_codes
+                .iter()
+                .any(|c| c.starts_with("contract_v2_"))
         );
     }
 }
