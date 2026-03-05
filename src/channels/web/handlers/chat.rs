@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Query, State, WebSocketUpgrade},
+    extract::{Path, Query, State, WebSocketUpgrade},
     http::StatusCode,
     response::IntoResponse,
 };
@@ -99,6 +99,7 @@ pub async fn chat_approval_handler(
 
     if let Some(ref thread_id) = req.thread_id {
         msg = msg.with_thread(thread_id);
+        msg = msg.with_metadata(serde_json::json!({"thread_id": thread_id}));
     }
 
     let msg_id = msg.id;
@@ -125,6 +126,13 @@ pub async fn chat_approval_handler(
     ))
 }
 
+async fn resolve_auth_thread_id(
+    state: &GatewayState,
+    requested_thread_id: Option<&str>,
+) -> Option<String> {
+    crate::channels::web::server::resolve_auth_thread_id(state, requested_thread_id).await
+}
+
 /// Submit an auth token directly to the extension manager, bypassing the message pipeline.
 ///
 /// The token never touches the LLM, chat history, or SSE stream.
@@ -141,6 +149,7 @@ pub async fn chat_auth_token_handler(
         .auth(&req.extension_name, Some(&req.token))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let thread_id = resolve_auth_thread_id(&state, req.thread_id.as_deref()).await;
 
     if result.status == "authenticated" {
         // Auto-activate so tools are available immediately
@@ -157,12 +166,13 @@ pub async fn chat_auth_token_handler(
         };
 
         // Clear auth mode on the active thread
-        clear_auth_mode(&state).await;
+        clear_auth_mode(&state, req.thread_id.as_deref()).await;
 
         state.sse.broadcast(SseEvent::AuthCompleted {
             extension_name: req.extension_name,
             success: true,
             message: msg.clone(),
+            thread_id,
         });
 
         Ok(Json(ActionResponse::ok(msg)))
@@ -173,6 +183,7 @@ pub async fn chat_auth_token_handler(
             instructions: result.instructions.clone(),
             auth_url: result.auth_url.clone(),
             setup_url: result.setup_url.clone(),
+            thread_id,
         });
         Ok(Json(ActionResponse::fail(
             result
@@ -185,23 +196,15 @@ pub async fn chat_auth_token_handler(
 /// Cancel an in-progress auth flow.
 pub async fn chat_auth_cancel_handler(
     State(state): State<Arc<GatewayState>>,
-    Json(_req): Json<AuthCancelRequest>,
+    Json(req): Json<AuthCancelRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    clear_auth_mode(&state).await;
+    clear_auth_mode(&state, req.thread_id.as_deref()).await;
     Ok(Json(ActionResponse::ok("Auth cancelled")))
 }
 
 /// Clear pending auth mode on the active thread.
-pub async fn clear_auth_mode(state: &GatewayState) {
-    if let Some(ref sm) = state.session_manager {
-        let session = sm.get_or_create_session(&state.user_id).await;
-        let mut sess = session.lock().await;
-        if let Some(thread_id) = sess.active_thread
-            && let Some(thread) = sess.threads.get_mut(&thread_id)
-        {
-            thread.pending_auth = None;
-        }
-    }
+pub async fn clear_auth_mode(state: &GatewayState, requested_thread_id: Option<&str>) {
+    crate::channels::web::server::clear_auth_mode(state, requested_thread_id).await;
 }
 
 pub async fn chat_events_handler(
@@ -577,6 +580,130 @@ pub async fn chat_new_thread_handler(
     }
 
     Ok(Json(info))
+}
+
+pub async fn chat_delete_thread_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let thread_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid thread ID".to_string()))?;
+
+    let session_manager = state.session_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Session manager not available".to_string(),
+    ))?;
+
+    let session = session_manager.get_or_create_session(&state.user_id).await;
+    let (in_memory_owned, was_active) = {
+        let sess = session.lock().await;
+        (
+            sess.threads.contains_key(&thread_id),
+            sess.active_thread == Some(thread_id),
+        )
+    };
+
+    let db_owned = if let Some(ref store) = state.store {
+        store
+            .conversation_belongs_to_user(thread_id, &state.user_id)
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let owned = db_owned || in_memory_owned;
+    if !owned {
+        return Err((StatusCode::NOT_FOUND, "Thread not found".to_string()));
+    }
+
+    let mut deleted = false;
+    if let Some(ref store) = state.store {
+        deleted = store
+            .delete_conversation_for_user(thread_id, &state.user_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    let next_active = if was_active {
+        if let Some(ref store) = state.store {
+            store
+                .get_or_create_assistant_conversation(&state.user_id, "gateway")
+                .await
+                .ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let active_thread = {
+        let mut sess = session.lock().await;
+        sess.threads.remove(&thread_id);
+        if was_active {
+            sess.active_thread = next_active.or_else(|| sess.threads.keys().copied().next());
+        }
+        sess.active_thread
+    };
+
+    session_manager
+        .remove_thread_references(&state.user_id, "gateway", thread_id)
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "status": "deleted",
+        "thread_id": thread_id,
+        "deleted": deleted || owned,
+        "active_thread": active_thread,
+    })))
+}
+
+pub async fn chat_clear_threads_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let session_manager = state.session_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Session manager not available".to_string(),
+    ))?;
+    let session = session_manager.get_or_create_session(&state.user_id).await;
+    let (cleared_thread_ids, in_memory_count) = {
+        let mut sess = session.lock().await;
+        let ids = sess.threads.keys().copied().collect::<Vec<_>>();
+        let count = ids.len() as u64;
+        sess.threads.clear();
+        sess.active_thread = None;
+        (ids, count)
+    };
+
+    let mut deleted_count = 0u64;
+    let mut assistant_thread: Option<Uuid> = None;
+    if let Some(ref store) = state.store {
+        deleted_count = store
+            .delete_all_conversations_for_user_channel(&state.user_id, "gateway")
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        assistant_thread = store
+            .get_or_create_assistant_conversation(&state.user_id, "gateway")
+            .await
+            .ok();
+    }
+
+    for thread_id in &cleared_thread_ids {
+        session_manager
+            .remove_thread_references(&state.user_id, "gateway", *thread_id)
+            .await;
+    }
+
+    if let Some(thread_id) = assistant_thread {
+        let mut sess = session.lock().await;
+        sess.active_thread = Some(thread_id);
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "cleared",
+        "deleted_threads": deleted_count.max(in_memory_count),
+        "assistant_thread": assistant_thread,
+    })))
 }
 
 #[cfg(test)]

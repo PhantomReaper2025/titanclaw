@@ -6,7 +6,7 @@
 //! - Check job status
 //! - Cancel running jobs
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,7 +20,9 @@ use crate::context::{ContextManager, JobContext, JobState};
 use crate::db::Database;
 use crate::history::SandboxJobRecord;
 use crate::orchestrator::auth::CredentialGrant;
-use crate::orchestrator::job_manager::{ContainerJobManager, JobMode};
+use crate::orchestrator::job_manager::{
+    ContainerHandle, ContainerJobManager, ContainerState, JobMode,
+};
 use crate::secrets::SecretsStore;
 use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
 
@@ -62,6 +64,48 @@ async fn resolve_job_id(input: &str, context_manager: &ContextManager) -> Result
             "ambiguous prefix '{}' matches {} jobs, provide more characters",
             input, n
         ))),
+    }
+}
+
+enum SandboxWaitObservation {
+    Pending,
+    Completed { success: bool, message: String },
+    UnconfirmedStop { reason: String },
+}
+
+fn observe_sandbox_wait_handle(handle: Option<&ContainerHandle>) -> SandboxWaitObservation {
+    let Some(handle) = handle else {
+        return SandboxWaitObservation::UnconfirmedStop {
+            reason: "container execution state disappeared before completion was confirmed"
+                .to_string(),
+        };
+    };
+
+    match handle.state {
+        ContainerState::Creating | ContainerState::Running => SandboxWaitObservation::Pending,
+        ContainerState::Stopped => {
+            let Some(result) = handle.completion_result.as_ref() else {
+                return SandboxWaitObservation::UnconfirmedStop {
+                    reason: "container stopped without a structured completion report".to_string(),
+                };
+            };
+            let message = result
+                .message
+                .clone()
+                .unwrap_or_else(|| "Container job completed".to_string());
+            SandboxWaitObservation::Completed {
+                success: result.success,
+                message,
+            }
+        }
+        ContainerState::Failed => SandboxWaitObservation::Completed {
+            success: false,
+            message: handle
+                .completion_result
+                .as_ref()
+                .and_then(|result| result.message.clone())
+                .unwrap_or_else(|| "unknown failure".to_string()),
+        },
     }
 }
 
@@ -224,19 +268,17 @@ impl CreateJobTool {
         Ok(grants)
     }
 
-    /// Persist a sandbox job record (fire-and-forget).
-    fn persist_job(&self, record: SandboxJobRecord) {
+    /// Persist a sandbox job record before container creation.
+    async fn persist_job(&self, record: &SandboxJobRecord) {
         if let Some(store) = self.store.clone() {
-            tokio::spawn(async move {
-                if let Err(e) = store.save_sandbox_job(&record).await {
-                    tracing::warn!(job_id = %record.id, "Failed to persist sandbox job: {}", e);
-                }
-            });
+            if let Err(e) = store.save_sandbox_job(record).await {
+                tracing::warn!(job_id = %record.id, "Failed to persist sandbox job: {}", e);
+            }
         }
     }
 
-    /// Update sandbox job status in DB (fire-and-forget).
-    fn update_status(
+    /// Update sandbox job status in DB.
+    async fn update_status(
         &self,
         job_id: Uuid,
         status: &str,
@@ -247,21 +289,98 @@ impl CreateJobTool {
     ) {
         if let Some(store) = self.store.clone() {
             let status = status.to_string();
-            tokio::spawn(async move {
-                if let Err(e) = store
-                    .update_sandbox_job_status(
-                        job_id,
-                        &status,
-                        success,
-                        message.as_deref(),
-                        started_at,
-                        completed_at,
-                    )
-                    .await
-                {
-                    tracing::warn!(job_id = %job_id, "Failed to update sandbox job status: {}", e);
+            if let Err(e) = store
+                .update_sandbox_job_status(
+                    job_id,
+                    &status,
+                    success,
+                    message.as_deref(),
+                    started_at,
+                    completed_at,
+                )
+                .await
+            {
+                tracing::warn!(job_id = %job_id, "Failed to update sandbox job status: {}", e);
+            }
+        }
+    }
+
+    async fn register_sandbox_job_context(
+        &self,
+        job_id: Uuid,
+        title: &str,
+        description: &str,
+        user_id: &str,
+    ) -> Result<(), ToolError> {
+        self.context_manager
+            .register_job_for_user_with_id(user_id, job_id, title, description)
+            .await
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!("failed to register job context: {}", e))
+            })
+    }
+
+    async fn sync_sandbox_job_context_state(
+        &self,
+        job_id: Uuid,
+        state: JobState,
+        started_at: Option<chrono::DateTime<Utc>>,
+        completed_at: Option<chrono::DateTime<Utc>>,
+    ) {
+        let _ = self
+            .context_manager
+            .update_context(job_id, move |ctx| {
+                ctx.state = state;
+                if let Some(ts) = started_at {
+                    ctx.started_at = Some(ts);
+                }
+                if let Some(ts) = completed_at {
+                    ctx.completed_at = Some(ts);
+                }
+            })
+            .await;
+    }
+
+    async fn persisted_wait_outcome(&self, job_id: Uuid) -> Option<(bool, String)> {
+        let store = self.store.as_ref()?;
+        let record = store.get_sandbox_job(job_id).await.ok().flatten()?;
+        if !matches!(
+            record.status.as_str(),
+            "completed" | "failed" | "interrupted"
+        ) {
+            return None;
+        }
+        if record.completed_at.is_none() {
+            return None;
+        }
+        let success = record.success?;
+        let message = record
+            .failure_reason
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                if success {
+                    "Container job completed".to_string()
+                } else {
+                    "unknown failure".to_string()
                 }
             });
+        Some((success, message))
+    }
+
+    async fn wait_for_persisted_wait_outcome(
+        &self,
+        job_id: Uuid,
+        grace_period: Duration,
+    ) -> Option<(bool, String)> {
+        let deadline = tokio::time::Instant::now() + grace_period;
+        loop {
+            if let Some(outcome) = self.persisted_wait_outcome(job_id).await {
+                return Some(outcome);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 
@@ -299,6 +418,8 @@ impl CreateJobTool {
     /// Execute via sandboxed Docker container.
     async fn execute_sandbox(
         &self,
+        title: &str,
+        description: &str,
         task: &str,
         explicit_dir: Option<PathBuf>,
         wait: bool,
@@ -318,6 +439,9 @@ impl CreateJobTool {
         let (project_dir, browse_id) = resolve_project_dir(explicit_dir, job_id)?;
         let project_dir_str = project_dir.display().to_string();
 
+        self.register_sandbox_job_context(job_id, title, description, &ctx.user_id)
+            .await?;
+
         // Serialize credential grants so restarts can reload them.
         let credential_grants_json = match serde_json::to_string(&credential_grants) {
             Ok(json) => json,
@@ -333,7 +457,7 @@ impl CreateJobTool {
         };
 
         // Persist the job to DB before creating the container.
-        self.persist_job(SandboxJobRecord {
+        self.persist_job(&SandboxJobRecord {
             id: job_id,
             task: task.to_string(),
             status: "creating".to_string(),
@@ -345,7 +469,8 @@ impl CreateJobTool {
             started_at: None,
             completed_at: None,
             credential_grants_json,
-        });
+        })
+        .await;
 
         // Persist the job mode to DB
         if mode != JobMode::Worker
@@ -364,24 +489,42 @@ impl CreateJobTool {
         }
 
         // Create the container job with the pre-determined job_id.
-        let _token = jm
+        let _token = match jm
             .create_job(job_id, task, Some(project_dir), mode, credential_grants)
             .await
-            .map_err(|e| {
+        {
+            Ok(token) => token,
+            Err(e) => {
+                let finished_at = Utc::now();
                 self.update_status(
                     job_id,
                     "failed",
                     Some(false),
                     Some(e.to_string()),
                     None,
-                    Some(Utc::now()),
-                );
-                ToolError::ExecutionFailed(format!("failed to create container: {}", e))
-            })?;
+                    Some(finished_at),
+                )
+                .await;
+                self.sync_sandbox_job_context_state(
+                    job_id,
+                    JobState::Failed,
+                    None,
+                    Some(finished_at),
+                )
+                .await;
+                return Err(ToolError::ExecutionFailed(format!(
+                    "failed to create container: {}",
+                    e
+                )));
+            }
+        };
 
         // Container started successfully.
         let now = Utc::now();
-        self.update_status(job_id, "running", None, None, Some(now), None);
+        self.update_status(job_id, "running", None, None, Some(now), None)
+            .await;
+        self.sync_sandbox_job_context_state(job_id, JobState::InProgress, Some(now), None)
+            .await;
 
         if !wait {
             // Spawn a background monitor that forwards Claude Code output
@@ -410,6 +553,7 @@ impl CreateJobTool {
         // Wait for completion by polling the container state.
         let timeout = Duration::from_secs(600);
         let poll_interval = Duration::from_secs(2);
+        let persistence_grace_period = Duration::from_secs(3);
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
@@ -423,7 +567,15 @@ impl CreateJobTool {
                     Some("Timed out (10 minutes)".to_string()),
                     None,
                     Some(Utc::now()),
-                );
+                )
+                .await;
+                self.sync_sandbox_job_context_state(
+                    job_id,
+                    JobState::Failed,
+                    None,
+                    Some(Utc::now()),
+                )
+                .await;
                 return Err(ToolError::ExecutionFailed(
                     "container execution timed out (10 minutes)".to_string(),
                 ));
@@ -436,16 +588,93 @@ impl CreateJobTool {
                         tokio::time::sleep(poll_interval).await;
                     }
                     crate::orchestrator::job_manager::ContainerState::Stopped => {
-                        let message = handle
-                            .completion_result
-                            .as_ref()
-                            .and_then(|r| r.message.clone())
+                        let Some(completion) = handle.completion_result.as_ref() else {
+                            if let Some((success, message)) = self
+                                .wait_for_persisted_wait_outcome(job_id, persistence_grace_period)
+                                .await
+                            {
+                                let finished_at = Utc::now();
+                                jm.cleanup_job(job_id).await;
+                                if success {
+                                    self.update_status(
+                                        job_id,
+                                        "completed",
+                                        Some(true),
+                                        None,
+                                        None,
+                                        Some(finished_at),
+                                    )
+                                    .await;
+                                    self.sync_sandbox_job_context_state(
+                                        job_id,
+                                        JobState::Completed,
+                                        None,
+                                        Some(finished_at),
+                                    )
+                                    .await;
+                                    let result = serde_json::json!({
+                                        "job_id": job_id.to_string(),
+                                        "status": "completed",
+                                        "output": message,
+                                        "project_dir": project_dir_str,
+                                        "browse_url": format!("/projects/{}", browse_id),
+                                    });
+                                    return Ok(ToolOutput::success(result, start.elapsed()));
+                                }
+
+                                self.update_status(
+                                    job_id,
+                                    "failed",
+                                    Some(false),
+                                    Some(message.clone()),
+                                    None,
+                                    Some(finished_at),
+                                )
+                                .await;
+                                self.sync_sandbox_job_context_state(
+                                    job_id,
+                                    JobState::Failed,
+                                    None,
+                                    Some(finished_at),
+                                )
+                                .await;
+                                return Err(ToolError::ExecutionFailed(format!(
+                                    "container job failed: {}",
+                                    message
+                                )));
+                            }
+
+                            jm.cleanup_job(job_id).await;
+                            let finished_at = Utc::now();
+                            self.update_status(
+                                job_id,
+                                "failed",
+                                Some(false),
+                                Some(
+                                    "container stopped without structured completion result"
+                                        .to_string(),
+                                ),
+                                None,
+                                Some(finished_at),
+                            )
+                            .await;
+                            self.sync_sandbox_job_context_state(
+                                job_id,
+                                JobState::Failed,
+                                None,
+                                Some(finished_at),
+                            )
+                            .await;
+                            return Err(ToolError::ExecutionFailed(
+                                "container stopped without structured completion result"
+                                    .to_string(),
+                            ));
+                        };
+                        let message = completion
+                            .message
+                            .clone()
                             .unwrap_or_else(|| "Container job completed".to_string());
-                        let success = handle
-                            .completion_result
-                            .as_ref()
-                            .map(|r| r.success)
-                            .unwrap_or(true);
+                        let success = completion.success;
                         jm.cleanup_job(job_id).await;
 
                         let finished_at = Utc::now();
@@ -457,7 +686,15 @@ impl CreateJobTool {
                                 None,
                                 None,
                                 Some(finished_at),
-                            );
+                            )
+                            .await;
+                            self.sync_sandbox_job_context_state(
+                                job_id,
+                                JobState::Completed,
+                                None,
+                                Some(finished_at),
+                            )
+                            .await;
                             let result = serde_json::json!({
                                 "job_id": job_id.to_string(),
                                 "status": "completed",
@@ -474,7 +711,15 @@ impl CreateJobTool {
                                 Some(message.clone()),
                                 None,
                                 Some(finished_at),
-                            );
+                            )
+                            .await;
+                            self.sync_sandbox_job_context_state(
+                                job_id,
+                                JobState::Failed,
+                                None,
+                                Some(finished_at),
+                            )
+                            .await;
                             return Err(ToolError::ExecutionFailed(format!(
                                 "container job failed: {}",
                                 message
@@ -488,14 +733,23 @@ impl CreateJobTool {
                             .and_then(|r| r.message.clone())
                             .unwrap_or_else(|| "unknown failure".to_string());
                         jm.cleanup_job(job_id).await;
+                        let finished_at = Utc::now();
                         self.update_status(
                             job_id,
                             "failed",
                             Some(false),
                             Some(message.clone()),
                             None,
-                            Some(Utc::now()),
-                        );
+                            Some(finished_at),
+                        )
+                        .await;
+                        self.sync_sandbox_job_context_state(
+                            job_id,
+                            JobState::Failed,
+                            None,
+                            Some(finished_at),
+                        )
+                        .await;
                         return Err(ToolError::ExecutionFailed(format!(
                             "container job failed: {}",
                             message
@@ -503,22 +757,84 @@ impl CreateJobTool {
                     }
                 },
                 None => {
+                    if let Some((success, message)) = self
+                        .wait_for_persisted_wait_outcome(job_id, persistence_grace_period)
+                        .await
+                    {
+                        let finished_at = Utc::now();
+                        jm.cleanup_job(job_id).await;
+                        if success {
+                            self.update_status(
+                                job_id,
+                                "completed",
+                                Some(true),
+                                None,
+                                None,
+                                Some(finished_at),
+                            )
+                            .await;
+                            self.sync_sandbox_job_context_state(
+                                job_id,
+                                JobState::Completed,
+                                None,
+                                Some(finished_at),
+                            )
+                            .await;
+                            let result = serde_json::json!({
+                                "job_id": job_id.to_string(),
+                                "status": "completed",
+                                "output": message,
+                                "project_dir": project_dir_str,
+                                "browse_url": format!("/projects/{}", browse_id),
+                            });
+                            return Ok(ToolOutput::success(result, start.elapsed()));
+                        }
+
+                        self.update_status(
+                            job_id,
+                            "failed",
+                            Some(false),
+                            Some(message.clone()),
+                            None,
+                            Some(finished_at),
+                        )
+                        .await;
+                        self.sync_sandbox_job_context_state(
+                            job_id,
+                            JobState::Failed,
+                            None,
+                            Some(finished_at),
+                        )
+                        .await;
+                        return Err(ToolError::ExecutionFailed(format!(
+                            "container job failed: {}",
+                            message
+                        )));
+                    }
+
+                    let finished_at = Utc::now();
                     self.update_status(
                         job_id,
-                        "completed",
-                        Some(true),
+                        "failed",
+                        Some(false),
+                        Some(
+                            "container handle disappeared before completion was recorded"
+                                .to_string(),
+                        ),
                         None,
+                        Some(finished_at),
+                    )
+                    .await;
+                    self.sync_sandbox_job_context_state(
+                        job_id,
+                        JobState::Failed,
                         None,
-                        Some(Utc::now()),
-                    );
-                    let result = serde_json::json!({
-                        "job_id": job_id.to_string(),
-                        "status": "completed",
-                        "output": "Container job completed",
-                        "project_dir": project_dir_str,
-                        "browse_url": format!("/projects/{}", browse_id),
-                    });
-                    return Ok(ToolOutput::success(result, start.elapsed()));
+                        Some(finished_at),
+                    )
+                    .await;
+                    return Err(ToolError::ExecutionFailed(
+                        "container handle disappeared before completion was recorded".to_string(),
+                    ));
                 }
             }
         }
@@ -593,6 +909,38 @@ fn projects_base() -> PathBuf {
         .join("projects")
 }
 
+fn ensure_existing_project_ancestor_within_base(
+    canonical_base: &Path,
+    resolved: &Path,
+) -> Result<(), ToolError> {
+    let mut existing = resolved;
+    while !existing.exists() {
+        existing = existing.parent().ok_or_else(|| {
+            ToolError::InvalidParameters(format!(
+                "project directory must be under {}",
+                canonical_base.display()
+            ))
+        })?;
+    }
+
+    let canonical_existing = existing.canonicalize().map_err(|e| {
+        ToolError::ExecutionFailed(format!(
+            "failed to canonicalize existing project ancestor {}: {}",
+            existing.display(),
+            e
+        ))
+    })?;
+
+    if canonical_existing.starts_with(canonical_base) {
+        Ok(())
+    } else {
+        Err(ToolError::InvalidParameters(format!(
+            "project directory must be under {}",
+            canonical_base.display()
+        )))
+    }
+}
+
 /// Resolve the project directory, creating it if it doesn't exist.
 ///
 /// Auto-creates `~/.ironclaw/projects/{project_id}/` so every sandbox job has a
@@ -600,6 +948,8 @@ fn projects_base() -> PathBuf {
 ///
 /// When an explicit path is provided (e.g. job restarts reusing the old dir),
 /// it is validated to fall within `~/.ironclaw/projects/` after canonicalization.
+/// Relative explicit paths are resolved under the projects base and created
+/// automatically (for example `project_dir: "portfolio"`).
 fn resolve_project_dir(
     explicit: Option<PathBuf>,
     project_id: Uuid,
@@ -618,15 +968,37 @@ fn resolve_project_dir(
 
     let (canonical_dir, _was_explicit) = match explicit {
         Some(d) => {
-            // Explicit paths: validate BEFORE creating anything.
-            // The path must already exist (it comes from a previous job run).
-            let canonical = d.canonicalize().map_err(|e| {
-                ToolError::InvalidParameters(format!(
-                    "explicit project dir {} does not exist or is inaccessible: {}",
-                    d.display(),
-                    e
-                ))
-            })?;
+            let canonical = if d.is_relative() {
+                if d.components().any(|c| matches!(c, Component::ParentDir)) {
+                    return Err(ToolError::InvalidParameters(
+                        "relative project_dir must not contain '..'".to_string(),
+                    ));
+                }
+                let resolved = canonical_base.join(&d);
+                ensure_existing_project_ancestor_within_base(&canonical_base, &resolved)?;
+                std::fs::create_dir_all(&resolved).map_err(|e| {
+                    ToolError::ExecutionFailed(format!(
+                        "failed to create project dir {}: {}",
+                        resolved.display(),
+                        e
+                    ))
+                })?;
+                resolved.canonicalize().map_err(|e| {
+                    ToolError::ExecutionFailed(format!(
+                        "failed to canonicalize project dir {}: {}",
+                        resolved.display(),
+                        e
+                    ))
+                })?
+            } else {
+                d.canonicalize().map_err(|e| {
+                    ToolError::InvalidParameters(format!(
+                        "explicit project dir {} does not exist or is inaccessible: {}",
+                        d.display(),
+                        e
+                    ))
+                })?
+            };
             if !canonical.starts_with(&canonical_base) {
                 return Err(ToolError::InvalidParameters(format!(
                     "project directory must be under {}",
@@ -697,7 +1069,7 @@ impl Tool for CreateJobTool {
                     },
                     "wait": {
                         "type": "boolean",
-                        "description": "If true (default), wait for the container to complete and return results. \
+                        "description": "If true, wait for the container to complete and return results. \
                                         If false, start the container and return the job_id immediately."
                     },
                     "mode": {
@@ -710,8 +1082,10 @@ impl Tool for CreateJobTool {
                     },
                     "project_dir": {
                         "type": "string",
-                        "description": "Path to an existing project directory to mount into the container. \
-                                        Must be under ~/.ironclaw/projects/. If omitted, a fresh directory is created."
+                        "description": "Optional path to mount into the container. \
+                                        Omit this field (or pass null) to auto-create a fresh directory under ~/.ironclaw/projects/. \
+                                        Relative values like 'portfolio' are created under ~/.ironclaw/projects/. \
+                                        Do not pass an empty string."
                     },
                     "credentials": {
                         "type": "object",
@@ -796,6 +1170,8 @@ impl Tool for CreateJobTool {
             let explicit_dir = params
                 .get("project_dir")
                 .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
                 .map(PathBuf::from);
 
             // Parse and validate credential grants
@@ -803,8 +1179,17 @@ impl Tool for CreateJobTool {
 
             // Combine title and description into the task prompt for the sub-agent.
             let task = format!("{}\n\n{}", title, description);
-            self.execute_sandbox(&task, explicit_dir, wait, mode, credential_grants, ctx)
-                .await
+            self.execute_sandbox(
+                title,
+                description,
+                &task,
+                explicit_dir,
+                wait,
+                mode,
+                credential_grants,
+                ctx,
+            )
+            .await
         } else {
             self.execute_local(title, description, ctx).await
         }
@@ -1341,6 +1726,18 @@ impl Tool for JobPromptTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Database;
+
+    async fn make_test_store() -> (tempfile::TempDir, Arc<dyn Database>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("job_tool_tests.db");
+        let backend = crate::db::libsql::LibSqlBackend::new_local(&db_path)
+            .await
+            .expect("create test libsql backend");
+        backend.run_migrations().await.expect("run migrations");
+        let store: Arc<dyn Database> = Arc::new(backend);
+        (dir, store)
+    }
 
     #[tokio::test]
     async fn test_create_job_tool_local() {
@@ -1426,6 +1823,28 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_job_status_tool_accepts_registered_job_id() {
+        let manager = Arc::new(ContextManager::new(5));
+        let job_id = Uuid::new_v4();
+        manager
+            .register_job_for_user_with_id("default", job_id, "Sandbox Job", "Description")
+            .await
+            .unwrap();
+
+        let tool = JobStatusTool::new(manager);
+        let params = serde_json::json!({
+            "job_id": job_id.to_string()
+        });
+        let ctx = JobContext::default();
+        let result = tool.execute(params, &ctx).await.unwrap();
+
+        assert_eq!(
+            result.result.get("job_id").unwrap().as_str().unwrap(),
+            job_id.to_string()
+        );
+    }
+
     #[test]
     fn test_resolve_project_dir_auto() {
         let project_id = Uuid::new_v4();
@@ -1446,7 +1865,7 @@ mod tests {
         let base = projects_base();
         std::fs::create_dir_all(&base).unwrap();
         let explicit = base.join("test_explicit_project");
-        // Explicit paths must already exist (no auto-create).
+        // Absolute explicit paths must already exist.
         std::fs::create_dir_all(&explicit).unwrap();
         let project_id = Uuid::new_v4();
 
@@ -1458,6 +1877,56 @@ mod tests {
         assert!(dir.starts_with(&canonical_base));
 
         let _ = std::fs::remove_dir_all(&explicit);
+    }
+
+    #[test]
+    fn test_resolve_project_dir_relative_under_base_creates_dir() {
+        let relative = PathBuf::from(format!("portfolio_{}", Uuid::new_v4().simple()));
+        let (dir, browse_id) = resolve_project_dir(Some(relative.clone()), Uuid::new_v4()).unwrap();
+        assert!(dir.exists());
+        assert_eq!(browse_id, relative.to_string_lossy().to_string());
+
+        let base = projects_base().canonicalize().unwrap();
+        assert!(dir.starts_with(&base));
+        assert!(dir.ends_with(relative));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_project_dir_rejects_relative_symlink_escape_before_creation() {
+        use std::os::unix::fs::symlink;
+
+        let base = projects_base();
+        std::fs::create_dir_all(&base).unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        let link_name = format!("escape_link_{}", Uuid::new_v4().simple());
+        let link_path = base.join(&link_name);
+        symlink(outside.path(), &link_path).unwrap();
+
+        let attempted_relative = PathBuf::from(format!("{}/nested", link_name));
+        let result = resolve_project_dir(Some(attempted_relative), Uuid::new_v4());
+        assert!(result.is_err(), "symlink escape should be rejected");
+        assert!(
+            !outside.path().join("nested").exists(),
+            "outside directory must not be created before rejection"
+        );
+
+        let _ = std::fs::remove_file(&link_path);
+    }
+
+    #[test]
+    fn test_resolve_project_dir_rejects_relative_parent_traversal() {
+        let result = resolve_project_dir(Some(PathBuf::from("../escape")), Uuid::new_v4());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("must not contain '..'"),
+            "expected traversal validation error, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -1511,6 +1980,122 @@ mod tests {
             assert!(result.is_err(), "path outside base should be rejected");
             let _ = std::fs::remove_dir_all(&base_parent);
         }
+    }
+
+    #[test]
+    fn test_observe_sandbox_wait_handle_rejects_missing_handle() {
+        match observe_sandbox_wait_handle(None) {
+            SandboxWaitObservation::UnconfirmedStop { reason } => {
+                assert!(reason.contains("disappeared"));
+            }
+            _ => panic!("expected unconfirmed stop"),
+        }
+    }
+
+    #[test]
+    fn test_observe_sandbox_wait_handle_rejects_stopped_without_completion() {
+        let handle = ContainerHandle {
+            job_id: Uuid::new_v4(),
+            container_id: "cid".to_string(),
+            state: ContainerState::Stopped,
+            mode: JobMode::Worker,
+            created_at: Utc::now(),
+            project_dir: None,
+            task_description: "test".to_string(),
+            last_worker_status: None,
+            worker_iteration: 0,
+            completion_result: None,
+        };
+
+        match observe_sandbox_wait_handle(Some(&handle)) {
+            SandboxWaitObservation::UnconfirmedStop { reason } => {
+                assert!(reason.contains("structured completion"));
+            }
+            _ => panic!("expected unconfirmed stop"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_persisted_wait_outcome_ignores_non_terminal_rows() {
+        let (_dir, store) = make_test_store().await;
+        let manager = Arc::new(ContextManager::new(5));
+        let jm = Arc::new(ContainerJobManager::new(
+            crate::orchestrator::job_manager::ContainerJobConfig::default(),
+            crate::orchestrator::TokenStore::new(),
+        ));
+        let tool = CreateJobTool::new(manager).with_sandbox(jm, Some(store.clone()));
+        let job_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        store
+            .save_sandbox_job(&SandboxJobRecord {
+                id: job_id,
+                task: "test".to_string(),
+                status: "running".to_string(),
+                user_id: "default".to_string(),
+                project_dir: "/tmp/project".to_string(),
+                success: Some(true),
+                failure_reason: Some("should be ignored".to_string()),
+                created_at: now,
+                started_at: Some(now),
+                completed_at: Some(now),
+                credential_grants_json: "[]".to_string(),
+            })
+            .await
+            .expect("seed sandbox job");
+
+        assert!(tool.persisted_wait_outcome(job_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_persisted_wait_outcome_allows_short_persistence_lag() {
+        let (_dir, store) = make_test_store().await;
+        let manager = Arc::new(ContextManager::new(5));
+        let jm = Arc::new(ContainerJobManager::new(
+            crate::orchestrator::job_manager::ContainerJobConfig::default(),
+            crate::orchestrator::TokenStore::new(),
+        ));
+        let tool = CreateJobTool::new(manager).with_sandbox(jm, Some(store.clone()));
+        let job_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        store
+            .save_sandbox_job(&SandboxJobRecord {
+                id: job_id,
+                task: "test".to_string(),
+                status: "running".to_string(),
+                user_id: "default".to_string(),
+                project_dir: "/tmp/project".to_string(),
+                success: None,
+                failure_reason: None,
+                created_at: now,
+                started_at: Some(now),
+                completed_at: None,
+                credential_grants_json: "[]".to_string(),
+            })
+            .await
+            .expect("seed sandbox job");
+
+        let delayed_store = store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            delayed_store
+                .update_sandbox_job_status(
+                    job_id,
+                    "completed",
+                    Some(true),
+                    Some("done"),
+                    Some(now),
+                    Some(now),
+                )
+                .await
+                .expect("update sandbox job");
+        });
+
+        let outcome = tool
+            .wait_for_persisted_wait_outcome(job_id, Duration::from_secs(1))
+            .await;
+        assert_eq!(outcome, Some((true, "done".to_string())));
     }
 
     #[test]
@@ -1668,6 +2253,37 @@ mod tests {
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0].content, "What's the status?");
         assert!(!prompts[0].done);
+    }
+
+    #[tokio::test]
+    async fn test_job_prompt_tool_accepts_registered_job_id() {
+        let cm = Arc::new(ContextManager::new(5));
+        let job_id = Uuid::new_v4();
+        cm.register_job_for_user_with_id("default", job_id, "Sandbox Job", "desc")
+            .await
+            .unwrap();
+
+        let queue: PromptQueue =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let tool = JobPromptTool::new(Arc::clone(&queue), cm);
+
+        let params = serde_json::json!({
+            "job_id": job_id.to_string(),
+            "content": "Continue",
+            "done": true,
+        });
+
+        let ctx = JobContext::default();
+        let result = tool.execute(params, &ctx).await.unwrap();
+        assert_eq!(
+            result.result.get("status").unwrap().as_str().unwrap(),
+            "queued"
+        );
+
+        let q = queue.lock().await;
+        let prompts = q.get(&job_id).expect("queued prompt");
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].done);
     }
 
     #[tokio::test]

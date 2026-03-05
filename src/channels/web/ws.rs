@@ -160,6 +160,7 @@ async fn handle_client_message(
             let mut incoming = IncomingMessage::new("gateway", user_id, &content);
             if let Some(ref tid) = thread_id {
                 incoming = incoming.with_thread(tid);
+                incoming = incoming.with_metadata(serde_json::json!({"thread_id": tid}));
             }
 
             let tx_guard = state.msg_tx.read().await;
@@ -230,6 +231,7 @@ async fn handle_client_message(
             let mut msg = IncomingMessage::new("gateway", user_id, content);
             if let Some(ref tid) = thread_id {
                 msg = msg.with_thread(tid);
+                msg = msg.with_metadata(serde_json::json!({"thread_id": tid}));
             }
             let tx_guard = state.msg_tx.read().await;
             if let Some(ref tx) = *tx_guard {
@@ -239,8 +241,14 @@ async fn handle_client_message(
         WsClientMessage::AuthToken {
             extension_name,
             token,
+            thread_id,
         } => {
             if let Some(ref ext_mgr) = state.extension_manager {
+                let auth_thread_id = crate::channels::web::server::resolve_auth_thread_id(
+                    state,
+                    thread_id.as_deref(),
+                )
+                .await;
                 match ext_mgr.auth(&extension_name, Some(&token)).await {
                     Ok(result) if result.status == "authenticated" => {
                         let msg = match ext_mgr.activate(&extension_name).await {
@@ -254,13 +262,15 @@ async fn handle_client_message(
                                 extension_name, e
                             ),
                         };
-                        crate::channels::web::server::clear_auth_mode(state).await;
+                        crate::channels::web::server::clear_auth_mode(state, thread_id.as_deref())
+                            .await;
                         state
                             .sse
                             .broadcast(crate::channels::web::types::SseEvent::AuthCompleted {
                                 extension_name,
                                 success: true,
                                 message: msg,
+                                thread_id: auth_thread_id,
                             });
                     }
                     Ok(result) => {
@@ -271,6 +281,7 @@ async fn handle_client_message(
                                 instructions: result.instructions,
                                 auth_url: result.auth_url,
                                 setup_url: result.setup_url,
+                                thread_id: auth_thread_id,
                             });
                     }
                     Err(e) => {
@@ -289,8 +300,8 @@ async fn handle_client_message(
                     .await;
             }
         }
-        WsClientMessage::AuthCancel { .. } => {
-            crate::channels::web::server::clear_auth_mode(state).await;
+        WsClientMessage::AuthCancel { thread_id, .. } => {
+            crate::channels::web::server::clear_auth_mode(state, thread_id.as_deref()).await;
         }
         WsClientMessage::Ping => {
             let _ = direct_tx.send(WsServerMessage::Pong).await;

@@ -1,12 +1,27 @@
 
+function authCardSelector(extensionName, threadId) {
+  let selector = '.auth-card[data-extension-name="' + extensionName + '"]';
+  if (threadId) {
+    selector += '[data-thread-id="' + threadId + '"]';
+  }
+  return selector;
+}
+
+function findAuthCard(extensionName, threadId) {
+  return document.querySelector(authCardSelector(extensionName, threadId));
+}
+
 function showAuthCard(data) {
   // Remove any existing card for this extension first
-  removeAuthCard(data.extension_name);
+  removeAuthCard(data.extension_name, data.thread_id);
 
   const container = document.getElementById('chat-messages');
   const card = document.createElement('div');
   card.className = 'auth-card';
   card.setAttribute('data-extension-name', data.extension_name);
+  if (data.thread_id) {
+    card.setAttribute('data-thread-id', data.thread_id);
+  }
 
   const header = document.createElement('div');
   header.className = 'auth-header';
@@ -53,7 +68,7 @@ function showAuthCard(data) {
   tokenInput.type = 'password';
   tokenInput.placeholder = 'Paste your API key or token';
   tokenInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') submitAuthToken(data.extension_name, tokenInput.value);
+    if (e.key === 'Enter') submitAuthToken(data.extension_name, tokenInput.value, data.thread_id);
   });
   tokenRow.appendChild(tokenInput);
   card.appendChild(tokenRow);
@@ -71,12 +86,12 @@ function showAuthCard(data) {
   const submitBtn = document.createElement('button');
   submitBtn.className = 'auth-submit';
   submitBtn.textContent = 'Submit';
-  submitBtn.addEventListener('click', () => submitAuthToken(data.extension_name, tokenInput.value));
+  submitBtn.addEventListener('click', () => submitAuthToken(data.extension_name, tokenInput.value, data.thread_id));
 
   const cancelBtn = document.createElement('button');
   cancelBtn.className = 'auth-cancel';
   cancelBtn.textContent = 'Cancel';
-  cancelBtn.addEventListener('click', () => cancelAuth(data.extension_name));
+  cancelBtn.addEventListener('click', () => cancelAuth(data.extension_name, data.thread_id));
 
   actions.appendChild(submitBtn);
   actions.appendChild(cancelBtn);
@@ -87,16 +102,24 @@ function showAuthCard(data) {
   tokenInput.focus();
 }
 
-function removeAuthCard(extensionName) {
-  const card = document.querySelector('.auth-card[data-extension-name="' + extensionName + '"]');
-  if (card) card.remove();
+function removeAuthCard(extensionName, threadId) {
+  if (threadId) {
+    const card = findAuthCard(extensionName, threadId);
+    if (card) card.remove();
+    return;
+  }
+
+  document.querySelectorAll(authCardSelector(extensionName)).forEach((card) => {
+    card.remove();
+  });
 }
 
-function submitAuthToken(extensionName, tokenValue) {
+function submitAuthToken(extensionName, tokenValue, threadId) {
   if (!tokenValue || !tokenValue.trim()) return;
 
   // Disable submit button while in flight
-  const card = document.querySelector('.auth-card[data-extension-name="' + extensionName + '"]');
+  const card = findAuthCard(extensionName, threadId);
+  const authThreadId = card ? card.getAttribute('data-thread-id') : threadId;
   if (card) {
     const btns = card.querySelectorAll('button');
     btns.forEach((b) => { b.disabled = true; });
@@ -104,30 +127,32 @@ function submitAuthToken(extensionName, tokenValue) {
 
   apiFetch('/api/chat/auth-token', {
     method: 'POST',
-    body: { extension_name: extensionName, token: tokenValue.trim() },
+    body: { extension_name: extensionName, token: tokenValue.trim(), thread_id: authThreadId || undefined },
   }).then((result) => {
     if (result.success) {
-      removeAuthCard(extensionName);
+      removeAuthCard(extensionName, authThreadId);
       addMessage('system', result.message);
     } else {
-      showAuthCardError(extensionName, result.message);
+      showAuthCardError(extensionName, authThreadId, result.message);
     }
   }).catch((err) => {
-    showAuthCardError(extensionName, 'Failed: ' + err.message);
+    showAuthCardError(extensionName, authThreadId, 'Failed: ' + err.message);
   });
 }
 
-function cancelAuth(extensionName) {
+function cancelAuth(extensionName, threadId) {
+  const card = findAuthCard(extensionName, threadId);
+  const authThreadId = card ? card.getAttribute('data-thread-id') : threadId;
   apiFetch('/api/chat/auth-cancel', {
     method: 'POST',
-    body: { extension_name: extensionName },
+    body: { extension_name: extensionName, thread_id: authThreadId || undefined },
   }).catch(() => {});
-  removeAuthCard(extensionName);
+  removeAuthCard(extensionName, authThreadId);
   enableChatInput();
 }
 
-function showAuthCardError(extensionName, message) {
-  const card = document.querySelector('.auth-card[data-extension-name="' + extensionName + '"]');
+function showAuthCardError(extensionName, threadId, message) {
+  const card = findAuthCard(extensionName, threadId);
   if (!card) return;
   // Re-enable buttons
   const btns = card.querySelectorAll('button');

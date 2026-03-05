@@ -65,6 +65,52 @@ impl ContextManager {
         Ok(job_id)
     }
 
+    /// Register a new job context using a pre-existing job ID.
+    pub async fn register_job_for_user_with_id(
+        &self,
+        user_id: impl Into<String>,
+        job_id: Uuid,
+        title: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Result<(), JobError> {
+        let user_id = user_id.into();
+        let title = title.into();
+        let description = description.into();
+
+        let mut contexts = self.contexts.write().await;
+        if let Some(existing) = contexts.get(&job_id) {
+            if existing.user_id == user_id {
+                drop(contexts);
+                self.memories
+                    .write()
+                    .await
+                    .entry(job_id)
+                    .or_insert_with(|| Memory::new(job_id));
+                return Ok(());
+            }
+            return Err(JobError::ContextError {
+                id: job_id,
+                reason: "job ID already belongs to a different user".to_string(),
+            });
+        }
+
+        let active_count = contexts.values().filter(|c| c.state.is_active()).count();
+        if active_count >= self.max_jobs {
+            return Err(JobError::MaxJobsExceeded { max: self.max_jobs });
+        }
+
+        let mut context = JobContext::with_user(user_id, title, description);
+        context.job_id = job_id;
+        contexts.insert(job_id, context);
+        drop(contexts);
+
+        self.memories
+            .write()
+            .await
+            .insert(job_id, Memory::new(job_id));
+        Ok(())
+    }
+
     /// Get a job context by ID.
     pub async fn get_context(&self, job_id: Uuid) -> Result<JobContext, JobError> {
         self.contexts
@@ -281,6 +327,21 @@ mod tests {
             .unwrap();
 
         let context = manager.get_context(job_id).await.unwrap();
+        assert_eq!(context.user_id, "user-123");
+    }
+
+    #[tokio::test]
+    async fn test_register_job_for_user_with_id_preserves_explicit_id() {
+        let manager = ContextManager::new(5);
+        let job_id = Uuid::new_v4();
+
+        manager
+            .register_job_for_user_with_id("user-123", job_id, "Test", "Description")
+            .await
+            .unwrap();
+
+        let context = manager.get_context(job_id).await.unwrap();
+        assert_eq!(context.job_id, job_id);
         assert_eq!(context.user_id, "user-123");
     }
 

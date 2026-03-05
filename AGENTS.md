@@ -59,6 +59,25 @@ When behavior changes, keep these docs aligned in the same branch:
 - Sandbox job completion signaling:
   - workers should terminate jobs through structured completion reports (`/worker/{job_id}/complete`) as the primary path
   - free-text completion phrase matching is fallback-only in worker loops (compatibility bridge)
+- Sandbox job project directory ergonomics:
+  - `create_job` now treats empty `project_dir` as omitted (auto-create behavior)
+  - relative `project_dir` values (for example `portfolio`) are resolved and created under `~/.ironclaw/projects`
+  - absolute `project_dir` values remain restricted to paths under `~/.ironclaw/projects`
+  - chat-driven `create_job` calls now default to async start when `wait` is omitted
+  - chat `job_started` status now includes optional `project_dir` context so users can locate artifacts faster
+  - sandbox `create_job` now registers in-memory job context immediately so follow-up tools like `job_status`, `job_events`, and `job_prompt` can resolve the new job in the same runtime
+  - waited sandbox jobs now require structured completion or a persisted terminal record; sandbox DB writes are awaited, stopped/missing handles get a short persisted-terminal grace window, and unconfirmed completion still fails instead of being treated as silent success
+  - approval prompts now include policy notes for high-impact contract checks where explicit per-call approval is still required
+- Approval/thread interaction hardening:
+  - dispatcher tool-call hooks now run before approval checks, and approval-resume rechecks approval after hook mutation even when autonomy telemetry flags are off so rewritten parameters cannot bypass approval
+  - pending approvals now terminalize and persist the affected turn on timeout or interrupt
+  - expired approvals are now terminalized before `/undo`, `/redo`, `/resume`, or malformed web/gateway approval retries can leave them stuck
+  - undo/redo/resume are blocked while a thread is `AwaitingApproval`, and gateway/web approval responses require request IDs
+- Web approval/job/auth event scoping:
+  - `approval_needed`, `job_started`, `auth_required`, and `auth_completed` SSE events now carry thread context for gateway chat filtering
+  - gateway/web auth token submission now resolves the active thread when `thread_id` is omitted, so auth completion/retry events still return to the owning thread
+  - web auth cards are keyed by extension plus thread, avoiding cross-thread removal when the same extension requests auth in multiple chats
+  - approval cards submit the owning thread ID and only mark themselves resolved after the approval request is accepted
 - Autonomy Control Plane v1 groundwork (internal persistence):
   - versioned autonomy domain types and dual-backend (PostgreSQL/libSQL) autonomy tables exist for goals/plans/plan steps/execution attempts/policy decisions/incidents/plan verifications
   - worker planned executions and dispatcher approval/tool-attempt paths now best-effort persist internal autonomy records (tracing emitters and approval UX remain unchanged), including worker post-plan verification outcomes for persisted plans with richer per-step checks/evidence and coverage for early completion-path exits

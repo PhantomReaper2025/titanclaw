@@ -15,6 +15,7 @@
 //! ```
 
 pub mod auth;
+pub mod handlers;
 pub mod log_layer;
 pub mod openai_compat;
 pub mod server;
@@ -300,10 +301,13 @@ impl Channel for GatewayChannel {
                 job_id,
                 title,
                 browse_url,
+                project_dir,
             } => SseEvent::JobStarted {
                 job_id,
                 title,
                 browse_url,
+                project_dir,
+                thread_id: thread_id.clone(),
             },
             StatusUpdate::ApprovalNeeded {
                 request_id,
@@ -316,6 +320,7 @@ impl Channel for GatewayChannel {
                 description,
                 parameters: serde_json::to_string_pretty(&parameters)
                     .unwrap_or_else(|_| parameters.to_string()),
+                thread_id: thread_id.clone(),
             },
             StatusUpdate::AuthRequired {
                 extension_name,
@@ -327,6 +332,7 @@ impl Channel for GatewayChannel {
                 instructions,
                 auth_url,
                 setup_url,
+                thread_id: thread_id.clone(),
             },
             StatusUpdate::AuthCompleted {
                 extension_name,
@@ -336,6 +342,7 @@ impl Channel for GatewayChannel {
                 extension_name,
                 success,
                 message,
+                thread_id: thread_id.clone(),
             },
         };
 

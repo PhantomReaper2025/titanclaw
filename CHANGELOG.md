@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Chat runtime can rewrite non-actionable model text into concrete follow-up prompts so TitanClaw remains conversational and task-oriented.
 - Reliability fallback execution is now bounded by a smart-rule attempt budget; exhaustion emits explicit failure context that the execution critic maps into deterministic replanning.
 - Proactive fallback-first routing thresholds are now configurable instead of hardcoded.
+- Sandbox `create_job` path handling is now more tolerant: empty `project_dir` values are treated as omitted, safe relative paths are resolved/created under `~/.ironclaw/projects`, and absolute paths remain base-constrained.
+- Chat `create_job` execution now defaults omitted `wait` to async start, emits `job_started` status with optional project-dir context, and returns clearer action-oriented remediation on sandbox/job creation failures.
+- Sandbox jobs now register runtime context immediately so `job_status`, `job_events`, and `job_prompt` work in the same session, sandbox DB writes are awaited instead of fire-and-forget, and waited jobs use a short persisted-terminal grace window before failing when structured completion lands slightly after the container stops.
+- Approval prompts now include clearer policy notes for high-impact actions where explicit per-call approval remains required even if session-level “Always approved” was selected.
+- Approval/thread flow is stricter and more consistent: hook-mutated params are re-approved before execution (including approval resume even when autonomy telemetry flags are off), pending approvals now close/persist on timeout or interrupt, expired approval waits are cleared before history controls or malformed approval retries can leave them stuck, gateway/web approvals require request IDs, auth completion/retry events preserve the active thread when clients omit `thread_id`, and approval/job/auth cards are thread-scoped and deduped on replay.
 
 ## [1.1.2] - 2026-03-02
 

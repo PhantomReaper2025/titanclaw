@@ -320,6 +320,12 @@ impl Thread {
         self.updated_at = Utc::now();
     }
 
+    /// Restore a pending approval without extending its expiry window.
+    pub fn restore_pending_approval_without_touch(&mut self, pending: PendingApproval) {
+        self.state = ThreadState::AwaitingApproval;
+        self.pending_approval = Some(pending);
+    }
+
     /// Take the pending approval (clearing it from the thread).
     pub fn take_pending_approval(&mut self) -> Option<PendingApproval> {
         self.pending_approval.take()
@@ -1099,6 +1105,28 @@ mod tests {
 
         assert_eq!(thread.state, ThreadState::Idle);
         assert!(thread.pending_approval.is_none());
+    }
+
+    #[test]
+    fn test_restore_pending_approval_without_touch_preserves_timestamp() {
+        let mut thread = Thread::new(Uuid::new_v4());
+        thread.start_turn("Need approval");
+        let original_updated_at = thread.updated_at;
+
+        let approval = PendingApproval {
+            request_id: Uuid::new_v4(),
+            tool_name: "shell".to_string(),
+            parameters: serde_json::json!({}),
+            description: "test".to_string(),
+            tool_call_id: "call-restore".to_string(),
+            context_messages: vec![],
+        };
+
+        thread.restore_pending_approval_without_touch(approval);
+
+        assert_eq!(thread.state, ThreadState::AwaitingApproval);
+        assert_eq!(thread.updated_at, original_updated_at);
+        assert!(thread.pending_approval.is_some());
     }
 
     #[test]

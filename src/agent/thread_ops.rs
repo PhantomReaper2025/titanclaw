@@ -18,7 +18,8 @@ use crate::agent::autonomy_telemetry::{
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context_monitor::CompactionStrategy;
 use crate::agent::dispatcher::{
-    AgenticLoopResult, ChatToolRoutingDecision, detect_auth_awaiting, parse_auth_result,
+    AgenticLoopResult, ChatToolRoutingDecision, detect_auth_awaiting, enrich_approval_description,
+    parse_auth_result,
 };
 use crate::agent::incident_detector::{
     PolicyDeniedIncidentRequest, record_policy_denied_incident_best_effort,
@@ -195,7 +196,76 @@ fn normalize_reflex_pattern(input: &str) -> String {
         .join(" ")
 }
 
+fn requires_explicit_request_id(channel: &str) -> bool {
+    matches!(channel, "gateway" | "web")
+}
+
 impl Agent {
+    async fn finalize_pending_approval_cancellation(
+        &self,
+        message: &IncomingMessage,
+        session: Arc<Mutex<Session>>,
+        thread_id: Uuid,
+        assistant_message: &str,
+        tool_error: &str,
+    ) {
+        let persist_user_input = {
+            let mut sess = session.lock().await;
+            let Some(thread) = sess.threads.get_mut(&thread_id) else {
+                return;
+            };
+            thread.clear_pending_approval();
+            if let Some(turn) = thread.last_turn_mut() {
+                turn.record_tool_error(tool_error);
+            }
+            let user_input = thread.last_turn().map(|turn| turn.user_input.clone());
+            thread.complete_turn(assistant_message);
+            user_input
+        };
+
+        if let Some(user_input) = persist_user_input {
+            self.persist_turn(
+                thread_id,
+                &message.user_id,
+                &user_input,
+                Some(assistant_message),
+                &message.channel,
+                &message.metadata,
+            );
+        }
+    }
+
+    async fn expire_pending_approval_if_needed(
+        &self,
+        message: &IncomingMessage,
+        session: Arc<Mutex<Session>>,
+        thread_id: Uuid,
+        assistant_message: &str,
+    ) -> Result<bool, Error> {
+        let is_expired = {
+            let sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get(&thread_id)
+                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+            thread.state == ThreadState::AwaitingApproval && is_approval_expired(thread.updated_at)
+        };
+
+        if !is_expired {
+            return Ok(false);
+        }
+
+        self.finalize_pending_approval_cancellation(
+            message,
+            session,
+            thread_id,
+            assistant_message,
+            "approval timeout",
+        )
+        .await;
+        Ok(true)
+    }
+
     /// Hydrate a historical thread from DB into memory if not already present.
     ///
     /// Called before `resolve_thread` so that the session manager finds the
@@ -325,7 +395,7 @@ impl Agent {
 
         // First check thread state without holding lock during I/O
         let thread_state = {
-            let mut sess = session.lock().await;
+            let sess = session.lock().await;
             let thread = sess
                 .threads
                 .get(&thread_id)
@@ -333,15 +403,18 @@ impl Agent {
             if thread.state == ThreadState::AwaitingApproval
                 && is_approval_expired(thread.updated_at)
             {
-                // Re-borrow mutably to clear pending approval and return to idle.
-                let thread = sess.threads.get_mut(&thread_id).expect("checked above");
-                thread.clear_pending_approval();
-                if let Some(turn) = thread.last_turn_mut() {
-                    turn.record_tool_error("approval timeout");
-                }
-                return Ok(SubmissionResult::error(
-                    "Approval request expired. The pending tool execution was canceled.",
-                ));
+                drop(sess);
+                let timeout_msg =
+                    "Approval request expired. The pending tool execution was canceled.";
+                self.finalize_pending_approval_cancellation(
+                    message,
+                    Arc::clone(&session),
+                    thread_id,
+                    timeout_msg,
+                    "approval timeout",
+                )
+                .await;
+                return Ok(SubmissionResult::response(timeout_msg));
             }
             thread.state
         };
@@ -929,21 +1002,48 @@ impl Agent {
 
     pub(super) async fn process_undo(
         &self,
+        message: &IncomingMessage,
         session: Arc<Mutex<Session>>,
         thread_id: Uuid,
     ) -> Result<SubmissionResult, Error> {
+        let timeout_msg = "Approval request expired. The pending tool execution was canceled.";
+        if self
+            .expire_pending_approval_if_needed(
+                message,
+                Arc::clone(&session),
+                thread_id,
+                timeout_msg,
+            )
+            .await?
+        {
+            return Ok(SubmissionResult::response(timeout_msg));
+        }
+
+        {
+            let sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get(&thread_id)
+                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+            if thread.state == ThreadState::AwaitingApproval {
+                return Ok(SubmissionResult::error(
+                    "Cannot undo while waiting for approval. Approve, deny, or interrupt the pending tool first.",
+                ));
+            }
+        }
+
         let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
         let mut mgr = undo_mgr.lock().await;
-
-        if !mgr.can_undo() {
-            return Ok(SubmissionResult::ok_with_message("Nothing to undo."));
-        }
 
         let mut sess = session.lock().await;
         let thread = sess
             .threads
             .get_mut(&thread_id)
             .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+
+        if !mgr.can_undo() {
+            return Ok(SubmissionResult::ok_with_message("Nothing to undo."));
+        }
 
         // Save current state to redo, get previous checkpoint
         let current_messages = thread.messages();
@@ -967,21 +1067,48 @@ impl Agent {
 
     pub(super) async fn process_redo(
         &self,
+        message: &IncomingMessage,
         session: Arc<Mutex<Session>>,
         thread_id: Uuid,
     ) -> Result<SubmissionResult, Error> {
+        let timeout_msg = "Approval request expired. The pending tool execution was canceled.";
+        if self
+            .expire_pending_approval_if_needed(
+                message,
+                Arc::clone(&session),
+                thread_id,
+                timeout_msg,
+            )
+            .await?
+        {
+            return Ok(SubmissionResult::response(timeout_msg));
+        }
+
+        {
+            let sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get(&thread_id)
+                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+            if thread.state == ThreadState::AwaitingApproval {
+                return Ok(SubmissionResult::error(
+                    "Cannot redo while waiting for approval. Approve, deny, or interrupt the pending tool first.",
+                ));
+            }
+        }
+
         let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
         let mut mgr = undo_mgr.lock().await;
-
-        if !mgr.can_redo() {
-            return Ok(SubmissionResult::ok_with_message("Nothing to redo."));
-        }
 
         let mut sess = session.lock().await;
         let thread = sess
             .threads
             .get_mut(&thread_id)
             .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+
+        if !mgr.can_redo() {
+            return Ok(SubmissionResult::ok_with_message("Nothing to redo."));
+        }
 
         let current_messages = thread.messages();
         let current_turn = thread.turn_number();
@@ -1010,7 +1137,7 @@ impl Agent {
             .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
 
         match thread.state {
-            ThreadState::Processing | ThreadState::AwaitingApproval => {
+            ThreadState::Processing => {
                 thread.interrupt();
                 drop(sess);
 
@@ -1035,6 +1162,20 @@ impl Agent {
                 } else {
                     Ok(SubmissionResult::ok_with_message("Interrupted."))
                 }
+            }
+            ThreadState::AwaitingApproval => {
+                drop(sess);
+                let interrupted_msg =
+                    "Approval request canceled. The pending tool execution will not run.";
+                self.finalize_pending_approval_cancellation(
+                    message,
+                    Arc::clone(&session),
+                    thread_id,
+                    interrupted_msg,
+                    "approval canceled by interrupt",
+                )
+                .await;
+                Ok(SubmissionResult::response(interrupted_msg))
             }
             _ => Ok(SubmissionResult::ok_with_message("Nothing to interrupt.")),
         }
@@ -1140,12 +1281,21 @@ impl Agent {
                 return Ok(SubmissionResult::error("No pending approval request."));
             }
             if is_approval_expired(thread.updated_at) {
-                thread.clear_pending_approval();
-                if let Some(turn) = thread.last_turn_mut() {
-                    turn.record_tool_error("approval timeout");
-                }
+                drop(sess);
+                let timeout_msg = "Approval request expired. Ask again to retry the operation.";
+                self.finalize_pending_approval_cancellation(
+                    message,
+                    Arc::clone(&session),
+                    thread_id,
+                    timeout_msg,
+                    "approval timeout",
+                )
+                .await;
+                return Ok(SubmissionResult::response(timeout_msg));
+            }
+            if request_id.is_none() && requires_explicit_request_id(&message.channel) {
                 return Ok(SubmissionResult::error(
-                    "Approval request expired. Ask again to retry the operation.",
+                    "Approval responses on web and gateway must include the request ID.",
                 ));
             }
 
@@ -1165,7 +1315,7 @@ impl Agent {
             // Put it back and return error
             let mut sess = session.lock().await;
             if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                thread.await_approval(pending);
+                thread.restore_pending_approval_without_touch(pending);
             }
             return Ok(SubmissionResult::error(
                 "Request ID mismatch. Use the correct request ID.",
@@ -1313,23 +1463,25 @@ impl Agent {
                     Some(always),
                     "approval_resume_decision",
                 );
+            }
 
-                match evaluate_tool_call_hook(
-                    self.hooks().as_ref(),
-                    &execution_tool_name,
-                    &approved_params,
-                    &message.user_id,
-                    "chat_approval_resume",
-                )
-                .await
-                {
-                    HookToolPolicyOutcome::Continue { parameters } => {
-                        approved_params = parameters;
-                    }
-                    HookToolPolicyOutcome::Modified {
-                        parameters,
-                        reason_codes,
-                    } => {
+            match evaluate_tool_call_hook(
+                self.hooks().as_ref(),
+                &execution_tool_name,
+                &approved_params,
+                &message.user_id,
+                "chat_approval_resume",
+            )
+            .await
+            {
+                HookToolPolicyOutcome::Continue { parameters } => {
+                    approved_params = parameters;
+                }
+                HookToolPolicyOutcome::Modified {
+                    parameters,
+                    reason_codes,
+                } => {
+                    if self.config.autonomy_policy_engine_v1 {
                         persist_chat_policy_decision_best_effort(
                             self,
                             message,
@@ -1342,12 +1494,14 @@ impl Agent {
                             None,
                             "approval_resume_hook",
                         );
-                        approved_params = parameters;
                     }
-                    HookToolPolicyOutcome::Deny {
-                        reason,
-                        reason_codes,
-                    } => {
+                    approved_params = parameters;
+                }
+                HookToolPolicyOutcome::Deny {
+                    reason,
+                    reason_codes,
+                } => {
+                    if self.config.autonomy_policy_engine_v1 {
                         persist_chat_policy_decision_best_effort(
                             self,
                             message,
@@ -1360,45 +1514,102 @@ impl Agent {
                             None,
                             "approval_resume_hook",
                         );
-                        let blocked_msg = format!(
-                            "Tool '{}' was approved, but a policy hook blocked execution: {}",
-                            execution_tool_name, reason
-                        );
-                        let persist_user_input = {
-                            let mut sess = session.lock().await;
-                            if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                                if let Some(turn) = thread.last_turn_mut() {
-                                    turn.record_tool_error(format!(
-                                        "blocked by hook after approval: {}",
-                                        reason
-                                    ));
-                                }
-                                let user_input = thread.last_turn().map(|t| t.user_input.clone());
-                                thread.complete_turn(&blocked_msg);
-                                user_input
-                            } else {
-                                None
+                    }
+                    let blocked_msg = format!(
+                        "Tool '{}' was approved, but a policy hook blocked execution: {}",
+                        execution_tool_name, reason
+                    );
+                    let persist_user_input = {
+                        let mut sess = session.lock().await;
+                        if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                            if let Some(turn) = thread.last_turn_mut() {
+                                turn.record_tool_error(format!(
+                                    "blocked by hook after approval: {}",
+                                    reason
+                                ));
                             }
-                        };
-                        let _ = self
-                            .channels
-                            .send_status(
-                                &message.channel,
-                                StatusUpdate::Status("Blocked by policy".into()),
-                                &message.metadata,
-                            )
-                            .await;
-                        if let Some(user_input) = persist_user_input {
-                            self.persist_turn(
+                            let user_input = thread.last_turn().map(|t| t.user_input.clone());
+                            thread.complete_turn(&blocked_msg);
+                            user_input
+                        } else {
+                            None
+                        }
+                    };
+                    let _ = self
+                        .channels
+                        .send_status(
+                            &message.channel,
+                            StatusUpdate::Status("Blocked by policy".into()),
+                            &message.metadata,
+                        )
+                        .await;
+                    if let Some(user_input) = persist_user_input {
+                        self.persist_turn(
+                            thread_id,
+                            &message.user_id,
+                            &user_input,
+                            Some(&blocked_msg),
+                            &message.channel,
+                            &message.metadata,
+                        );
+                    }
+                    return Ok(SubmissionResult::response(blocked_msg));
+                }
+            }
+
+            if let Some(tool) = self.tools().get(&execution_tool_name).await {
+                let contract_v2 = self
+                    .resolve_tool_contract_v2_for_user(&execution_tool_name, &message.user_id)
+                    .await;
+                match evaluate_dispatcher_tool_approval(
+                    tool.as_ref(),
+                    &approved_params,
+                    false,
+                    contract_v2.as_ref(),
+                ) {
+                    ApprovalPolicyOutcome::NoApprovalRequired
+                    | ApprovalPolicyOutcome::AllowAutoApproved { .. } => {}
+                    ApprovalPolicyOutcome::RequireApproval { reason_codes } => {
+                        if self.config.autonomy_policy_engine_v1 {
+                            persist_chat_policy_decision_best_effort(
+                                self,
+                                message,
                                 thread_id,
-                                &message.user_id,
-                                &user_input,
-                                Some(&blocked_msg),
-                                &message.channel,
-                                &message.metadata,
+                                &job_ctx,
+                                &execution_tool_name,
+                                &pending.tool_call_id,
+                                TelemetryPolicyDecisionKind::RequireApproval,
+                                reason_codes.clone(),
+                                Some(false),
+                                "approval_resume_recheck",
                             );
                         }
-                        return Ok(SubmissionResult::response(blocked_msg));
+
+                        let new_pending = crate::agent::PendingApproval {
+                            request_id: Uuid::new_v4(),
+                            tool_name: execution_tool_name.clone(),
+                            parameters: approved_params.clone(),
+                            description: enrich_approval_description(
+                                tool.description(),
+                                &reason_codes,
+                            ),
+                            tool_call_id: pending.tool_call_id.clone(),
+                            context_messages: pending.context_messages.clone(),
+                        };
+
+                        {
+                            let mut sess = session.lock().await;
+                            if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                                thread.await_approval(new_pending.clone());
+                            }
+                        }
+
+                        return Ok(SubmissionResult::NeedApproval {
+                            request_id: new_pending.request_id,
+                            tool_name: new_pending.tool_name,
+                            description: new_pending.description,
+                            parameters: new_pending.parameters,
+                        });
                     }
                 }
             }
@@ -1842,10 +2053,37 @@ impl Agent {
 
     pub(super) async fn process_resume(
         &self,
+        message: &IncomingMessage,
         session: Arc<Mutex<Session>>,
         thread_id: Uuid,
         checkpoint_id: Uuid,
     ) -> Result<SubmissionResult, Error> {
+        let timeout_msg = "Approval request expired. The pending tool execution was canceled.";
+        if self
+            .expire_pending_approval_if_needed(
+                message,
+                Arc::clone(&session),
+                thread_id,
+                timeout_msg,
+            )
+            .await?
+        {
+            return Ok(SubmissionResult::response(timeout_msg));
+        }
+
+        {
+            let sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get(&thread_id)
+                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+            if thread.state == ThreadState::AwaitingApproval {
+                return Ok(SubmissionResult::error(
+                    "Cannot resume while waiting for approval. Approve, deny, or /interrupt first.",
+                ));
+            }
+        }
+
         let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
         let mut mgr = undo_mgr.lock().await;
 
@@ -1887,9 +2125,11 @@ mod tests {
     use crate::llm::ChatMessage;
     use crate::settings::Settings;
     use crate::testing::TestHarnessBuilder;
-    use crate::tools::CircuitBreakerState;
+    use crate::tools::{CircuitBreakerState, Tool, ToolError, ToolOutput, ToolRegistry};
 
     struct RejectToolCallHook;
+
+    struct ModifyToolCallHook;
 
     #[async_trait]
     impl Hook for RejectToolCallHook {
@@ -1919,6 +2159,79 @@ mod tests {
                 HookEvent::ToolCall { .. } => Ok(HookOutcome::reject("blocked in test hook")),
                 _ => Ok(HookOutcome::ok()),
             }
+        }
+    }
+
+    #[async_trait]
+    impl Hook for ModifyToolCallHook {
+        fn name(&self) -> &str {
+            "modify_tool_call"
+        }
+
+        fn hook_points(&self) -> &[HookPoint] {
+            static POINTS: [HookPoint; 1] = [HookPoint::BeforeToolCall];
+            &POINTS
+        }
+
+        fn failure_mode(&self) -> HookFailureMode {
+            HookFailureMode::FailClosed
+        }
+
+        fn timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        async fn execute(
+            &self,
+            event: &HookEvent,
+            _ctx: &HookContext,
+        ) -> Result<HookOutcome, crate::hooks::HookError> {
+            match event {
+                HookEvent::ToolCall { .. } => {
+                    Ok(HookOutcome::modify(json!({"dangerous": true}).to_string()))
+                }
+                _ => Ok(HookOutcome::ok()),
+            }
+        }
+    }
+
+    struct ApprovalHookTestTool;
+
+    #[async_trait]
+    impl Tool for ApprovalHookTestTool {
+        fn name(&self) -> &str {
+            "approval_hook_test"
+        }
+
+        fn description(&self) -> &str {
+            "Tool used to verify approval is re-evaluated after hook mutation"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": {
+                    "dangerous": { "type": "boolean" }
+                },
+                "required": ["dangerous"],
+                "additionalProperties": false
+            })
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _job_ctx: &crate::context::JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            panic!("approval_hook_test should not execute when re-approval is required");
+        }
+
+        fn requires_approval(&self) -> bool {
+            true
+        }
+
+        fn execution_timeout(&self) -> Duration {
+            Duration::from_secs(1)
         }
     }
 
@@ -1983,6 +2296,383 @@ mod tests {
         })
         .await
         .expect("timed out waiting for incidents")
+    }
+
+    async fn wait_for_conversation_messages(
+        db: &dyn crate::db::Database,
+        conversation_id: Uuid,
+        min_count: usize,
+    ) -> Vec<crate::history::ConversationMessage> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let rows = db
+                    .list_conversation_messages(conversation_id)
+                    .await
+                    .expect("list conversation messages");
+                if rows.len() >= min_count {
+                    break rows;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for conversation messages")
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_process_approval_requires_request_id_for_gateway_channel() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let config = AgentConfig::resolve(&Settings::default()).expect("config");
+        let agent = Agent::new(
+            config,
+            harness.deps,
+            ChannelManager::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let message = IncomingMessage::new("gateway", "approval-id-user", "yes")
+            .with_metadata(json!({"source":"test"}));
+        let session = agent
+            .session_manager
+            .get_or_create_session("approval-id-user")
+            .await;
+
+        let (thread_id, expected_request_id) = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("Please run shell");
+            thread.record_tool_call("call-request-id", "shell", json!({"command":"echo hi"}));
+            let request_id = Uuid::new_v4();
+            thread.await_approval(crate::agent::PendingApproval {
+                request_id,
+                tool_name: "shell".to_string(),
+                parameters: json!({"command":"echo hi"}),
+                description: "Run shell".to_string(),
+                tool_call_id: "call-request-id".to_string(),
+                context_messages: vec![ChatMessage::user("Please run shell")],
+            });
+            (thread.id, request_id)
+        };
+
+        let out = agent
+            .process_approval(&message, session.clone(), thread_id, None, true, false)
+            .await
+            .expect("process approval");
+
+        match out {
+            crate::agent::submission::SubmissionResult::Error { message } => {
+                assert!(message.contains("request ID"));
+            }
+            other => panic!("unexpected submission result: {:?}", other),
+        }
+
+        let sess = session.lock().await;
+        let thread = sess.threads.get(&thread_id).expect("thread");
+        assert_eq!(thread.state, ThreadState::AwaitingApproval);
+        assert_eq!(
+            thread
+                .pending_approval
+                .as_ref()
+                .map(|pending| pending.request_id),
+            Some(expected_request_id)
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_process_approval_request_id_mismatch_preserves_expiry_timestamp() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let config = AgentConfig::resolve(&Settings::default()).expect("config");
+        let agent = Agent::new(
+            config,
+            harness.deps,
+            ChannelManager::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let message = IncomingMessage::new("test", "approval-mismatch-user", "approve")
+            .with_metadata(json!({"source":"test"}));
+        let session = agent
+            .session_manager
+            .get_or_create_session("approval-mismatch-user")
+            .await;
+
+        let (thread_id, request_id, original_updated_at) = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("Please run shell");
+            thread.record_tool_call("call-mismatch", "shell", json!({"command":"echo hi"}));
+            let request_id = Uuid::new_v4();
+            thread.await_approval(crate::agent::PendingApproval {
+                request_id,
+                tool_name: "shell".to_string(),
+                parameters: json!({"command":"echo hi"}),
+                description: "Run shell".to_string(),
+                tool_call_id: "call-mismatch".to_string(),
+                context_messages: vec![ChatMessage::user("Please run shell")],
+            });
+            let original_updated_at = Utc::now() - chrono::Duration::minutes(5);
+            thread.updated_at = original_updated_at;
+            (thread.id, request_id, original_updated_at)
+        };
+
+        let out = agent
+            .process_approval(
+                &message,
+                session.clone(),
+                thread_id,
+                Some(Uuid::new_v4()),
+                true,
+                false,
+            )
+            .await
+            .expect("process approval");
+
+        match out {
+            crate::agent::submission::SubmissionResult::Error { message } => {
+                assert!(message.contains("Request ID mismatch"));
+            }
+            other => panic!("unexpected submission result: {:?}", other),
+        }
+
+        let sess = session.lock().await;
+        let thread = sess.threads.get(&thread_id).expect("thread");
+        assert_eq!(thread.state, ThreadState::AwaitingApproval);
+        assert_eq!(thread.updated_at, original_updated_at);
+        assert_eq!(
+            thread
+                .pending_approval
+                .as_ref()
+                .map(|pending| pending.request_id),
+            Some(request_id)
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_process_interrupt_cancels_pending_approval_and_persists_turn() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let config = AgentConfig::resolve(&Settings::default()).expect("config");
+        let agent = Agent::new(
+            config,
+            harness.deps,
+            ChannelManager::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let message = IncomingMessage::new("test", "approval-interrupt-user", "/interrupt")
+            .with_metadata(json!({"source":"test"}));
+        let session = agent
+            .session_manager
+            .get_or_create_session("approval-interrupt-user")
+            .await;
+
+        let thread_id = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("Please run shell");
+            thread.record_tool_call("call-interrupt", "shell", json!({"command":"echo hi"}));
+            thread.await_approval(crate::agent::PendingApproval {
+                request_id: Uuid::new_v4(),
+                tool_name: "shell".to_string(),
+                parameters: json!({"command":"echo hi"}),
+                description: "Run shell".to_string(),
+                tool_call_id: "call-interrupt".to_string(),
+                context_messages: vec![ChatMessage::user("Please run shell")],
+            });
+            thread.id
+        };
+
+        let out = agent
+            .process_interrupt(&message, session.clone(), thread_id)
+            .await
+            .expect("process interrupt");
+
+        match out {
+            crate::agent::submission::SubmissionResult::Response { content } => {
+                assert!(content.contains("Approval request canceled"));
+            }
+            other => panic!("unexpected submission result: {:?}", other),
+        }
+
+        let sess = session.lock().await;
+        let thread = sess.threads.get(&thread_id).expect("thread");
+        assert_eq!(thread.state, ThreadState::Idle);
+        assert!(thread.pending_approval.is_none());
+        let turn = thread.last_turn().expect("turn");
+        assert!(
+            turn.response
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Approval request canceled")
+        );
+        assert!(
+            turn.tool_calls[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("approval canceled by interrupt")
+        );
+        drop(sess);
+
+        let messages = wait_for_conversation_messages(harness.db.as_ref(), thread_id, 2).await;
+        assert_eq!(messages[0].content, "Please run shell");
+        assert!(messages[1].content.contains("Approval request canceled"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_process_user_input_expired_approval_terminalizes_and_persists_turn() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let config = AgentConfig::resolve(&Settings::default()).expect("config");
+        let agent = Agent::new(
+            config,
+            harness.deps,
+            ChannelManager::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let message = IncomingMessage::new("test", "approval-timeout-user", "new input")
+            .with_metadata(json!({"source":"test"}));
+        let session = agent
+            .session_manager
+            .get_or_create_session("approval-timeout-user")
+            .await;
+
+        let thread_id = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("Please run shell");
+            thread.record_tool_call("call-timeout", "shell", json!({"command":"echo hi"}));
+            thread.await_approval(crate::agent::PendingApproval {
+                request_id: Uuid::new_v4(),
+                tool_name: "shell".to_string(),
+                parameters: json!({"command":"echo hi"}),
+                description: "Run shell".to_string(),
+                tool_call_id: "call-timeout".to_string(),
+                context_messages: vec![ChatMessage::user("Please run shell")],
+            });
+            thread.updated_at = Utc::now() - chrono::Duration::seconds(APPROVAL_TIMEOUT_SECS + 5);
+            thread.id
+        };
+
+        let out = agent
+            .process_user_input(&message, session.clone(), thread_id, "new input")
+            .await
+            .expect("process user input");
+
+        match out {
+            crate::agent::submission::SubmissionResult::Response { content } => {
+                assert!(content.contains("Approval request expired"));
+            }
+            other => panic!("unexpected submission result: {:?}", other),
+        }
+
+        let sess = session.lock().await;
+        let thread = sess.threads.get(&thread_id).expect("thread");
+        assert_eq!(thread.state, ThreadState::Idle);
+        assert!(thread.pending_approval.is_none());
+        let turn = thread.last_turn().expect("turn");
+        assert!(
+            turn.response
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Approval request expired")
+        );
+        assert!(
+            turn.tool_calls[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("approval timeout")
+        );
+        drop(sess);
+
+        let messages = wait_for_conversation_messages(harness.db.as_ref(), thread_id, 2).await;
+        assert_eq!(messages[0].content, "Please run shell");
+        assert!(messages[1].content.contains("Approval request expired"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_history_actions_block_while_waiting_for_approval() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let config = AgentConfig::resolve(&Settings::default()).expect("config");
+        let agent = Agent::new(
+            config,
+            harness.deps,
+            ChannelManager::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let session = agent
+            .session_manager
+            .get_or_create_session("approval-history-user")
+            .await;
+        let thread_id = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("Please run shell");
+            thread.record_tool_call("call-history", "shell", json!({"command":"echo hi"}));
+            thread.await_approval(crate::agent::PendingApproval {
+                request_id: Uuid::new_v4(),
+                tool_name: "shell".to_string(),
+                parameters: json!({"command":"echo hi"}),
+                description: "Run shell".to_string(),
+                tool_call_id: "call-history".to_string(),
+                context_messages: vec![ChatMessage::user("Please run shell")],
+            });
+            thread.id
+        };
+        let message = IncomingMessage::new("test", "approval-history-user", "undo");
+
+        let undo = agent
+            .process_undo(&message, session.clone(), thread_id)
+            .await
+            .expect("process undo");
+        let redo = agent
+            .process_redo(&message, session.clone(), thread_id)
+            .await
+            .expect("process redo");
+        let resume = agent
+            .process_resume(&message, session, thread_id, Uuid::new_v4())
+            .await
+            .expect("process resume");
+
+        match undo {
+            crate::agent::submission::SubmissionResult::Error { message } => {
+                assert!(message.contains("Cannot undo"));
+            }
+            other => panic!("unexpected undo result: {:?}", other),
+        }
+        match redo {
+            crate::agent::submission::SubmissionResult::Error { message } => {
+                assert!(message.contains("Cannot redo"));
+            }
+            other => panic!("unexpected redo result: {:?}", other),
+        }
+        match resume {
+            crate::agent::submission::SubmissionResult::Error { message } => {
+                assert!(message.contains("Cannot resume"));
+            }
+            other => panic!("unexpected resume result: {:?}", other),
+        }
     }
 
     #[cfg(feature = "libsql")]
@@ -2122,6 +2812,427 @@ mod tests {
                 >= 2,
             "expected approval flow policy_decision memory records"
         );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_process_approval_rechecks_hook_modification_and_requests_new_approval() {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(ApprovalHookTestTool)).await;
+        let harness = TestHarnessBuilder::new()
+            .with_tools(Arc::clone(&tools))
+            .build()
+            .await;
+        harness
+            .deps
+            .hooks
+            .register(Arc::new(ModifyToolCallHook))
+            .await;
+
+        let mut config = AgentConfig::resolve(&Settings::default()).expect("config");
+        config.autonomy_policy_engine_v1 = true;
+
+        let agent = Agent::new(
+            config,
+            harness.deps,
+            ChannelManager::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let message = IncomingMessage::new("test", "user-reapprove", "approve")
+            .with_metadata(json!({"source":"test"}));
+        let session = agent
+            .session_manager
+            .get_or_create_session("user-reapprove")
+            .await;
+
+        let (thread_id, request_id) = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("Please run the approval hook test tool");
+            thread.record_tool_call(
+                "call-modify",
+                "approval_hook_test",
+                json!({"dangerous":false}),
+            );
+            let request_id = Uuid::new_v4();
+            thread.await_approval(crate::agent::PendingApproval {
+                request_id,
+                tool_name: "approval_hook_test".to_string(),
+                parameters: json!({"dangerous": false}),
+                description: "Run approval_hook_test".to_string(),
+                tool_call_id: "call-modify".to_string(),
+                context_messages: vec![ChatMessage::user("Please run the approval hook test tool")],
+            });
+            (thread.id, request_id)
+        };
+
+        let out = agent
+            .process_approval(
+                &message,
+                session.clone(),
+                thread_id,
+                Some(request_id),
+                true,
+                false,
+            )
+            .await
+            .expect("process approval");
+
+        let new_request_id = match out {
+            crate::agent::submission::SubmissionResult::NeedApproval {
+                request_id,
+                tool_name,
+                parameters,
+                ..
+            } => {
+                assert_eq!(tool_name, "approval_hook_test");
+                assert_eq!(parameters, json!({"dangerous": true}));
+                request_id
+            }
+            other => panic!("unexpected submission result: {:?}", other),
+        };
+
+        assert_ne!(new_request_id, request_id);
+
+        let sess = session.lock().await;
+        let thread = sess.threads.get(&thread_id).expect("thread");
+        assert_eq!(thread.state, ThreadState::AwaitingApproval);
+        let pending = thread.pending_approval.as_ref().expect("pending approval");
+        assert_eq!(pending.parameters, json!({"dangerous": true}));
+
+        let policy_rows =
+            wait_for_policy_decisions_for_user(harness.db.as_ref(), "user-reapprove", 3).await;
+        assert!(policy_rows.iter().any(|d| {
+            d.tool_name.as_deref() == Some("approval_hook_test")
+                && d.tool_call_id.as_deref() == Some("call-modify")
+                && d.action_kind == "approval_resume_recheck"
+                && d.decision == crate::agent::PolicyDecisionKind::RequireApproval
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_process_approval_rechecks_hook_even_when_policy_engine_disabled() {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(ApprovalHookTestTool)).await;
+        let harness = TestHarnessBuilder::new()
+            .with_tools(Arc::clone(&tools))
+            .build()
+            .await;
+        harness
+            .deps
+            .hooks
+            .register(Arc::new(ModifyToolCallHook))
+            .await;
+
+        let mut config = AgentConfig::resolve(&Settings::default()).expect("config");
+        config.autonomy_policy_engine_v1 = false;
+
+        let agent = Agent::new(
+            config,
+            harness.deps,
+            ChannelManager::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let message = IncomingMessage::new("test", "user-reapprove-no-policy", "approve");
+        let session = agent
+            .session_manager
+            .get_or_create_session("user-reapprove-no-policy")
+            .await;
+
+        let (thread_id, request_id) = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("Please run the approval hook test tool");
+            thread.record_tool_call(
+                "call-modify",
+                "approval_hook_test",
+                json!({"dangerous":false}),
+            );
+            let request_id = Uuid::new_v4();
+            thread.await_approval(crate::agent::PendingApproval {
+                request_id,
+                tool_name: "approval_hook_test".to_string(),
+                parameters: json!({"dangerous": false}),
+                description: "Run approval_hook_test".to_string(),
+                tool_call_id: "call-modify".to_string(),
+                context_messages: vec![ChatMessage::user("Please run the approval hook test tool")],
+            });
+            (thread.id, request_id)
+        };
+
+        let out = agent
+            .process_approval(
+                &message,
+                session.clone(),
+                thread_id,
+                Some(request_id),
+                true,
+                false,
+            )
+            .await
+            .expect("process approval");
+
+        match out {
+            crate::agent::submission::SubmissionResult::NeedApproval {
+                tool_name,
+                parameters,
+                ..
+            } => {
+                assert_eq!(tool_name, "approval_hook_test");
+                assert_eq!(parameters, json!({"dangerous": true}));
+            }
+            other => panic!("unexpected submission result: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_approval_request_id_mismatch_preserves_timestamp() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let agent = Agent::new(
+            AgentConfig::resolve(&Settings::default()).expect("config"),
+            harness.deps,
+            ChannelManager::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let message = IncomingMessage::new("test", "user-mismatch", "approve");
+        let session = agent
+            .session_manager
+            .get_or_create_session("user-mismatch")
+            .await;
+
+        let (thread_id, original_request_id, original_updated_at) = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("Please run shell");
+            let request_id = Uuid::new_v4();
+            thread.await_approval(crate::agent::PendingApproval {
+                request_id,
+                tool_name: "shell".to_string(),
+                parameters: json!({"command":"echo hi"}),
+                description: "Run shell".to_string(),
+                tool_call_id: "call-mismatch".to_string(),
+                context_messages: vec![ChatMessage::user("Please run shell")],
+            });
+            thread.updated_at = Utc::now() - chrono::Duration::minutes(10);
+            (thread.id, request_id, thread.updated_at)
+        };
+
+        let out = agent
+            .process_approval(
+                &message,
+                session.clone(),
+                thread_id,
+                Some(Uuid::new_v4()),
+                true,
+                false,
+            )
+            .await
+            .expect("process approval");
+
+        match out {
+            crate::agent::submission::SubmissionResult::Error { message } => {
+                assert!(message.contains("Request ID mismatch"));
+            }
+            other => panic!("unexpected submission result: {:?}", other),
+        }
+
+        let sess = session.lock().await;
+        let thread = sess.threads.get(&thread_id).expect("thread");
+        assert_eq!(thread.state, ThreadState::AwaitingApproval);
+        assert_eq!(thread.updated_at, original_updated_at);
+        assert_eq!(
+            thread.pending_approval.as_ref().map(|p| p.request_id),
+            Some(original_request_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_undo_redo_resume_blocked_while_waiting_for_approval() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let agent = Agent::new(
+            AgentConfig::resolve(&Settings::default()).expect("config"),
+            harness.deps,
+            ChannelManager::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let session = agent
+            .session_manager
+            .get_or_create_session("user-blocked")
+            .await;
+        let thread_id = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("Please run shell");
+            thread.await_approval(crate::agent::PendingApproval {
+                request_id: Uuid::new_v4(),
+                tool_name: "shell".to_string(),
+                parameters: json!({"command":"echo hi"}),
+                description: "Run shell".to_string(),
+                tool_call_id: "call-blocked".to_string(),
+                context_messages: vec![ChatMessage::user("Please run shell")],
+            });
+            thread.id
+        };
+        let message = IncomingMessage::new("test", "user-blocked", "undo");
+
+        let undo = agent
+            .process_undo(&message, session.clone(), thread_id)
+            .await
+            .expect("undo");
+        let redo = agent
+            .process_redo(&message, session.clone(), thread_id)
+            .await
+            .expect("redo");
+        let resume = agent
+            .process_resume(&message, session.clone(), thread_id, Uuid::new_v4())
+            .await
+            .expect("resume");
+
+        for result in [undo, redo, resume] {
+            match result {
+                crate::agent::submission::SubmissionResult::Error { message } => {
+                    assert!(message.contains("waiting for approval"));
+                }
+                other => panic!("unexpected submission result: {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_undo_redo_resume_expired_approval_terminalizes_pending_request() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let agent = Agent::new(
+            AgentConfig::resolve(&Settings::default()).expect("config"),
+            harness.deps,
+            ChannelManager::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let message = IncomingMessage::new("test", "user-expired-history", "undo");
+
+        for action in ["undo", "redo", "resume"] {
+            let session = agent
+                .session_manager
+                .get_or_create_session(&format!("user-expired-history-{action}"))
+                .await;
+            let thread_id = {
+                let mut sess = session.lock().await;
+                let thread = sess.create_thread();
+                thread.start_turn("Please run shell");
+                thread.await_approval(crate::agent::PendingApproval {
+                    request_id: Uuid::new_v4(),
+                    tool_name: "shell".to_string(),
+                    parameters: json!({"command":"echo hi"}),
+                    description: "Run shell".to_string(),
+                    tool_call_id: format!("call-{action}"),
+                    context_messages: vec![ChatMessage::user("Please run shell")],
+                });
+                thread.updated_at =
+                    Utc::now() - chrono::TimeDelta::seconds(APPROVAL_TIMEOUT_SECS + 1);
+                thread.id
+            };
+
+            let result = match action {
+                "undo" => {
+                    agent
+                        .process_undo(&message, session.clone(), thread_id)
+                        .await
+                }
+                "redo" => {
+                    agent
+                        .process_redo(&message, session.clone(), thread_id)
+                        .await
+                }
+                "resume" => {
+                    agent
+                        .process_resume(&message, session.clone(), thread_id, Uuid::new_v4())
+                        .await
+                }
+                _ => unreachable!(),
+            }
+            .expect("history action");
+
+            match result {
+                crate::agent::submission::SubmissionResult::Response { content } => {
+                    assert!(content.contains("Approval request expired"));
+                }
+                other => panic!("unexpected submission result: {:?}", other),
+            }
+
+            let sess = session.lock().await;
+            let thread = sess.threads.get(&thread_id).expect("thread");
+            assert_ne!(thread.state, ThreadState::AwaitingApproval);
+            assert!(thread.pending_approval.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_approval_missing_request_id_clears_expired_pending_approval() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let agent = Agent::new(
+            AgentConfig::resolve(&Settings::default()).expect("config"),
+            harness.deps,
+            ChannelManager::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let message = IncomingMessage::new("gateway", "user-expired-approval", "approve");
+        let session = agent
+            .session_manager
+            .get_or_create_session("user-expired-approval")
+            .await;
+
+        let thread_id = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            thread.start_turn("Please run shell");
+            thread.await_approval(crate::agent::PendingApproval {
+                request_id: Uuid::new_v4(),
+                tool_name: "shell".to_string(),
+                parameters: json!({"command":"echo hi"}),
+                description: "Run shell".to_string(),
+                tool_call_id: "call-expired".to_string(),
+                context_messages: vec![ChatMessage::user("Please run shell")],
+            });
+            thread.updated_at = Utc::now() - chrono::TimeDelta::seconds(APPROVAL_TIMEOUT_SECS + 1);
+            thread.id
+        };
+
+        let result = agent
+            .process_approval(&message, session.clone(), thread_id, None, true, false)
+            .await
+            .expect("process approval");
+
+        match result {
+            crate::agent::submission::SubmissionResult::Response { content } => {
+                assert!(content.contains("Approval request expired"));
+            }
+            other => panic!("unexpected submission result: {:?}", other),
+        }
+
+        let sess = session.lock().await;
+        let thread = sess.threads.get(&thread_id).expect("thread");
+        assert!(thread.pending_approval.is_none());
     }
 
     #[cfg(feature = "libsql")]

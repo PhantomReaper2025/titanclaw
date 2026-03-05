@@ -1059,8 +1059,8 @@ impl Agent {
             Submission::SystemCommand { command, args } => {
                 self.handle_system_command(&command, &args).await
             }
-            Submission::Undo => self.process_undo(session, thread_id).await,
-            Submission::Redo => self.process_redo(session, thread_id).await,
+            Submission::Undo => self.process_undo(message, session, thread_id).await,
+            Submission::Redo => self.process_redo(message, session, thread_id).await,
             Submission::Interrupt => self.process_interrupt(message, session, thread_id).await,
             Submission::Compact => self.process_compact(session, thread_id).await,
             Submission::Clear => self.process_clear(session, thread_id).await,
@@ -1073,7 +1073,8 @@ impl Agent {
                 self.process_switch_thread(message, target).await
             }
             Submission::Resume { checkpoint_id } => {
-                self.process_resume(session, thread_id, checkpoint_id).await
+                self.process_resume(message, session, thread_id, checkpoint_id)
+                    .await
             }
             Submission::ExecApproval {
                 request_id,

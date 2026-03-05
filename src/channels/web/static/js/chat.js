@@ -34,28 +34,78 @@ function enableChatInput() {
   input.focus();
 }
 
+function setApprovalCardButtonsDisabled(card, disabled) {
+  if (!card) return;
+  const buttons = card.querySelectorAll('.approval-actions button');
+  buttons.forEach((btn) => {
+    btn.disabled = disabled;
+  });
+}
+
+function showApprovalCardError(card, message) {
+  if (!card) return;
+  let errorEl = card.querySelector('.approval-error');
+  if (!errorEl) {
+    errorEl = document.createElement('div');
+    errorEl.className = 'approval-error';
+    card.appendChild(errorEl);
+  }
+  errorEl.textContent = message;
+}
+
+function clearApprovalCardError(card) {
+  if (!card) return;
+  const errorEl = card.querySelector('.approval-error');
+  if (errorEl) {
+    errorEl.remove();
+  }
+}
+
+function markApprovalCardResolved(card, action) {
+  if (!card) return;
+  clearApprovalCardError(card);
+  setApprovalCardButtonsDisabled(card, true);
+  const actions = card.querySelector('.approval-actions');
+  if (!actions) return;
+
+  const existingLabel = actions.querySelector('.approval-resolved');
+  if (existingLabel) {
+    existingLabel.remove();
+  }
+
+  const label = document.createElement('span');
+  label.className = 'approval-resolved';
+  const labelText = action === 'approve'
+    ? 'Approved'
+    : action === 'always'
+      ? 'Always approved (when policy allows)'
+      : 'Denied';
+  label.textContent = labelText;
+  actions.appendChild(label);
+}
+
 function sendApprovalAction(requestId, action) {
+  const card = document.querySelector('.approval-card[data-request-id="' + requestId + '"]');
+  const approvalThreadId = card
+    ? card.getAttribute('data-thread-id')
+    : currentThreadId;
+
+  clearApprovalCardError(card);
+  setApprovalCardButtonsDisabled(card, true);
+
   apiFetch('/api/chat/approval', {
     method: 'POST',
-    body: { request_id: requestId, action: action, thread_id: currentThreadId },
+    body: { request_id: requestId, action: action, thread_id: approvalThreadId || undefined },
+  }).then(() => {
+    markApprovalCardResolved(card, action);
   }).catch((err) => {
+    setApprovalCardButtonsDisabled(card, false);
+    if (card) {
+      showApprovalCardError(card, 'Failed to send approval: ' + err.message);
+      return;
+    }
     addMessage('system', 'Failed to send approval: ' + err.message);
   });
-
-  // Disable buttons and show confirmation on the card
-  const card = document.querySelector('.approval-card[data-request-id="' + requestId + '"]');
-  if (card) {
-    const buttons = card.querySelectorAll('.approval-actions button');
-    buttons.forEach((btn) => {
-      btn.disabled = true;
-    });
-    const actions = card.querySelector('.approval-actions');
-    const label = document.createElement('span');
-    label.className = 'approval-resolved';
-    const labelText = action === 'approve' ? 'Approved' : action === 'always' ? 'Always approved' : 'Denied';
-    label.textContent = labelText;
-    actions.appendChild(label);
-  }
 }
 
 function renderMarkdown(text) {
@@ -301,9 +351,16 @@ function setStatus(text, spinning) {
 
 function showApproval(data) {
   const container = document.getElementById('chat-messages');
+  document
+    .querySelectorAll('.approval-card[data-request-id="' + data.request_id + '"]')
+    .forEach((existing) => existing.remove());
+
   const card = document.createElement('div');
   card.className = 'approval-card';
   card.setAttribute('data-request-id', data.request_id);
+  if (data.thread_id) {
+    card.setAttribute('data-thread-id', data.thread_id);
+  }
 
   const header = document.createElement('div');
   header.className = 'approval-header';
@@ -388,6 +445,13 @@ function showJobCard(data) {
   id.className = 'job-card-id';
   id.textContent = (data.job_id || '').substring(0, 8);
   info.appendChild(id);
+
+  if (data.project_dir) {
+    const dir = document.createElement('div');
+    dir.className = 'job-card-dir';
+    dir.textContent = data.project_dir;
+    info.appendChild(dir);
+  }
 
   card.appendChild(info);
 

@@ -267,6 +267,97 @@ You can reply with one of these:\n\
     )
 }
 
+fn approval_reason_note(reason_codes: &[String]) -> Option<&'static str> {
+    let has = |code: &str| reason_codes.iter().any(|c| c == code);
+    if has("contract_v2_override_auto_approval")
+        || has("contract_v2_system_mutation")
+        || has("contract_v2_non_simulatable_high_impact")
+    {
+        return Some(
+            "High-impact action detected: explicit approval is required each time for safety; 'Always' does not bypass this policy.",
+        );
+    }
+    if has("destructive_params_override_auto_approval") {
+        return Some(
+            "Destructive parameters detected: explicit approval is required for this call.",
+        );
+    }
+    None
+}
+
+pub(super) fn enrich_approval_description(base: &str, reason_codes: &[String]) -> String {
+    if let Some(note) = approval_reason_note(reason_codes) {
+        format!("{} {}", base.trim(), note)
+    } else {
+        base.to_string()
+    }
+}
+
+fn apply_chat_create_job_defaults(params: &serde_json::Value) -> serde_json::Value {
+    let mut effective = params.clone();
+    let Some(obj) = effective.as_object_mut() else {
+        return effective;
+    };
+
+    // Chat-first default: start sandbox jobs asynchronously unless explicitly overridden.
+    obj.entry("wait".to_string())
+        .or_insert_with(|| serde_json::Value::Bool(false));
+
+    // Empty project_dir should behave as omitted.
+    if obj
+        .get("project_dir")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .is_some_and(|s| s.is_empty())
+    {
+        obj.remove("project_dir");
+    }
+    effective
+}
+
+fn format_create_job_error(raw_reason: &str) -> String {
+    let reason = raw_reason.trim();
+    let normalized = reason.to_ascii_lowercase();
+
+    if normalized.contains("sandbox jobs are unavailable")
+        || normalized.contains("sandbox not enabled")
+    {
+        return format!(
+            "{} Fix: enable sandbox runtime and restart TitanClaw before creating sandbox jobs.",
+            reason
+        );
+    }
+    if normalized.contains("failed to create container")
+        || normalized.contains("no such image")
+        || normalized.contains("docker")
+    {
+        return format!(
+            "{} Fix: verify Docker is running and the worker image is available, then retry.",
+            reason
+        );
+    }
+    if normalized.contains("project directory must be under")
+        || normalized.contains("must not contain '..'")
+        || normalized.contains("project dir")
+    {
+        return format!(
+            "{} Fix: omit `project_dir` for auto-create, or use a safe relative path like `portfolio`.",
+            reason
+        );
+    }
+    if normalized.contains("timed out") {
+        return format!(
+            "{} Fix: retry with `wait=false` and monitor progress via `job_events`.",
+            reason
+        );
+    }
+
+    format!(
+        "{} Fix: retry with `wait=false`; if needed, omit `project_dir` to auto-create a safe sandbox path.",
+        reason
+    )
+}
+
 fn profile_breaker_is_open(profile: &ToolReliabilityProfile, now: DateTime<Utc>) -> bool {
     if !matches!(profile.breaker_state, CircuitBreakerState::Open) {
         return false;
@@ -1454,90 +1545,6 @@ impl Agent {
                             }
                         }
 
-                        // Check if tool requires approval
-                        if let Some(tool) = self.tools().get(&tc.name).await {
-                            let contract_v2 = self
-                                .resolve_tool_contract_v2_for_user(&tc.name, &message.user_id)
-                                .await;
-                            let session_auto_approved = {
-                                let sess = session.lock().await;
-                                sess.is_tool_auto_approved(&tc.name)
-                            };
-                            match evaluate_dispatcher_tool_approval(
-                                tool.as_ref(),
-                                &tc.arguments,
-                                session_auto_approved,
-                                contract_v2.as_ref(),
-                            ) {
-                                ApprovalPolicyOutcome::NoApprovalRequired => {}
-                                ApprovalPolicyOutcome::RequireApproval { reason_codes } => {
-                                    if reason_codes
-                                        .iter()
-                                        .any(|c| c == "destructive_params_override_auto_approval")
-                                    {
-                                        tracing::info!(
-                                            tool = %tc.name,
-                                            "Parameters require explicit approval despite auto-approve"
-                                        );
-                                    }
-                                    let reason_codes_for_db = reason_codes.clone();
-                                    emit_policy_decision(&PolicyDecisionRecord {
-                                        user_id: message.user_id.clone(),
-                                        channel: message.channel.clone(),
-                                        thread_id,
-                                        tool_name: tc.name.clone(),
-                                        tool_call_id: tc.id.clone(),
-                                        decision: TelemetryPolicyDecisionKind::RequireApproval,
-                                        reason_codes,
-                                        auto_approved: Some(false),
-                                    });
-                                    persist_policy_decision_best_effort(
-                                        self,
-                                        message,
-                                        &job_ctx,
-                                        &tc.name,
-                                        &tc.id,
-                                        TelemetryPolicyDecisionKind::RequireApproval,
-                                        reason_codes_for_db,
-                                        Some(false),
-                                    );
-                                    let pending = PendingApproval {
-                                        request_id: Uuid::new_v4(),
-                                        tool_name: tc.name.clone(),
-                                        parameters: tc.arguments.clone(),
-                                        description: tool.description().to_string(),
-                                        tool_call_id: tc.id.clone(),
-                                        context_messages: context_messages.clone(),
-                                    };
-
-                                    return Ok(AgenticLoopResult::NeedApproval { pending });
-                                }
-                                ApprovalPolicyOutcome::AllowAutoApproved { reason_codes } => {
-                                    let reason_codes_for_db = reason_codes.clone();
-                                    emit_policy_decision(&PolicyDecisionRecord {
-                                        user_id: message.user_id.clone(),
-                                        channel: message.channel.clone(),
-                                        thread_id,
-                                        tool_name: tc.name.clone(),
-                                        tool_call_id: tc.id.clone(),
-                                        decision: TelemetryPolicyDecisionKind::Allow,
-                                        reason_codes,
-                                        auto_approved: Some(true),
-                                    });
-                                    persist_policy_decision_best_effort(
-                                        self,
-                                        message,
-                                        &job_ctx,
-                                        &tc.name,
-                                        &tc.id,
-                                        TelemetryPolicyDecisionKind::Allow,
-                                        reason_codes_for_db,
-                                        Some(true),
-                                    );
-                                }
-                            }
-                        }
-
                         // Hook: BeforeToolCall — allow hooks to modify or reject tool calls
                         {
                             match evaluate_tool_call_hook(
@@ -1610,6 +1617,95 @@ impl Agent {
                                 }
                                 HookToolPolicyOutcome::Continue { parameters } => {
                                     tc.arguments = parameters;
+                                }
+                            }
+                        }
+
+                        // Check if tool requires approval after hook mutation so
+                        // rewritten parameters cannot bypass policy gates.
+                        if let Some(tool) = self.tools().get(&tc.name).await {
+                            let contract_v2 = self
+                                .resolve_tool_contract_v2_for_user(&tc.name, &message.user_id)
+                                .await;
+                            let session_auto_approved = {
+                                let sess = session.lock().await;
+                                sess.is_tool_auto_approved(&tc.name)
+                            };
+                            match evaluate_dispatcher_tool_approval(
+                                tool.as_ref(),
+                                &tc.arguments,
+                                session_auto_approved,
+                                contract_v2.as_ref(),
+                            ) {
+                                ApprovalPolicyOutcome::NoApprovalRequired => {}
+                                ApprovalPolicyOutcome::RequireApproval { reason_codes } => {
+                                    if reason_codes
+                                        .iter()
+                                        .any(|c| c == "destructive_params_override_auto_approval")
+                                    {
+                                        tracing::info!(
+                                            tool = %tc.name,
+                                            "Parameters require explicit approval despite auto-approve"
+                                        );
+                                    }
+                                    let approval_description = enrich_approval_description(
+                                        tool.description(),
+                                        &reason_codes,
+                                    );
+                                    let reason_codes_for_db = reason_codes.clone();
+                                    emit_policy_decision(&PolicyDecisionRecord {
+                                        user_id: message.user_id.clone(),
+                                        channel: message.channel.clone(),
+                                        thread_id,
+                                        tool_name: tc.name.clone(),
+                                        tool_call_id: tc.id.clone(),
+                                        decision: TelemetryPolicyDecisionKind::RequireApproval,
+                                        reason_codes,
+                                        auto_approved: Some(false),
+                                    });
+                                    persist_policy_decision_best_effort(
+                                        self,
+                                        message,
+                                        &job_ctx,
+                                        &tc.name,
+                                        &tc.id,
+                                        TelemetryPolicyDecisionKind::RequireApproval,
+                                        reason_codes_for_db,
+                                        Some(false),
+                                    );
+                                    let pending = PendingApproval {
+                                        request_id: Uuid::new_v4(),
+                                        tool_name: tc.name.clone(),
+                                        parameters: tc.arguments.clone(),
+                                        description: approval_description,
+                                        tool_call_id: tc.id.clone(),
+                                        context_messages: context_messages.clone(),
+                                    };
+
+                                    return Ok(AgenticLoopResult::NeedApproval { pending });
+                                }
+                                ApprovalPolicyOutcome::AllowAutoApproved { reason_codes } => {
+                                    let reason_codes_for_db = reason_codes.clone();
+                                    emit_policy_decision(&PolicyDecisionRecord {
+                                        user_id: message.user_id.clone(),
+                                        channel: message.channel.clone(),
+                                        thread_id,
+                                        tool_name: tc.name.clone(),
+                                        tool_call_id: tc.id.clone(),
+                                        decision: TelemetryPolicyDecisionKind::Allow,
+                                        reason_codes,
+                                        auto_approved: Some(true),
+                                    });
+                                    persist_policy_decision_best_effort(
+                                        self,
+                                        message,
+                                        &job_ctx,
+                                        &tc.name,
+                                        &tc.id,
+                                        TelemetryPolicyDecisionKind::Allow,
+                                        reason_codes_for_db,
+                                        Some(true),
+                                    );
                                 }
                             }
                         }
@@ -1834,8 +1930,17 @@ impl Agent {
             }
         }
 
+        let effective_params = if tool_name == "create_job" {
+            apply_chat_create_job_defaults(params)
+        } else {
+            params.clone()
+        };
+
         // Validate tool parameters
-        let validation = self.safety().validator().validate_tool_params(params);
+        let validation = self
+            .safety()
+            .validator()
+            .validate_tool_params(&effective_params);
         if !validation.is_valid {
             let details = validation
                 .errors
@@ -1852,7 +1957,7 @@ impl Agent {
 
         tracing::debug!(
             tool = %tool_name,
-            params = %params,
+            params = %effective_params,
             "Tool call started"
         );
 
@@ -1883,13 +1988,13 @@ impl Agent {
                 })
             };
             tokio::time::timeout(timeout, async {
-                tool.execute_streaming(params.clone(), job_ctx, Some(on_chunk))
+                tool.execute_streaming(effective_params.clone(), job_ctx, Some(on_chunk))
                     .await
             })
             .await
         } else {
             tokio::time::timeout(timeout, async {
-                tool.execute(params.clone(), job_ctx).await
+                tool.execute(effective_params.clone(), job_ctx).await
             })
             .await
         };
@@ -1932,14 +2037,94 @@ impl Agent {
         }
 
         let result = result
-            .map_err(|_| crate::error::ToolError::Timeout {
-                name: tool_name.to_string(),
-                timeout,
+            .map_err(|_| {
+                if tool_name == "create_job" {
+                    crate::error::ToolError::ExecutionFailed {
+                        name: tool_name.to_string(),
+                        reason: format_create_job_error(&format!(
+                            "create_job timed out after {} seconds",
+                            timeout.as_secs()
+                        )),
+                    }
+                } else {
+                    crate::error::ToolError::Timeout {
+                        name: tool_name.to_string(),
+                        timeout,
+                    }
+                }
             })?
-            .map_err(|e| crate::error::ToolError::ExecutionFailed {
-                name: tool_name.to_string(),
-                reason: e.to_string(),
+            .map_err(|e| {
+                let reason = if tool_name == "create_job" {
+                    format_create_job_error(&e.to_string())
+                } else {
+                    e.to_string()
+                };
+                crate::error::ToolError::ExecutionFailed {
+                    name: tool_name.to_string(),
+                    reason,
+                }
             })?;
+
+        if tool_name == "create_job" {
+            let status = result
+                .result
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if matches!(status, "started" | "completed") {
+                let job_id = result
+                    .result
+                    .get("job_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let browse_url = result
+                    .result
+                    .get("browse_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let project_dir = result
+                    .result
+                    .get("project_dir")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+
+                if !job_id.is_empty() && !browse_url.is_empty() {
+                    let title = effective_params
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Sandbox Job")
+                        .to_string();
+                    let _ = self
+                        .channels
+                        .send_status(
+                            channel_name,
+                            StatusUpdate::JobStarted {
+                                job_id,
+                                title,
+                                browse_url,
+                                project_dir: project_dir.clone(),
+                            },
+                            metadata,
+                        )
+                        .await;
+                    if let Some(project_dir) = project_dir {
+                        let _ = self
+                            .channels
+                            .send_status(
+                                channel_name,
+                                StatusUpdate::Status(format!(
+                                    "Sandbox project directory: {}",
+                                    project_dir
+                                )),
+                                metadata,
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
 
         // Convert result to string
         serde_json::to_string_pretty(&result.result).map_err(|e| {
@@ -2005,21 +2190,162 @@ pub(super) fn detect_auth_awaiting(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use crate::error::Error;
-    use crate::tools::{
-        CircuitBreakerState, ToolContractSource, ToolContractV2Descriptor, ToolDryRunSupport,
-        ToolIdempotency, ToolReliabilityProfile, ToolSideEffectLevel,
+    use crate::error::LlmError;
+    use crate::llm::{
+        CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ToolCall,
+        ToolCompletionRequest, ToolCompletionResponse,
     };
+    use crate::testing::TestHarnessBuilder;
+    use crate::tools::{
+        CircuitBreakerState, Tool, ToolContractSource, ToolContractV2Descriptor, ToolDryRunSupport,
+        ToolIdempotency, ToolOutput, ToolRegistry, ToolReliabilityProfile, ToolSideEffectLevel,
+    };
+    use async_trait::async_trait;
     use chrono::Utc;
+    use rust_decimal::Decimal;
+    use serde_json::json;
 
     use super::{
-        TOOL_RESULT_CHUNK_CHARS, TOOL_STREAM_EVENT_PREFIX, ToolStreamEvent,
-        chunk_tool_result_preview, contract_routing_bonus, detect_auth_awaiting,
+        AgenticLoopResult, TOOL_RESULT_CHUNK_CHARS, TOOL_STREAM_EVENT_PREFIX, ToolStreamEvent,
+        apply_chat_create_job_defaults, chunk_tool_result_preview, contract_routing_bonus,
+        detect_auth_awaiting, enrich_approval_description, format_create_job_error,
         looks_like_non_actionable_response, merge_fallback_candidates,
         parse_contract_fallback_tools, parse_profile_fallback_tools, parse_tool_stream_event,
         profile_breaker_is_open, render_non_actionable_recovery_response, shell_preview_from_args,
         should_proactively_reroute,
     };
+    use crate::agent::Agent;
+    use crate::channels::{ChannelManager, IncomingMessage};
+    use crate::config::AgentConfig;
+    use crate::hooks::{Hook, HookContext, HookEvent, HookFailureMode, HookOutcome, HookPoint};
+    use crate::settings::Settings;
+
+    struct HookMutatesToDangerousParams;
+
+    #[async_trait]
+    impl Hook for HookMutatesToDangerousParams {
+        fn name(&self) -> &str {
+            "hook_mutates_to_dangerous_params"
+        }
+
+        fn hook_points(&self) -> &[HookPoint] {
+            static POINTS: [HookPoint; 1] = [HookPoint::BeforeToolCall];
+            &POINTS
+        }
+
+        fn failure_mode(&self) -> HookFailureMode {
+            HookFailureMode::FailClosed
+        }
+
+        fn timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        async fn execute(
+            &self,
+            event: &HookEvent,
+            _ctx: &HookContext,
+        ) -> Result<HookOutcome, crate::hooks::HookError> {
+            match event {
+                HookEvent::ToolCall { .. } => {
+                    Ok(HookOutcome::modify(json!({"dangerous": true}).to_string()))
+                }
+                _ => Ok(HookOutcome::ok()),
+            }
+        }
+    }
+
+    struct ApprovalHookTestTool;
+
+    #[async_trait]
+    impl Tool for ApprovalHookTestTool {
+        fn name(&self) -> &str {
+            "approval_hook_test"
+        }
+
+        fn description(&self) -> &str {
+            "Tool used to verify approval is re-evaluated after hook mutation"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": {
+                    "dangerous": { "type": "boolean" }
+                },
+                "required": ["dangerous"],
+                "additionalProperties": false
+            })
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _job_ctx: &crate::context::JobContext,
+        ) -> Result<ToolOutput, crate::tools::ToolError> {
+            panic!("approval_hook_test should not execute when re-approval is required");
+        }
+
+        fn requires_approval(&self) -> bool {
+            true
+        }
+
+        fn requires_approval_for(&self, params: &serde_json::Value) -> bool {
+            params
+                .get("dangerous")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        }
+
+        fn execution_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+    }
+
+    struct SingleToolCallLlm;
+
+    #[async_trait]
+    impl LlmProvider for SingleToolCallLlm {
+        fn model_name(&self) -> &str {
+            "single-tool-call-llm"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            Err(LlmError::InvalidResponse {
+                provider: self.model_name().to_string(),
+                reason: "complete() should not be called in this test".to_string(),
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, LlmError> {
+            Ok(ToolCompletionResponse {
+                content: Some("Using the test tool.".to_string()),
+                tool_calls: vec![ToolCall {
+                    id: "call-approval-hook".to_string(),
+                    name: "approval_hook_test".to_string(),
+                    arguments: json!({"dangerous": false}),
+                }],
+                input_tokens: 1,
+                output_tokens: 1,
+                finish_reason: FinishReason::ToolUse,
+                response_id: None,
+            })
+        }
+    }
 
     #[test]
     fn test_chunk_tool_result_preview_empty() {
@@ -2222,6 +2548,99 @@ mod tests {
         let recovery = render_non_actionable_recovery_response("No actionable task provided.");
         assert!(recovery.contains("clearer objective"));
         assert!(recovery.contains("Exact outcome"));
+    }
+
+    #[test]
+    fn test_enrich_approval_description_mentions_high_impact_policy() {
+        let out = enrich_approval_description(
+            "Create and execute a job.",
+            &[
+                "contract_v2_override_auto_approval".to_string(),
+                "contract_v2_system_mutation".to_string(),
+            ],
+        );
+        assert!(out.contains("High-impact action detected"));
+        assert!(out.contains("Always"));
+    }
+
+    #[test]
+    fn test_apply_chat_create_job_defaults_sets_wait_false_and_drops_empty_project_dir() {
+        let raw = serde_json::json!({
+            "title": "Portfolio",
+            "description": "Build a site",
+            "project_dir": "   "
+        });
+        let out = apply_chat_create_job_defaults(&raw);
+        assert_eq!(out.get("wait"), Some(&serde_json::Value::Bool(false)));
+        assert!(out.get("project_dir").is_none());
+    }
+
+    #[test]
+    fn test_format_create_job_error_project_dir_guidance() {
+        let out = format_create_job_error(
+            "project directory must be under /home/user/.ironclaw/projects",
+        );
+        assert!(out.contains("omit `project_dir`"));
+        assert!(out.contains("portfolio"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_run_agentic_loop_requires_approval_after_hook_parameter_mutation() {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(ApprovalHookTestTool)).await;
+
+        let llm = Arc::new(SingleToolCallLlm);
+        let harness = TestHarnessBuilder::new()
+            .with_llm(llm)
+            .with_tools(Arc::clone(&tools))
+            .build()
+            .await;
+        harness
+            .deps
+            .hooks
+            .register(Arc::new(HookMutatesToDangerousParams))
+            .await;
+
+        let config = AgentConfig::resolve(&Settings::default()).expect("config");
+        let agent = Agent::new(
+            config,
+            harness.deps,
+            ChannelManager::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let session = agent
+            .session_manager
+            .get_or_create_session("dispatcher-hook-user")
+            .await;
+        let (thread_id, context_messages) = {
+            let mut sess = session.lock().await;
+            sess.auto_approve_tool("approval_hook_test");
+            let thread = sess.create_thread();
+            thread
+                .try_start_turn("Run the approval hook test tool")
+                .expect("start turn");
+            (thread.id, thread.messages())
+        };
+
+        let message = IncomingMessage::new("test", "dispatcher-hook-user", "run")
+            .with_metadata(json!({"source":"test"}));
+        let result = agent
+            .run_agentic_loop(&message, session, thread_id, context_messages, false)
+            .await
+            .expect("agentic loop result");
+
+        match result {
+            AgenticLoopResult::NeedApproval { pending } => {
+                assert_eq!(pending.tool_name, "approval_hook_test");
+                assert_eq!(pending.parameters, json!({"dangerous": true}));
+            }
+            _ => panic!("expected need approval after hook mutation"),
+        }
     }
 
     #[test]

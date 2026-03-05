@@ -81,25 +81,29 @@ function connectSSE() {
   eventSource.addEventListener('job_started', (e) => {
     touchChatActivity();
     const data = JSON.parse(e.data);
+    if (!isCurrentThread(data.thread_id)) return;
     showJobCard(data);
   });
 
   eventSource.addEventListener('approval_needed', (e) => {
     touchChatActivity();
     const data = JSON.parse(e.data);
+    if (!isCurrentThread(data.thread_id)) return;
     showApproval(data);
   });
 
   eventSource.addEventListener('auth_required', (e) => {
     touchChatActivity();
     const data = JSON.parse(e.data);
+    if (!isCurrentThread(data.thread_id)) return;
     showAuthCard(data);
   });
 
   eventSource.addEventListener('auth_completed', (e) => {
     touchChatActivity();
     const data = JSON.parse(e.data);
-    removeAuthCard(data.extension_name);
+    if (!isCurrentThread(data.thread_id)) return;
+    removeAuthCard(data.extension_name, data.thread_id);
     showToast(data.message, 'success');
     enableChatInput();
   });

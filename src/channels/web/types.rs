@@ -130,6 +130,10 @@ pub enum SseEvent {
         job_id: String,
         title: String,
         browse_url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        project_dir: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
     },
     #[serde(rename = "approval_needed")]
     ApprovalNeeded {
@@ -137,6 +141,8 @@ pub enum SseEvent {
         tool_name: String,
         description: String,
         parameters: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
     },
     #[serde(rename = "auth_required")]
     AuthRequired {
@@ -147,12 +153,16 @@ pub enum SseEvent {
         auth_url: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         setup_url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
     },
     #[serde(rename = "auth_completed")]
     AuthCompleted {
         extension_name: String,
         success: bool,
         message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
     },
     #[serde(rename = "error")]
     Error {
@@ -450,12 +460,14 @@ pub struct SkillInstallRequest {
 pub struct AuthTokenRequest {
     pub extension_name: String,
     pub token: String,
+    pub thread_id: Option<String>,
 }
 
 /// Request to cancel an in-progress auth flow.
 #[derive(Debug, Deserialize)]
 pub struct AuthCancelRequest {
     pub extension_name: String,
+    pub thread_id: Option<String>,
 }
 
 // --- WebSocket ---
@@ -484,10 +496,14 @@ pub enum WsClientMessage {
     AuthToken {
         extension_name: String,
         token: String,
+        thread_id: Option<String>,
     },
     /// Cancel an in-progress auth flow.
     #[serde(rename = "auth_cancel")]
-    AuthCancel { extension_name: String },
+    AuthCancel {
+        extension_name: String,
+        thread_id: Option<String>,
+    },
     /// Client heartbeat ping.
     #[serde(rename = "ping")]
     Ping,
@@ -785,12 +801,14 @@ mod tests {
             tool_name: "shell".to_string(),
             description: "Run ls".to_string(),
             parameters: "{}".to_string(),
+            thread_id: Some("thread-approval".to_string()),
         };
         let ws = WsServerMessage::from_sse_event(&sse);
         match ws {
             WsServerMessage::Event { event_type, data } => {
                 assert_eq!(event_type, "approval_needed");
                 assert_eq!(data["tool_name"], "shell");
+                assert_eq!(data["thread_id"], "thread-approval");
             }
             _ => panic!("Expected Event variant"),
         }
@@ -818,9 +836,11 @@ mod tests {
             WsClientMessage::AuthToken {
                 extension_name,
                 token,
+                thread_id,
             } => {
                 assert_eq!(extension_name, "notion");
                 assert_eq!(token, "sk-123");
+                assert!(thread_id.is_none());
             }
             _ => panic!("Expected AuthToken variant"),
         }
@@ -831,8 +851,12 @@ mod tests {
         let json = r#"{"type":"auth_cancel","extension_name":"notion"}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            WsClientMessage::AuthCancel { extension_name } => {
+            WsClientMessage::AuthCancel {
+                extension_name,
+                thread_id,
+            } => {
                 assert_eq!(extension_name, "notion");
+                assert!(thread_id.is_none());
             }
             _ => panic!("Expected AuthCancel variant"),
         }
@@ -845,6 +869,7 @@ mod tests {
             instructions: Some("Get your token from...".to_string()),
             auth_url: None,
             setup_url: Some("https://notion.so/integrations".to_string()),
+            thread_id: Some("thread-auth".to_string()),
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -853,6 +878,7 @@ mod tests {
         assert_eq!(parsed["instructions"], "Get your token from...");
         assert!(parsed.get("auth_url").is_none());
         assert_eq!(parsed["setup_url"], "https://notion.so/integrations");
+        assert_eq!(parsed["thread_id"], "thread-auth");
     }
 
     #[test]
@@ -861,12 +887,14 @@ mod tests {
             extension_name: "notion".to_string(),
             success: true,
             message: "notion authenticated (3 tools loaded)".to_string(),
+            thread_id: Some("thread-auth".to_string()),
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "auth_completed");
         assert_eq!(parsed["extension_name"], "notion");
         assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["thread_id"], "thread-auth");
     }
 
     #[test]
@@ -876,12 +904,14 @@ mod tests {
             instructions: Some("Enter API key".to_string()),
             auth_url: None,
             setup_url: None,
+            thread_id: Some("thread-auth".to_string()),
         };
         let ws = WsServerMessage::from_sse_event(&sse);
         match ws {
             WsServerMessage::Event { event_type, data } => {
                 assert_eq!(event_type, "auth_required");
                 assert_eq!(data["extension_name"], "openai");
+                assert_eq!(data["thread_id"], "thread-auth");
             }
             _ => panic!("Expected Event variant"),
         }
@@ -893,12 +923,14 @@ mod tests {
             extension_name: "slack".to_string(),
             success: false,
             message: "Invalid token".to_string(),
+            thread_id: Some("thread-auth".to_string()),
         };
         let ws = WsServerMessage::from_sse_event(&sse);
         match ws {
             WsServerMessage::Event { event_type, data } => {
                 assert_eq!(event_type, "auth_completed");
                 assert_eq!(data["success"], false);
+                assert_eq!(data["thread_id"], "thread-auth");
             }
             _ => panic!("Expected Event variant"),
         }
@@ -910,6 +942,7 @@ mod tests {
         let req: AuthTokenRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.extension_name, "telegram");
         assert_eq!(req.token, "bot12345");
+        assert!(req.thread_id.is_none());
     }
 
     #[test]
@@ -917,5 +950,6 @@ mod tests {
         let json = r#"{"extension_name":"telegram"}"#;
         let req: AuthCancelRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.extension_name, "telegram");
+        assert!(req.thread_id.is_none());
     }
 }

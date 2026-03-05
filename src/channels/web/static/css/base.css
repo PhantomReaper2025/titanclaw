@@ -652,6 +652,11 @@ body::before {
   font-style: italic;
 }
 
+.approval-error {
+  color: var(--danger);
+  font-size: 12px;
+}
+
 /* Auth card (inline in chat) */
 .auth-card {
   align-self: flex-start;
@@ -1272,6 +1277,14 @@ body::before {
   font-size: 12px;
   color: var(--text-secondary);
   font-family: monospace;
+}
+
+.job-card-dir {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-family: monospace;
+  margin-top: 2px;
+  word-break: break-all;
 }
 
 .job-card-view,

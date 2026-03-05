@@ -119,6 +119,7 @@ pub enum StatusUpdate {
         job_id: String,
         title: String,
         browse_url: String,
+        project_dir: Option<String>,
     },
     /// Tool requires user approval before execution.
     ApprovalNeeded {
