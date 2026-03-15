@@ -16,6 +16,7 @@
 
 mod agents;
 mod approvals;
+mod canvas;
 mod backup;
 mod browser;
 mod channels;
@@ -36,6 +37,7 @@ mod tool;
 
 pub use agents::{AgentsCommand, run_agents_command};
 pub use approvals::{ApprovalsCommand, run_approvals_command};
+pub use canvas::{CanvasCommand, run_canvas_command};
 pub use backup::{BackupCommand, run_backup_command};
 pub use browser::{BrowserCommand, run_browser_command};
 pub use channels::{ChannelsCommand, run_channels_command};
@@ -168,6 +170,10 @@ pub enum Command {
     /// Spawn and manage subagents for parallel work
     #[command(subcommand)]
     Agents(AgentsCommand),
+
+    /// Canvas UI rendering and display
+    #[command(subcommand)]
+    Canvas(CanvasCommand),
 
     /// Probe external dependencies and validate configuration
     Doctor,

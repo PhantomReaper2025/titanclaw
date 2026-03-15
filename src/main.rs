@@ -17,7 +17,7 @@ use ironclaw::{
         web::log_layer::{LogBroadcaster, WebLogLayer},
     },
     cli::{
-        Cli, Command, run_agents_command, run_approvals_command, run_backup_command, run_browser_command, run_cron_command, run_goal_command, run_mcp_command, run_memory_plane_command,
+        Cli, Command, run_agents_command, run_approvals_command, run_backup_command, run_browser_command, run_canvas_command, run_cron_command, run_goal_command, run_mcp_command, run_memory_plane_command,
         run_pairing_command, run_plan_command, run_plan_step_command, run_service_command,
         run_status_command, run_tool_command,
     },
@@ -255,6 +255,15 @@ async fn main() -> anyhow::Result<()> {
                 .init();
 
             return run_agents_command(agents_cmd.clone()).await;
+        }
+        Some(Command::Canvas(canvas_cmd)) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+                )
+                .init();
+
+            return run_canvas_command(canvas_cmd.clone()).await;
         }
         Some(Command::Doctor) => {
             // Load .env file for configuration checks
