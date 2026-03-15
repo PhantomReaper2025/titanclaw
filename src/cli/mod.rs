@@ -11,7 +11,11 @@
 //! - Managing OS service (`service install`, `service start`, `service stop`)
 //! - Active health diagnostics (`doctor`)
 //! - Checking system health (`status`)
+//! - Browser automation (`browser status`, `browser open`, `browser snapshot`, etc.)
+//! - Backup and restore agent state (`backup create`, `backup restore`, etc.)
 
+mod backup;
+mod browser;
 mod channels;
 mod config;
 mod cron;
@@ -28,6 +32,8 @@ mod service;
 pub mod status;
 mod tool;
 
+pub use backup::{BackupCommand, run_backup_command};
+pub use browser::{BrowserCommand, run_browser_command};
 pub use channels::{ChannelsCommand, run_channels_command};
 pub use config::{ConfigCommand, run_config_command};
 pub use cron::{CronCommand, run_cron_command};
@@ -142,6 +148,14 @@ pub enum Command {
     /// Manage routines (scheduled tasks / cron jobs)
     #[command(subcommand)]
     Cron(CronCommand),
+
+    /// Manage browser automation (status, open, snapshot, screenshot, etc.)
+    #[command(subcommand)]
+    Browser(BrowserCommand),
+
+    /// Backup and restore agent state (database, workspace, settings)
+    #[command(subcommand)]
+    Backup(BackupCommand),
 
     /// Probe external dependencies and validate configuration
     Doctor,
