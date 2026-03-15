@@ -1,434 +1,65 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable changes to TitanClaw will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-## [Unreleased]
+## [1.2.0] - 2026-03-16
 
 ### Added
+- **CLI Commands** - Full parity with OpenClaw:
+  - `titanclaw cron list/add/rm/run/status` - Manage scheduled routines
+  - `titanclaw channels list/status/available/install` - Manage chat channels
+  - `titanclaw backup create/restore/list/export/import` - Backup/restore agent state
+  - `titanclaw browser status/start/stop/open/tabs/snapshot/screenshot/act` - Browser automation
+  - `titanclaw approvals list/show/approve/deny/auto-approve/rules` - Manage pending approvals
+  - `titanclaw agents list/spawn/status/send/kill/wait/logs` - Subagent management
+  - `titanclaw canvas status/present/hide/navigate/eval/snapshot/screenshot` - UI rendering
 
-- Smart Rules v1 runtime knobs (default-on) via `AUTONOMY_SMART_RULES_*`: enable switch, proactive fallback thresholds, fallback-attempt budget, and empty-plan recovery toggle.
-- Planner clarification outcome path: empty/low-action plans now produce explicit clarification guidance with suggested next steps instead of opaque hard-stop errors.
-- Gateway readiness endpoint `GET /api/ready` with dependency checks (`message_pipeline`, `database_store`, `session_manager`) and `ready`/`degraded` status.
-- Production deployment templates now include loopback-bound reverse-proxy baseline via `deploy/nginx.titanclaw.conf.example`.
+- **Documentation**:
+  - `docs/QUICK_START.md` - 5-minute setup guide
+  - `docs/FEATURE_STATUS.md` - Feature completion analysis
+  - `docs/UX_AUDIT.md` - UX comparison with OpenClaw
+
+- **Configuration**:
+  - `.env` with Ollama + libSQL configuration
+  - Enabled Memory Plane v2, Tool Routing v2, Autonomy Control Plane v1
 
 ### Changed
+- Improved CLI command organization
+- Added comprehensive help text for all commands
 
-- Worker runtime now treats non-actionable model replies (for example “no task” / “nothing to do”) as clarification-needed guidance and exits with actionable instructions instead of looping silently.
-- Chat runtime can rewrite non-actionable model text into concrete follow-up prompts so TitanClaw remains conversational and task-oriented.
-- Reliability fallback execution is now bounded by a smart-rule attempt budget; exhaustion emits explicit failure context that the execution critic maps into deterministic replanning.
-- Proactive fallback-first routing thresholds are now configurable instead of hardcoded.
-- Sandbox `create_job` path handling is now more tolerant: empty `project_dir` values are treated as omitted, safe relative paths are resolved/created under `~/.ironclaw/projects`, and absolute paths remain base-constrained.
-- Chat `create_job` execution now defaults omitted `wait` to async start, emits `job_started` status with optional project-dir context, and returns clearer action-oriented remediation on sandbox/job creation failures.
-- Sandbox jobs now register runtime context immediately so `job_status`, `job_events`, and `job_prompt` work in the same session, sandbox DB writes are awaited instead of fire-and-forget, and waited jobs use a short persisted-terminal grace window before failing when structured completion lands slightly after the container stops.
-- Approval prompts now include clearer policy notes for high-impact actions where explicit per-call approval remains required even if session-level “Always approved” was selected.
-- Approval/thread flow is stricter and more consistent: hook-mutated params are re-approved before execution (including approval resume even when autonomy telemetry flags are off), pending approvals now close/persist on timeout or interrupt, expired approval waits are cleared before history controls or malformed approval retries can leave them stuck, gateway/web approvals require request IDs, auth completion/retry events preserve the active thread when clients omit `thread_id`, and approval/job/auth cards are thread-scoped and deduped on replay.
-- Worker autonomous tool execution now re-runs approval preflight after hook parameter mutation (`tool_call_post_hook_preflight`) so hook rewrites cannot bypass high-impact contract approval requirements.
-- `/clear` now clears pending approval state atomically instead of only resetting thread state.
-- Direct shell execution now drains stdout/stderr concurrently during process execution, removing a large-output deadlock class.
-- WebSocket approval submissions now return explicit `Channel not started` / `Channel closed` errors instead of silently dropping failed sends.
-- Auth thread resolution now validates explicit thread UUIDs before apply/clear operations and falls back to active thread on malformed IDs.
-- `jit_wasm_run` now always requires explicit approval and registration is explicit opt-in (`JIT_WASM_ENABLED=true`, requires `ALLOW_LOCAL_TOOLS=true`).
-- Deployment service template now enforces pinned image configuration via `/opt/ironclaw/service.env`, drops host networking in favor of loopback publish, and setup now verifies Cloud SQL proxy SHA256 before install.
+### Technical
+- All advanced features now configurable via environment flags:
+  - `AUTONOMY_POLICY_ENGINE_V1=true`
+  - `AUTONOMY_VERIFIER_V1=true`
+  - `AUTONOMY_REPLANNER_V1=true`
+  - `AUTONOMY_MEMORY_PLANE_V2=true`
+  - `AUTONOMY_MEMORY_RETRIEVAL_V2=true`
+  - `AUTONOMY_MEMORY_CONSOLIDATION_V2=true`
+  - `AUTONOMY_TOOL_ROUTING_V2=true`
 
-## [1.1.2] - 2026-03-02
-
-### Fixed
-
-- Fix onboarding persistence - completion status now properly saved to database
-
-## [1.1.1] - 2026-03-02
+## [1.1.2] - 2026-03-05
 
 ### Added
+- Autonomy Control Plane v1 groundwork
+- Memory Plane v2 persistence
+- Tooling System v2 reliability features
+- Swarm mesh libp2p integration
+- Production hardening for runtime approval flow
 
-- Add mobile responsiveness to web UI - responsive breakpoints, touch targets, collapsible sidebar
-
-## [1.1.0] - 2026-03-02
-
-### Highlights
-
-- All 138 Execution TODO items completed
-- Memory Plane v2 fully implemented (all phases: V19-V23 + libSQL mirror, write policy, consolidation, retrieval)
-- Phase 3 Tooling System v2 / Reliability foundations completed (all 12 slices: incidents, contract v2 overrides, reliability profiles, tool reliability service, incident detector, auto-refresh, routing flags, fallback routing, contract-aware checks, dry-run semantics, execution critic, proactive degraded-tool rerouting)
-- Gateway/CLI parity for autonomy operations
-- Web auth/render hardening (SSE token, WebSocket origin, DOM-based sanitization)
+## [1.1.0] - 2026-02-25
 
 ### Added
+- GraphRAG + AST indexing
+- Docker worker orchestration
+- WASM tool sandbox
+- Multi-provider LLM support
 
-- Autonomy Control Plane v1 persistence groundwork: versioned autonomy domain types, Postgres/libSQL goal/plan/plan-step/execution/policy/incident schema (`V11`-`V16` + libSQL mirror), and backend store CRUD implementations for the new autonomy tables.
-- Read-only web gateway autonomy inspection endpoints for goals/plans (`GET /api/goals`, `GET /api/goals/{id}`, `GET /api/goals/{id}/plans`, `GET /api/plans?goal_id=...`, `GET /api/plans/{id}`), user-scoped to the authenticated gateway user.
-- User-scoped web gateway create endpoints for autonomy goals/plans (`POST /api/goals`, `POST /api/plans`) with server-generated IDs/timestamps and goal-ownership checks before plan creation.
-- CLI autonomy commands for goals/plans (`titanclaw goal|plan create/list/show`) with DB-backed create/read access and user-scoped ownership validation through goal records.
-- User-scoped web gateway goal/plan status update endpoints (`POST /api/goals/{id}/status`, `POST /api/plans/{id}/status`) with ownership checks and DB-backed status transitions.
-- CLI status update commands for autonomy goals/plans (`titanclaw goal set-status`, `titanclaw plan set-status`) with enum validation and user-scoped ownership checks.
-- User-scoped plan-step web APIs for autonomy plan structure management (`GET/POST /api/plans/{id}/steps`, `GET /api/plan-steps/{id}`, `POST /api/plan-steps/{id}/status`) backed by new `PlanStore` step read helpers in both PostgreSQL and libSQL backends.
-- CLI plan-step commands (`titanclaw plan-step create|list|show|set-status`) for local plan-step creation, inspection, and status updates with user-scoped ownership validation.
-- User-scoped autonomy telemetry inspection endpoints (`GET /api/plans/{id}/executions`, `GET /api/goals/{id}/policy-decisions`) to inspect persisted runtime execution attempts and policy decisions from worker/dispatcher instrumentation.
-- User-scoped plan verification inspection endpoint (`GET /api/plans/{id}/verifications`) to inspect persisted worker completion-check verification outcomes for autonomy plans.
-- CLI plan verification inspection command (`titanclaw plan verifications`) with user-scoped ownership checks and optional `--limit`.
-- Goal-scoped plan list (`GET /api/goals/{id}/plans`) and plan verification inspection (`GET /api/plans/{id}/verifications`) now support optional `status`, `sort`, `offset`, and `limit` query params; CLI `titanclaw plan verifications` now supports `--status`, `--sort`, `--offset`, and `--limit`.
-- Atomic plan-step replacement support for replans: `POST /api/plans/{id}/steps/replace` and `titanclaw plan-step replace`, backed by transactional `replace_plan_steps_for_plan` implementations in PostgreSQL and libSQL.
-- Plan revisioning actions: `POST /api/plans/{id}/replan` and `titanclaw plan replan` create the next plan revision from an existing plan with optional metadata overrides, optional superseding of the source plan, and optional source-step copying into the new revision.
-- Replan now also supports inline step payloads in one call: `POST /api/plans/{id}/replan` accepts `steps`, and `titanclaw plan replan` accepts `--steps-file` / `--steps-json` (mutually exclusive with step-copy mode).
-- Goal/plan lifecycle convenience actions: web aliases (`POST /api/goals/{id}/cancel`, `/complete`, `/abandon`, `POST /api/plans/{id}/cancel`, `/complete`, `/supersede`) and matching CLI aliases (`titanclaw goal cancel|complete|abandon`, `titanclaw plan cancel|complete|supersede`) on top of the existing status-update APIs.
-- Goal reprioritization support: `POST /api/goals/{id}/priority` and `titanclaw goal set-priority` with user-scoped ownership checks (PostgreSQL + libSQL).
-- Goal/plan list filtering/sorting/pagination support: web list endpoints accept optional `status`, `sort`, `offset`, and `limit` query params, and CLI `goal list` / `plan list` now support `--status`, `--sort`, `--offset`, and `--limit`.
-- Internal autonomy runtime control-plane v1 modules: `PlannerV1`, shared policy-evaluation helpers, `VerifierV1`, and `ReplannerV1` scaffolding with targeted unit tests.
-- Internal runtime rollout flags for autonomy control-plane v1 behavior: `AUTONOMY_POLICY_ENGINE_V1`, `AUTONOMY_VERIFIER_V1`, and `AUTONOMY_REPLANNER_V1` (default enabled).
-- Targeted runtime integration tests for autonomy Phase 1 paths: approval-resume hook re-check blocking (`thread_ops`) and verifier-blocked planned completion -> replan request (`worker`).
-- Additional autonomy Phase 1 acceptance tests: end-to-end worker auto-replan success (`Worker::run`) and direct approval-resume approve/reject policy-decision persistence assertions in `thread_ops`.
-- Internal Memory Plane v2 groundwork: typed memory-plane domain models (`src/agent/memory_plane.rs`), new `AutonomyMemoryStore` DB subtrait, dual-backend Postgres/libSQL CRUD foundations for memory records/events/procedural playbooks/consolidation runs, and schema migrations `V19`-`V23` plus libSQL schema mirror updates.
-- Internal Phase 2 Memory Plane v2 config/decision scaffolding: default-off runtime rollout flags (`AUTONOMY_MEMORY_PLANE_V2`, `AUTONOMY_MEMORY_RETRIEVAL_V2`, `AUTONOMY_MEMORY_CONSOLIDATION_V2` + tuning knobs) and a deterministic `MemoryWritePolicyEngine` classifier module with unit tests.
-- Initial Phase 2 Memory Plane v2 runtime write integration (flag-gated): worker step/verifier/replan events and worker/chat policy decisions can now be mirrored into `autonomy_memory_records` via a shared classifier-backed helper when `AUTONOMY_MEMORY_PLANE_V2=true` (best-effort/fail-open persistence).
-- Expanded Phase 2 Memory Plane v2 flag-gated runtime writes to scheduler/routine paths: scheduler tool-subtask outcomes (with local-fallback/remote-path hints) and routine-run summaries now persist memory records, and repeated successful routine runs seed procedural playbook-candidate records.
-- Added a flag-gated, supervised `MemoryConsolidator` loop for Phase 2 Memory Plane v2 that records consolidation runs/events, processes active episodic memory records in batches, and performs an initial deterministic routine-summary -> semantic-summary promotion path with source demote/archive handling.
-- Expanded the Phase 2 `MemoryConsolidator` deterministic promotion path to process routine playbook-candidate episodic records into `autonomy_procedural_playbooks` (create on first candidate, update on repeated candidates with success/confidence/source-id tracking) while archiving the source candidate and recording `GeneratePlaybook` consolidation events.
-- Added a flag-gated `MemoryRetrievalComposer` for Phase 2 Memory Plane v2 with task-class inference, task-aware memory/playbook selection, and transient retrieval-context prompt injection into worker initial planning + automatic replanning via the `PlannerV1` wrapper (`AUTONOMY_MEMORY_RETRIEVAL_V2`, fail-open on retrieval errors).
-- Added user-scoped Phase 2 Memory Plane v2 gateway inspection/ops endpoints (`/api/memory-plane/*`) for memory records/playbooks, playbook status updates, consolidation run listing/manual trigger, and retrieval preview, including ownership checks plus filter/sort/pagination validation and targeted handler tests.
-- Added `titanclaw memory-plane` CLI inspection/ops commands for Memory Plane v2 (records/playbooks/consolidation/retrieval preview) with user-scoped ownership checks, sort/filter/pagination validation, and parser/helper tests.
-- Completed Phase 2 Memory Plane v2 acceptance/stabilization pass: added runtime assertions for worker and approval-flow memory-plane writes (plus flag-off no-write behavior), and ran the validation matrix across memory modules, runtime modules, gateway memory-plane handlers, CLI memory-plane tests, and `cargo check`.
-- Phase 3 Tooling System v2 / reliability foundations (slice 1): added typed Tool Contract V2 and reliability profile domain structs (`src/tools/contract_v2.rs`), introduced `AutonomyReliabilityStore` in the DB layer, implemented PostgreSQL + libSQL CRUD foundations for incidents (including Phase 3 dedupe/reliability fields), tool contract overrides, and tool reliability profiles, and added schema migrations `V24`-`V27` plus libSQL schema mirror/compatibility patching for extended `autonomy_incidents` columns.
-- Phase 3 Tooling System v2 / reliability foundations (slice 2): added pure Tool Contract V2 inference/overlay helpers and `ToolRegistry` resolver APIs for inferred and DB-override-resolved descriptors (override precedence `user` -> `global` -> inferred), with unit tests and no execution-path behavior changes yet.
-- Phase 3 Tooling System v2 / reliability foundations (slice 3): added a conservative `ToolReliabilityService` scaffold for deterministic manual reliability-profile recomputation (score + circuit-breaker state) from persisted autonomy execution/policy/incident records plus a legacy `tool_failures` bridge penalty, along with a new cross-backend `AutonomyExecutionStore::list_execution_attempts_for_user(...)` helper and unit tests for profile/breaker computation.
-- Phase 3 Tooling System v2 / reliability foundations (slice 4): added shared runtime incident detection helpers (`src/agent/incident_detector.rs`) with deterministic fingerprint dedupe + occurrence increments, wired incident persistence into worker/dispatcher failed execution-attempt paths and worker/dispatcher/thread deny-policy paths, and added targeted worker/thread integration assertions for incident linkage to persisted autonomy records.
-- Phase 3 Tooling System v2 / reliability foundations (slice 5): added runtime best-effort reliability-profile auto-refresh hooks (`recompute_tool_reliability_profile_best_effort`) so worker/dispatcher execution attempts and worker/dispatcher/thread policy decisions now trigger `ToolReliabilityService` recomputation for the touched tool, with worker integration coverage asserting profile writes in the failure->replan path.
-- Phase 3 Tooling System v2 / reliability foundations (slice 6): added default-off worker routing rollout flag `AUTONOMY_TOOL_ROUTING_V2` and reliability-aware planned-step fallback routing (profile fallback-candidate ordering, open-breaker avoidance, retry-based fallback attempts with persisted `retry_count` execution attempts), plus targeted fallback routing integration coverage.
-- Phase 3 Tooling System v2 / reliability foundations (slice 7): extended `AUTONOMY_TOOL_ROUTING_V2` into dispatcher + thread reflex/approval-resume runtime paths with reliability-driven fallback-or-deny routing and persisted policy-decision telemetry, disabled piped early shell execution while routing is active to avoid bypass, and added hard circuit-breaker enforcement in chat tool execution and non-planned worker tool execution paths (with targeted worker/thread/dispatcher coverage).
-- Phase 3 Tooling System v2 / reliability foundations (slice 8): integrated Tool Contract V2 runtime policy enforcement so dispatcher/worker/scheduler/reflex preflight checks resolve contract descriptors (including DB override precedence where available) and enforce contract-declared high-impact approval semantics; added policy-engine unit coverage and worker integration coverage for contract-driven approval blocking.
-- Phase 3 Tooling System v2 / reliability foundations (slice 9): added dry-run/simulation-aware contract policy rules so high-impact simulatable actions are only preflight-allowed with explicit dry-run intent in parameters (`dry_run`/`simulate`/`mode=dry_run`), while non-simulatable high-impact actions emit explicit policy reason codes and remain strict approval-gated across dispatcher/worker/scheduler/reflex call paths.
-- Phase 3 Tooling System v2 / reliability foundations (slice 10): added an explicit `ExecutionCritic` loop module for planned worker steps with deterministic post-step evaluation and replan hooks (policy-block/transient/tool-unavailable/latency-drift), wired critic decisions into worker replan selection (including PolicyDenied escalation precedence), and added `execution_critic` unit coverage plus worker replan-path regression checks.
-- Phase 3 Tooling System v2 / reliability foundations (slice 11): added contract-aware fallback ranking integration so worker planned-step routing and chat routing now merge reliability-profile fallbacks with Tool Contract V2 `fallback_candidates`, dedupe deterministically, and rank alternatives using reliability plus contract side-effect/idempotency bias before selecting fallback tools; added targeted dispatcher/worker helper coverage and worker integration coverage for contract-fallback routing when profile fallbacks are absent.
-- Phase 3 Tooling System v2 / reliability foundations (slice 12): added proactive degraded-primary rerouting so worker planned-step routing and chat routing can choose a materially better fallback before any primary attempt when reliability evidence indicates degradation (or half-open breaker state), while retaining open-breaker hard-block behavior; added targeted helper coverage and worker integration coverage proving primary-attempt avoidance on degraded tools.
-
-### Changed
-
-- Worker planning and chat tool dispatch now best-effort persist internal autonomy records: worker-generated `ActionPlan`s create/update `Goal`/`Plan`/`PlanStep` records during planned execution, and dispatcher approval/tool-attempt telemetry is additionally mirrored into DB-backed autonomy policy/execution tables without changing the existing approval UX or tracing emitters.
-- Worker planned execution completion checks now also best-effort persist DB-backed autonomy plan verification records (`autonomy_plan_verifications`, `V18` + libSQL schema mirror) for later inspection via the web gateway.
-- Worker plan verification persistence now captures richer per-step checks/evidence summaries and also records an `Inconclusive` verification on early `execute_plan()` completion-path exits (future-proofing the dormant `completed` branch).
-- Worker planned execution now routes initial planning through `PlannerV1`, performs pre-completion `VerifierV1` soft gating before final completion state transitions, and can perform bounded automatic replanning (with persisted next plan revisions when autonomy linkage is available) when steps fail or completion checks indicate remaining work.
-- Dispatcher, worker, and approval-resume tool preflight paths now share policy-evaluation helper logic for approval/hook decisions; approval resume re-checks hook policy before executing an approved tool and persists explicit approve/reject autonomy policy-decision records.
-- Runtime control-plane v1 behavior can now be staged: worker policy-decision persistence, verifier soft gating, and automatic replanning are each gated by internal config flags while preserving the existing persistence/CRUD/inspection surfaces.
-- Shared approval policy-evaluation helpers are now also used by piped shell early-start preflight checks, reflex fast-path approval checks, and scheduler approval/offload eligibility checks, reducing edge-path drift.
-- Worker plan-step evidence classification now records richer verifier evidence/check metadata (test/lint-check/diff/command categories), and `VerifierV1` uses these signals to permit high-risk completions with explicit acceptance criteria when validation/change evidence is present.
-- Job runtime context now carries optional autonomy linkage IDs (`goal_id` / `plan_id` / `plan_step_id`) in memory so worker/dispatcher paths can correlate records more consistently during execution.
-- `agent_jobs` now persists optional autonomy linkage IDs (`autonomy_goal_id`, `autonomy_plan_id`, `autonomy_plan_step_id`) across PostgreSQL/libSQL (`V17` + libSQL schema compatibility path), so autonomy correlation survives DB save/load and restart boundaries.
-- Added internal DB convenience query `list_policy_decisions_for_user(...)` across PostgreSQL/libSQL backends to support direct testing/inspection of chat approval-resume policy-decision persistence paths.
-
-## [1.0.2] - 2026-02-23
-
-### Fixed
-
-- Patch release retag on the latest `main` commit so published source includes the onboarding/profile synthesis/WASM introspection modules and compiles successfully (the earlier `v1.0.1` tag pointed to a prior commit).
-
-## [1.0.1] - 2026-02-23
-
-### Fixed
-
-- Session/thread workflow reliability: gateway/web external UUID thread IDs are preserved during resolution (non-gateway channels stay channel-scoped), thread mapping creation is serialized to reduce duplicate-thread races, hydration avoids overwriting concurrently created in-memory threads, `register_thread` logs mapping collisions instead of silently overwriting, and chat thread delete/clear now cleans in-memory thread mappings + undo managers immediately instead of waiting for session pruning.
-- Pending approval requests now expire automatically (timeout) and are canceled instead of leaving threads waiting indefinitely.
-- Conversation turn persistence now retries DB writes (with backoff) and emits an in-channel warning if persistence still fails after retries, reducing silent chat-history loss.
-- Approval rejection/resume paths now finalize and persist the current turn consistently, and runtime turn starts use guarded state checks (`try_start_turn`) to avoid invalid state transitions.
-- Scheduler subtask tracking no longer reports successful subtasks as errors during background task execution.
-- Sandbox job tool now returns a structured execution error when sandbox dependencies/job manager are unavailable instead of panicking the agent process.
-- WASM OAuth callback endpoint now requires and validates/consumes the `state` nonce before accepting remote auth callbacks.
-- WASM channel onboarding validation endpoints are now executed (HTTP GET) with secret placeholder substitution, catching misconfigurations during setup instead of deferring failure to runtime.
-- Embedding providers now enforce approximate character-length checks (not byte length) consistently for both single and batched embedding requests.
-- WhatsApp channel no longer silently drops non-text inbound messages; unsupported message types are surfaced as explicit placeholder messages to the agent and logged as warnings.
-- AST graph query error messaging now explicitly documents that PostgreSQL-backed workspaces are not yet supported for this feature.
-- Web gateway SSE auth now accepts URL-encoded query tokens (for EventSource clients), and WebSocket Origin validation correctly parses localhost loopback hosts including IPv6.
-- Jobs UI manual-create flow now sends JSON with the correct content type and surfaces backend error messages in the UI instead of generic HTTP status text.
-- Sandbox worker completion detection now recognizes common completion phrasings (including repeated “Job Complete” style outputs), adds a completion-like repetition guard to stop terminal-state loops, and continues to terminate jobs via the structured `/worker/{job_id}/complete` report path.
-- Manual `/compact` now snapshots and compacts outside the session mutex, then applies results only if the thread is unchanged, reducing chat stalls during compaction.
-- Thread turn tool-call records now preserve tool-call IDs / sanitized tool-result text, and `Thread::messages()` rebuilds tool messages into LLM context.
-- Swarm task broadcasts now honor task-level assignee targeting (`assignee_node`) and receiver-side duplicate task suppression, preventing repeated execution across peers after broadcast/replay.
-- Critical background loops (self-repair, kernel orchestrator, shadow cache pruning, reflex compiler) now run under restartable supervisors with backoff and shutdown signaling instead of silently dying on panic/unexpected exit.
-
-### Changed
-
-- WASM tool loader now reads optional sidecar metadata/schema overrides (`description`, `schema`, `tool.{description,schema}`) and applies them at registration time; runtime fallback metadata remains but is warning-logged.
-- NEAR AI session renewal menu no longer offers the unimplemented NEAR Wallet auth option (GitHub/Google only).
-- WASM tool preparation now probes WIT exports (`description()` / `schema()`) to populate LLM-facing metadata before falling back to generic runtime metadata.
-- Web chat markdown rendering now uses DOM-based allowlist sanitization and DOM-bound copy-button wiring (replacing regex sanitization and inline `onclick` handlers).
-- Sandbox archive downloads now stream `tar` output with a timeout watchdog instead of buffering full archives in gateway memory.
-- Swarm remote wait fallback timeout default increased from `300ms` to `2500ms` to reduce premature local fallback under normal network/tool latency.
-- Swarm remote wait fallback timeout is now configurable via `SWARM_REMOTE_WAIT_TIMEOUT_MS` (clamped to a safe range) instead of being hardcoded.
+## [1.0.0] - 2026-02-19
 
 ### Added
-
-- Background profile synthesis engine that batches successful turns asynchronously (debounced) and updates managed sections in workspace core docs (`AGENTS.md`, `IDENTITY.md`, `SOUL.md`, `USER.md`, `MEMORY.md`) while preserving manual content outside markers.
-- New profile synthesis configuration knobs (`PROFILE_SYNTHESIS_*`) for enablement, debounce, batching, minimum turn size, and optional LLM merge.
-- Conversational profile onboarding (OpenClaw-style) with a soft-block first-chat flow that asks identity/goals/tone/work-style/boundaries questions, supports `/onboard profile` commands (`status|defer|skip|reset`), and writes managed baseline sections to core docs after review + confirm.
-
-## [1.0.0](https://github.com/PhantomReaper2025/titanclaw/compare/v0.6.3...v1.0.0) - 2026-02-22
-
-### Added
-
-- Web gateway chat lifecycle controls:
-  - `DELETE /api/chat/thread/{id}` for single-thread hard delete
-  - `DELETE /api/chat/threads` for clear-all hard delete (chat scope)
-- Sandbox output archive export endpoint: `GET /api/jobs/{id}/files/download`
-- Jobs UI actions for thread deletion, clear-all chats, and archive download
-- Onboarding prompt for default sandbox coding runtime and OpenCode default model
-- `memory bootstrap` CLI command for seeding and safe-refreshing core workspace docs (`--dry-run`, `--force`)
-- Jobs tab manual creation flow (`POST /api/jobs`) with mode selection (`worker`, `claude_code`, `opencode`)
-
-### Changed
-
-- `create_job` sandbox mode now accepts `opencode` in addition to `worker` and `claude_code`
-- `CODING_RUNTIME_DEFAULT` is now respected as the default sandbox mode when `mode` is omitted
-- Workspace startup now runs conservative core-doc synchronization using managed template markers and legacy detection
-- `JobMode::OpenCode` now launches a dedicated OpenCode bridge command (`opencode-bridge`) instead of silently falling back to the generic worker runtime
-- `RoutineAction::FullJob` now executes via real scheduler job flow (context creation + `Scheduler::schedule`) instead of being downgraded to lightweight single-call execution
-
-### Fixed
-
-- Claude bridge failure reporting now includes recent stderr context to diagnose `claude exited with code 1` failures faster
-- Worker max-iteration failure reason now includes actionable remediation guidance
-- OpenCode model and runtime selection are now effective at execution time (bridge consumes mode/model wiring instead of ignored env-only fallback)
-- Worker image now exposes `opencode` on PATH for sandbox user and pre-creates OpenCode writable directories
-
-### Infrastructure
-
-- `Dockerfile.worker` now installs OpenCode CLI by default (`curl -fsSL https://opencode.ai/install | bash`)
-
-## [0.6.3](https://github.com/PhantomReaper2025/titanclaw/compare/v0.6.2...v0.6.3) - 2026-02-21
-
-### Fixed
-
-- OpenRouter attribution now sends `X-Title: TitanClaw` and `HTTP-Referer: https://github.com/PhantomReaper2025/titanclaw`, so OpenRouter logs no longer show app identity as unknown.
-- Auto-onboarding in `run` now reloads `.env` + `~/.ironclaw/.env` in-process after wizard completion, preventing first-run missing-key states.
-- OpenRouter auth validation now fails early with a clear configuration error when `LLM_API_KEY` is missing, avoiding delayed runtime 401 failures.
-- API-key providers (OpenAI/Anthropic/OpenAI-compatible) now persist env fallback keys to `~/.ironclaw/.env` when encrypted secrets storage is unavailable.
-- Onboarding now preflights sandbox image readiness and auto-recovers by building local fallback image `titanclaw-worker:latest` when registry pull fails.
-- Onboarding now persists `SANDBOX_IMAGE` and `SANDBOX_AUTO_PULL` to bootstrap env so runtime job manager uses the same image selected/built during setup.
-- Sandbox preflight now prefers configured `SANDBOX_IMAGE` first, preventing repeated attempts to pull `ghcr.io/nearai/sandbox:latest` after fallback image is already configured.
-- `Dockerfile.worker` now builds and runs the correct `titanclaw` binary (instead of `ironclaw`), fixing worker-image fallback builds.
-- Web gateway now has resilient SSE reconnect/backoff for both chat and logs streams, reducing cases that required manual page refresh.
-
-## [0.6.2](https://github.com/PhantomReaper2025/titanclaw/compare/v0.6.1...v0.6.2) - 2026-02-21
-
-### Fixed
-
-- OpenRouter/OpenAI-compatible onboarding now persists `LLM_API_KEY` to `~/.ironclaw/.env` when OS secrets storage is unavailable, preventing first-run `401 Missing Authentication header` failures.
-- Bootstrap env persistence now merges with existing `~/.ironclaw/.env` entries instead of overwriting them, preserving previously saved keys such as `SECRETS_MASTER_KEY` and `LLM_API_KEY`.
-- Container job startup reliability remains hardened with missing-image auto-pull support (respects `sandbox.auto_pull_image`).
-
-## [0.6.1](https://github.com/PhantomReaper2025/titanclaw/compare/v0.6.0...v0.6.1) - 2026-02-21
-
-### Added
-
-- Production-core swarm hardening:
-  - capability-gated remote offload from scheduler
-  - deterministic local fallback on timeout/failure
-  - bounded remote waiter routing with expiry cleanup
-
-### Changed
-
-- Rebranded release package identity from `ironclaw` to `titanclaw`
-- Updated package metadata links to the TitanClaw repository
-- Updated benchmark dependency mapping to track the renamed package
-
-### Fixed
-
-- Regenerated WiX installer metadata to match `titanclaw` binary/product naming:
-  - MSI product name and install path
-  - executable filename/path (`titanclaw.exe`)
-  - installer help link URL
-
-## [0.6.0](https://github.com/nearai/ironclaw/compare/ironclaw-v0.5.0...ironclaw-v0.6.0) - 2026-02-19
-
-### Added
-
-- add issue triage skill ([#200](https://github.com/nearai/ironclaw/pull/200))
-- add PR triage dashboard skill ([#196](https://github.com/nearai/ironclaw/pull/196))
-- add OpenRouter usage examples ([#189](https://github.com/nearai/ironclaw/pull/189))
-- add Tinfoil private inference provider ([#62](https://github.com/nearai/ironclaw/pull/62))
-- shell env scrubbing and command injection detection ([#164](https://github.com/nearai/ironclaw/pull/164))
-- Add PR review tools, job monitor, and channel injection for E2E sandbox workflows ([#57](https://github.com/nearai/ironclaw/pull/57))
-- Secure prompt-based skills system (Phases 1-4) ([#51](https://github.com/nearai/ironclaw/pull/51))
-- Add benchmarking harness with spot suite ([#10](https://github.com/nearai/ironclaw/pull/10))
-- 10 infrastructure improvements from zeroclaw ([#126](https://github.com/nearai/ironclaw/pull/126))
-
-### Fixed
-
-- *(rig)* prevent OpenAI Responses API panic on tool call IDs ([#182](https://github.com/nearai/ironclaw/pull/182))
-- *(docs)* correct settings storage path in README ([#194](https://github.com/nearai/ironclaw/pull/194))
-- OpenAI tool calling — schema normalization, missing types, and Responses API panic ([#132](https://github.com/nearai/ironclaw/pull/132))
-- *(security)* prevent path traversal bypass in WASM HTTP allowlist ([#137](https://github.com/nearai/ironclaw/pull/137))
-- persist OpenAI-compatible provider and respect embeddings disable ([#177](https://github.com/nearai/ironclaw/pull/177))
-- remove .expect() calls in FailoverProvider::try_providers ([#156](https://github.com/nearai/ironclaw/pull/156))
-- sentinel value collision in FailoverProvider cooldown ([#125](https://github.com/nearai/ironclaw/pull/125)) ([#154](https://github.com/nearai/ironclaw/pull/154))
-- skills module audit cleanup ([#173](https://github.com/nearai/ironclaw/pull/173))
-
-### Other
-
-- Fix division by zero panic in ValueEstimator::is_profitable ([#139](https://github.com/nearai/ironclaw/pull/139))
-- audit feature parity matrix against codebase and recent commits ([#202](https://github.com/nearai/ironclaw/pull/202))
-- architecture improvements for contributor velocity ([#198](https://github.com/nearai/ironclaw/pull/198))
-- fix rustfmt formatting from PR #137
-- add .env.example examples for Ollama and OpenAI-compatible ([#110](https://github.com/nearai/ironclaw/pull/110))
-
-## [0.5.0](https://github.com/nearai/ironclaw/compare/v0.4.0...v0.5.0) - 2026-02-17
-
-### Added
-
-- add cooldown management to FailoverProvider ([#114](https://github.com/nearai/ironclaw/pull/114))
-
-## [0.4.0](https://github.com/nearai/ironclaw/compare/v0.3.0...v0.4.0) - 2026-02-17
-
-### Added
-
-- move per-invocation approval check into Tool trait ([#119](https://github.com/nearai/ironclaw/pull/119))
-- add polished boot screen on CLI startup ([#118](https://github.com/nearai/ironclaw/pull/118))
-- Add lifecycle hooks system with 6 interception points ([#18](https://github.com/nearai/ironclaw/pull/18))
-
-### Other
-
-- remove accidentally committed .sidecar and .todos directories ([#123](https://github.com/nearai/ironclaw/pull/123))
-
-## [0.3.0](https://github.com/nearai/ironclaw/compare/v0.2.0...v0.3.0) - 2026-02-17
-
-### Added
-
-- direct api key and cheap model ([#116](https://github.com/nearai/ironclaw/pull/116))
-
-## [0.2.0](https://github.com/nearai/ironclaw/compare/v0.1.3...v0.2.0) - 2026-02-16
-
-### Added
-
-- mark Ollama + OpenAI-compatible as implemented ([#102](https://github.com/nearai/ironclaw/pull/102))
-- multi-provider inference + libSQL onboarding selection ([#92](https://github.com/nearai/ironclaw/pull/92))
-- add multi-provider LLM failover with retry backoff ([#28](https://github.com/nearai/ironclaw/pull/28))
-- add libSQL/Turso embedded database backend ([#47](https://github.com/nearai/ironclaw/pull/47))
-- Move debug log truncation from agent loop to REPL channel ([#65](https://github.com/nearai/ironclaw/pull/65))
-
-### Fixed
-
-- shell destructive-command check bypassed by Value::Object arguments ([#72](https://github.com/nearai/ironclaw/pull/72))
-- propagate real tool_call_id instead of hardcoded placeholder ([#73](https://github.com/nearai/ironclaw/pull/73))
-- Fix wasm tool schemas and runtime ([#42](https://github.com/nearai/ironclaw/pull/42))
-- flatten tool messages for NEAR AI cloud-api compatibility ([#41](https://github.com/nearai/ironclaw/pull/41))
-- security hardening across all layers ([#35](https://github.com/nearai/ironclaw/pull/35))
-
-### Other
-
-- Explicitly enable cargo-dist caching for binary artifacts building
-- Skip building binary artifacts on every PR
-- add module specification rules to CLAUDE.md
-- add setup/onboarding specification (src/setup/README.md)
-- deduplicate tool code and remove dead stubs ([#98](https://github.com/nearai/ironclaw/pull/98))
-- Reformat architecture diagram in README ([#64](https://github.com/nearai/ironclaw/pull/64))
-- Add review discipline guidelines to CLAUDE.md ([#68](https://github.com/nearai/ironclaw/pull/68))
-- Bump MSRV to 1.92, add GCP deployment files ([#40](https://github.com/nearai/ironclaw/pull/40))
-- Add OpenAI-compatible HTTP API (/v1/chat/completions, /v1/models)   ([#31](https://github.com/nearai/ironclaw/pull/31))
-
-## [0.1.3](https://github.com/nearai/ironclaw/compare/v0.1.2...v0.1.3) - 2026-02-12
-
-### Other
-
-- Enabled builds caching during CI/CD
-- Disabled npm publishing as the name is already taken
-
-## [0.1.2](https://github.com/nearai/ironclaw/compare/v0.1.1...v0.1.2) - 2026-02-12
-
-### Other
-
-- Added Installation instructions for the pre-built binaries
-- Disabled Windows ARM64 builds as auto-updater [provided by cargo-dist] does not support this platform yet and it is not a common platform for us to support
-
-## [0.1.1](https://github.com/nearai/ironclaw/compare/v0.1.0...v0.1.1) - 2026-02-12
-
-### Other
-
-- Renamed the secrets in release-plz.yml to match the configuration
-- Make sure that the binaries release CD it kicking in after release-plz
-
-## [0.1.0](https://github.com/nearai/ironclaw/releases/tag/v0.1.0) - 2026-02-12
-
-### Added
-
-- Add multi-provider LLM support via rig-core adapter ([#36](https://github.com/nearai/ironclaw/pull/36))
-- Sandbox jobs ([#4](https://github.com/nearai/ironclaw/pull/4))
-- Add Google Suite & Telegram WASM tools ([#9](https://github.com/nearai/ironclaw/pull/9))
-- Improve CLI ([#5](https://github.com/nearai/ironclaw/pull/5))
-
-### Fixed
-
-- resolve runtime panic in Linux keychain integration ([#32](https://github.com/nearai/ironclaw/pull/32))
-
-### Other
-
-- Skip release-plz on forks
-- Upgraded release-plz CD pipeline
-- Added CI/CD and release pipelines ([#45](https://github.com/nearai/ironclaw/pull/45))
-- DM pairing + Telegram channel improvements ([#17](https://github.com/nearai/ironclaw/pull/17))
-- Fixes build, adds missing sse event and correct command ([#11](https://github.com/nearai/ironclaw/pull/11))
-- Codex/feature parity pr hook ([#6](https://github.com/nearai/ironclaw/pull/6))
-- Add WebSocket gateway and control plane ([#8](https://github.com/nearai/ironclaw/pull/8))
-- select bundled Telegram channel and auto-install ([#3](https://github.com/nearai/ironclaw/pull/3))
-- Adding skills for reusable work
-- Fix MCP tool calls, approval loop, shutdown, and improve web UI
-- Add auth mode, fix MCP token handling, and parallelize startup loading
-- Merge remote-tracking branch 'origin/main' into ui
-- Adding web UI
-- Rename `setup` CLI command to `onboard` for compatibility
-- Add in-chat extension discovery, auth, and activation system
-- Add Telegram typing indicator via WIT on-status callback
-- Add proactivity features: memory CLI, session pruning, self-repair notifications, slash commands, status diagnostics, context warnings
-- Add hosted MCP server support with OAuth 2.1 and token refresh
-- Add interactive setup wizard and persistent settings
-- Rebrand to IronClaw with security-first mission
-- Fix build_software tool stuck in planning mode loop
-- Enable sandbox by default
-- Fix Telegram Markdown formatting and clarify tool/memory distinctions
-- Simplify Telegram channel config with host-injected tunnel/webhook settings
-- Apply Telegram channel learnings to WhatsApp implementation
-- Merge remote-tracking branch 'origin/main'
-- Docker file for sandbox
-- Replace hardcoded intent patterns with job tools
-- Fix router test to match intentional job creation patterns
-- Add Docker execution sandbox for secure shell command isolation
-- Move setup wizard credentials to database storage
-- Add interactive setup wizard for first-run configuration
-- Add Telegram Bot API channel as WASM module
-- Add OpenClaw feature parity tracking matrix
-- Add Chat Completions API support and expand REPL debugging
-- Implementing channels to be handled in wasm
-- Support non interactive mode and model selection
-- Implement tool approval, fix tool definition refresh, and wire embeddings
-- Tool use
-- Wiring more
-- Add heartbeat integration, planning phase, and auto-repair
-- Login flow
-- Extend support for session management
-- Adding builder capability
-- Load tools at launch
-- Fix multiline message rendering in TUI
-- Parse NEAR AI alternative response format with output field
-- Handle NEAR AI plain text responses
-- Disable mouse capture to allow text selection in TUI
-- Add verbose logging to debug empty NEAR AI responses
-- Improve NEAR AI response parsing for varying response formats
-- Show status/thinking messages in chat window, debug empty responses
-- Add timeout and logging to NEAR AI provider
-- Add status updates to show agent thinking/processing state
-- Add CLI subcommands for WASM tool management
-- Fix TUI shutdown: send /shutdown message and handle in agent loop
-- Remove SimpleCliChannel, add Ctrl+D twice quit, redirect logs to TUI
-- Fix TuiChannel integration and enable in main.rs
-- Integrate Codex patterns: task scheduler, TUI, sessions, compaction
-- Adding LICENSE
-- Add README with IronClaw branding
-- Add WASM sandbox secure API extension
-- Wire database Store into agent loop
-- Implementing WASM runtime
-- Add workspace integration tests
-- Compact memory_tree output format
-- Replace memory_list with memory_tree tool
-- Simplify workspace to path-based storage, remove legacy code
-- Add NEAR AI chat-api as default LLM provider
-- Add CLAUDE.md project documentation
-- Add workspace and memory system (OpenClaw-inspired)
-- Initial implementation of the agent framework
+- Initial release based on IronClaw from NEAR AI
+- Multi-provider LLM runtime with failover
+- Local-first memory with hybrid retrieval
+- Secure WASM tool sandbox
+- Web gateway with WebSocket + SSE
+- Routines/automation engine

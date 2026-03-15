@@ -53,6 +53,38 @@ Based on `implementation_plan.md`, this is where the upgrade stands today.
 
 ## Capabilities
 
+### CLI Commands
+
+TitanClaw provides full CLI parity with OpenClaw:
+
+```
+titanclaw run                    # Interactive agent session
+titanclaw onboard                # Profile setup wizard
+titanclaw doctor                 # Dependency checks
+titanclaw status                 # Health diagnostics
+
+# Scheduled routines
+titanclaw cron list/add/rm/run/status
+
+# Chat channels
+titanclaw channels list/status/available/install
+
+# Backup & restore
+titanclaw backup create/restore/list/export/import
+
+# Browser automation
+titanclaw browser status/start/stop/open/tabs/snapshot/screenshot
+
+# Approval management
+titanclaw approvals list/show/approve/deny/auto-approve/rules
+
+# Subagent orchestration
+titanclaw agents list/spawn/status/send/kill/wait/logs
+
+# Canvas UI
+titanclaw canvas status/present/hide/navigate/eval/snapshot/screenshot
+```
+
 ### What You Get Today
 
 - Multi-provider LLM runtime with failover and retry logic
