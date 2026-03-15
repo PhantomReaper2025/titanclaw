@@ -14,6 +14,7 @@
 //! - Browser automation (`browser status`, `browser open`, `browser snapshot`, etc.)
 //! - Backup and restore agent state (`backup create`, `backup restore`, etc.)
 
+mod approvals;
 mod backup;
 mod browser;
 mod channels;
@@ -32,6 +33,7 @@ mod service;
 pub mod status;
 mod tool;
 
+pub use approvals::{ApprovalsCommand, run_approvals_command};
 pub use backup::{BackupCommand, run_backup_command};
 pub use browser::{BrowserCommand, run_browser_command};
 pub use channels::{ChannelsCommand, run_channels_command};
@@ -156,6 +158,10 @@ pub enum Command {
     /// Backup and restore agent state (database, workspace, settings)
     #[command(subcommand)]
     Backup(BackupCommand),
+
+    /// Manage pending approvals for tool executions
+    #[command(subcommand)]
+    Approvals(ApprovalsCommand),
 
     /// Probe external dependencies and validate configuration
     Doctor,
