@@ -4,6 +4,7 @@
 //! - Running the agent (`run`)
 //! - Interactive onboarding wizard (`onboard`)
 //! - Managing configuration (`config list`, `config get`, `config set`)
+//! - Managing channels (`channels list`, `channels status`, `channels install`)
 //! - Managing WASM tools (`tool install`, `tool list`, `tool remove`)
 //! - Managing MCP servers (`mcp add`, `mcp auth`, `mcp list`, `mcp test`)
 //! - Querying workspace memory (`memory search`, `memory read`, `memory write`)
@@ -11,7 +12,9 @@
 //! - Active health diagnostics (`doctor`)
 //! - Checking system health (`status`)
 
+mod channels;
 mod config;
+mod cron;
 mod doctor;
 mod goal;
 mod mcp;
@@ -25,7 +28,9 @@ mod service;
 pub mod status;
 mod tool;
 
+pub use channels::{ChannelsCommand, run_channels_command};
 pub use config::{ConfigCommand, run_config_command};
+pub use cron::{CronCommand, run_cron_command};
 pub use doctor::run_doctor_command;
 pub use goal::{GoalCommand, run_goal_command};
 pub use mcp::{McpCommand, run_mcp_command};
@@ -94,6 +99,10 @@ pub enum Command {
     #[command(subcommand)]
     Config(ConfigCommand),
 
+    /// Manage chat channels (Telegram, Discord, etc)
+    #[command(subcommand)]
+    Channels(ChannelsCommand),
+
     /// Manage WASM tools
     #[command(subcommand)]
     Tool(ToolCommand),
@@ -129,6 +138,10 @@ pub enum Command {
     /// Manage OS service (launchd / systemd)
     #[command(subcommand)]
     Service(ServiceCommand),
+
+    /// Manage routines (scheduled tasks / cron jobs)
+    #[command(subcommand)]
+    Cron(CronCommand),
 
     /// Probe external dependencies and validate configuration
     Doctor,

@@ -104,6 +104,15 @@ enum CheckResult {
 }
 
 async fn check_nearai_session() -> CheckResult {
+    // Skip check if using a different LLM backend
+    let backend = std::env::var("LLM_BACKEND")
+        .ok()
+        .unwrap_or_else(|| "ollama".into());
+    
+    if backend.to_lowercase() != "nearai" && backend.to_lowercase() != "near_ai" && backend.to_lowercase() != "near" {
+        return CheckResult::Skip(format!("using {} backend", backend));
+    }
+
     // Check if session file exists
     let session_path = crate::llm::session::default_session_path();
     if !session_path.exists() {

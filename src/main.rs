@@ -17,7 +17,7 @@ use ironclaw::{
         web::log_layer::{LogBroadcaster, WebLogLayer},
     },
     cli::{
-        Cli, Command, run_goal_command, run_mcp_command, run_memory_plane_command,
+        Cli, Command, run_cron_command, run_goal_command, run_mcp_command, run_memory_plane_command,
         run_pairing_command, run_plan_command, run_plan_step_command, run_service_command,
         run_status_command, run_tool_command,
     },
@@ -59,16 +59,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle non-agent commands first (they don't need full setup)
     match &cli.command {
-        Some(Command::Tool(tool_cmd)) => {
-            // Simple logging for CLI commands
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-                )
-                .init();
-
-            return run_tool_command(tool_cmd.clone()).await;
-        }
         Some(Command::Config(config_cmd)) => {
             // Config commands need DB access for settings
             tracing_subscriber::fmt()
@@ -78,6 +68,26 @@ async fn main() -> anyhow::Result<()> {
                 .init();
 
             return ironclaw::cli::run_config_command(config_cmd.clone()).await;
+        }
+        Some(Command::Channels(channels_cmd)) => {
+            // Channels commands for managing chat channels
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+                )
+                .init();
+
+            return ironclaw::cli::run_channels_command(channels_cmd.clone()).await;
+        }
+        Some(Command::Tool(tool_cmd)) => {
+            // Simple logging for tool commands
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+                )
+                .init();
+
+            return run_tool_command(tool_cmd.clone()).await;
         }
         Some(Command::Mcp(mcp_cmd)) => {
             // Simple logging for MCP commands
@@ -201,7 +211,19 @@ async fn main() -> anyhow::Result<()> {
 
             return run_service_command(service_cmd);
         }
+        Some(Command::Cron(cron_cmd)) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+                )
+                .init();
+
+            return run_cron_command(cron_cmd.clone()).await;
+        }
         Some(Command::Doctor) => {
+            // Load .env file for configuration checks
+            let _ = dotenvy::dotenv();
+
             tracing_subscriber::fmt()
                 .with_env_filter(
                     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
